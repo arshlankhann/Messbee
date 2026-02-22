@@ -3,6 +3,7 @@ import { Routes, Route, Navigate, useLocation, Outlet } from "react-router-dom";
 import { ConfigProvider } from "antd";
 import { ToastContainer } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
+import { SpeedInsights } from "@vercel/speed-insights/react";
 import MainHeading from "./components/header/MainHeading";
 import MainSidebar from "./components/mainsidebar/MainSidebar";
 import ProtectedRoute from "./components/ProtectedRoute";
@@ -286,6 +287,7 @@ function App() {
 
         <Route path="*" element={<NotFound />} />
       </Routes>
+      <SpeedInsights />
     </ConfigProvider>
   );
 }
