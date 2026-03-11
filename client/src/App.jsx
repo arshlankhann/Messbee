@@ -1,5 +1,5 @@
 import PropTypes from "prop-types";
-import { Suspense, lazy, useState, memo, useEffect } from "react";
+import { Suspense, lazy, useState, memo, useEffect, useContext } from "react";
 import { Routes, Route, Navigate, useLocation, Outlet } from "react-router-dom";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 import CssBaseline from "@mui/material/CssBaseline";
@@ -8,12 +8,14 @@ import "react-toastify/dist/ReactToastify.css";
 
 // --- IMPORTS FOR NEW UI ---
 import Loading from "./components/Loading";
+import { userContext } from "./context/Context";
 import ErrorBoundary from "./components/ui/ErrorBoundary";
 
 import MainHeading from "./components/header/MainHeading";
 import MainSidebar from "./components/mainsidebar/MainSidebar";
 import ProtectedRoute from "./components/ProtectedRoute";
 import PublicRoute from "./components/PublicRoute";
+import WhatsAppConfig from "./pages/setting/Wapi";
 
 // --- UPDATED LOADING UI ---
 const PageLoader = () => <Loading />;
@@ -44,7 +46,6 @@ const InvoiceView = lazy(() => import("./pages/PlanPricing/InvoiceView"));
 const Contact = lazy(() => import(/* webpackPrefetch: true */ "./pages/contats/contact"));
 const StatusPage = lazy(() => import("./pages/contats/Status/StatusPage"));
 const ImportContacts = lazy(() => import("./pages/contats/importContact"));
-// const MapFields = lazy(() => import("./pages/contats/mapfields"));
 const ReviewSummary = lazy(() => import("./pages/contats/reviewSummary"));
 
 // --- LAZY LOADED SETTINGS ---
@@ -60,10 +61,7 @@ const ManageTeams = lazy(() => import("./pages/setting/ManageTeams"));
 const DevApi = lazy(() => import("./pages/setting/DevApi"));
 const AppIntegration = lazy(() => import("./pages/setting/AppIntegration"));
 
-// --- LAZY LOADED HELP PAGES ---
-const ApiDocs = lazy(() => import("./pages/help/ApiDocs"));
-const Support = lazy(() => import("./pages/help/Support"));
-const Faq = lazy(() => import("./pages/help/Faq"));
+// --- LAZY LOADED COMMERCE PAGES ---
 const PaymentList = lazy(() => import("./pages/commerce/PaymentList"));
 const ProductList = lazy(() => import("./pages/commerce/ProductList"));
 const Inventory = lazy(() => import("./pages/commerce/Inventory"));
@@ -80,6 +78,22 @@ const ForgotPassword = lazy(() => import("./pages/Auth/ForgotPassword"));
 const VerifyOTP = lazy(() => import("./pages/Auth/VerifyOTP"));
 const ResetPassword = lazy(() => import("./pages/Auth/ResetPassword"));
 const Onboarding = lazy(() => import("./pages/Auth/Onboarding"));
+const LandingPage = lazy(() => import("./pages/LandingPage"));
+
+// --- LAZY LOADED HELP PAGES ---
+const HelpLayout = lazy(() => import("./pages/help/help"));
+const Introduction = lazy(() => import("./pages/help/introduction"));
+const Faq = lazy(() => import("./pages/help/Faq"));
+const ApiDocs = lazy(() => import("./pages/help/ApiDocs"));
+const Support = lazy(() => import("./pages/help/Support"));
+
+// Support Sub-pages (Removed Whatsapp)
+const GetStarted = lazy(() => import("./pages/help/support/GetStarted"));
+const ApiWebhooks = lazy(() => import("./pages/help/support/ApiWebhooks"));
+const BillingPlans = lazy(() => import("./pages/help/support/BillingPlans"));
+const CampaignsHelp = lazy(() => import("./pages/help/support/Campaigns"));
+const Troubleshooting = lazy(() => import("./pages/help/support/Troubleshooting"));
+
 
 // --- 404 COMPONENT ---
 const NotFound = memo(() => {
@@ -105,8 +119,6 @@ Placeholder.displayName = "Placeholder";
 Placeholder.propTypes = {
   title: PropTypes.string.isRequired,
 };
-
-
 
 // --- LAYOUT WRAPPER ---
 const AppLayout = memo(() => {
@@ -143,6 +155,13 @@ const theme = createTheme({
   },
 });
 
+// --- ROOT REDIRECT COMPONENT ---
+// Sends logged-in users to /dashboard, unauthenticated users to /landing
+const RootRedirect = () => {
+  const { isLoggedIn } = useContext(userContext);
+  return isLoggedIn ? <Navigate to="/dashboard" replace /> : <Navigate to="/landing" replace />;
+};
+
 function App() {
   return (
     <ThemeProvider theme={theme}>
@@ -162,6 +181,12 @@ function App() {
       />
 
       <Routes>
+        {/* ROOT: redirect based on auth state */}
+        <Route path="/" element={<RootRedirect />} />
+
+        {/* LANDING PAGE - Public marketing page for new visitors */}
+        <Route path="/landing" element={<Suspense fallback={<PageLoader />}><LandingPage /></Suspense>} />
+
         {/* PUBLIC ROUTES - Redirect to dashboard if already logged in */}
         <Route path="/login" element={<PublicRoute><Suspense fallback={<PageLoader />}><Login /></Suspense></PublicRoute>} />
         <Route path="/signup" element={<PublicRoute><Suspense fallback={<PageLoader />}><Registration /></Suspense></PublicRoute>} />
@@ -173,10 +198,10 @@ function App() {
         {/* PROTECTED ROUTES - Require Authentication */}
         <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
           {/* 1. Dashboard */}
-          <Route path="/" element={<Dashboard />} />
+          <Route path="/dashboard" element={<Dashboard />} />
           <Route
             path="/admin/dashboard"
-            element={<Navigate to="/" replace />}
+            element={<Navigate to="/dashboard" replace />}
           />
           {/* 2. Notifications */}
           <Route path="/admin/notifications" element={<NotificationPage />} />
@@ -202,14 +227,10 @@ function App() {
             path="/admin/contacts/import"
             element={<ImportContacts />}
           />{" "}
-          {/* ← ADDED */}
-          {/* <Route path="/admin/contacts/map" element={<MapFields />} />{" "} */}
-          {/* ← ADDED */}
           <Route
             path="/admin/contacts/review"
             element={<ReviewSummary />}
           />{" "}
-          {/* ← ADDED */}
           {/* 5. Templates */}
           <Route path="/admin/templates/list" element={<Templates />} />
           <Route path="/admin/campaigns/templates" element={<Templates />} />
@@ -298,19 +319,29 @@ function App() {
           <Route path="/admin/account/plan" element={<ActivePlans />} />
           <Route path="/admin/profile/info" element={<UserProfile />} />
           <Route path="/admin/profile/business" element={<BusinessProfile />} />
-          {/* 14. Help */}
-          <Route
-            path="/admin/help/docs"
-            element={<ApiDocs />}
-          />
-          <Route
-            path="/admin/help/support"
-            element={<Support />}
-          />
-          <Route
-            path="/admin/help/faqs"
-            element={<Faq />}
-          />
+
+          {/* 14. Help & Support Wrapper Route */}
+          <Route path="/admin/help" element={<HelpLayout />}>
+            {/* Default page when hitting /admin/help */}
+            <Route index element={<Navigate to="introduction" replace />} />
+
+            {/* Main Tabs */}
+            <Route path="introduction" element={<Introduction />} />
+            <Route path="faq" element={<Faq />} />
+            <Route path="api-docs" element={<ApiDocs />} />
+
+            {/* Support Hub and sub-pages */}
+            <Route path="support">
+              <Route index element={<Support />} />
+              <Route path="get-started" element={<GetStarted />} />
+              <Route path="api-webhooks" element={<ApiWebhooks />} />
+              <Route path="billing-plans" element={<BillingPlans />} />
+              <Route path="campaigns" element={<CampaignsHelp />} />
+              <Route path="troubleshooting" element={<Troubleshooting />} />
+              <Route path="whatsapp-compliance" element={<WhatsAppConfig />} />
+            </Route>
+          </Route>
+
         </Route>
 
         <Route path="*" element={<NotFound />} />
