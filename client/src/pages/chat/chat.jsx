@@ -1,45 +1,74 @@
-import React, { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
+import { ExclamationTriangleIcon } from "@heroicons/react/24/outline";
 import ContactCard from "./ContactCard";
 import Conversion from "./Conversion";
 import UserProfilePanel from "./UserProfilePanel";
-import ActivityLog from "./ActivityLog"; 
-import axios from "../../context/axios";
+import ActivityLog from "./ActivityLog";
 import chatService from "../../services/chatService";
+import LabelApi from "../../services/LabelApi";
+import StatusApi from "../../services/StatusApi";
+import QuickReplyApi from "../../services/QuickReplyApi";
 import io from "socket.io-client";
 import ErrorState from "../../components/ui/ErrorState";
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
-var socket;
+const SOCKET_URL =
+  import.meta.env.VITE_SOCKET_URL ||
+  (import.meta.env.VITE_API_URL
+    ? String(import.meta.env.VITE_API_URL).replace(/\/api\/?$/, '')
+    : 'http://localhost:5000');
 
 const Chat = () => {
-  const [chats, setChats] = useState([]); 
-  const [messages, setMessages] = useState([]); 
+  const [chats, setChats] = useState([]);
+  const [messages, setMessages] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
   const [showProfile, setShowProfile] = useState(false);
-  const [activeTab, setActiveTab] = useState("All"); 
+  const [activeTab, setActiveTab] = useState("All");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [sendError, setSendError] = useState(null);  // WhatsApp send error
+
+  // ✅ Dynamic Data for Labels, Statuses, and Quick Replies
+  const [availableLabels, setAvailableLabels] = useState([]);
+  const [statusOptions, setStatusOptions] = useState([]);
+  const [quickReplies, setQuickReplies] = useState([]);
 
   // ✅ State to track if we are viewing the Activity Log instead of Chat
   const [showActivityLog, setShowActivityLog] = useState(false);
 
+  // ✅ Confirmation Modal States
+  const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
+  const [confirmConfig, setConfirmConfig] = useState({
+    title: "",
+    message: "",
+    confirmText: "",
+    onConfirm: () => { },
+    type: "danger"
+  });
+
+  // Ref to always have latest activeChatId inside socket callbacks
+  const activeChatIdRef = useRef(null);
+  const socketRef = useRef(null);
+  const previousChatIdRef = useRef(null);
   useEffect(() => {
-    socket = io(SOCKET_URL);
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  // ── Initial socket + data fetch (runs once) ──────────────────────────────
+  useEffect(() => {
+    socketRef.current = io(SOCKET_URL, { withCredentials: true });
 
     const fetchChats = async () => {
       try {
         setError(null);
         const result = await chatService.getChats();
-        
         if (result.success) {
           setChats(result.data);
-          if (result.data.length > 0 && !activeChatId) {
+          if (result.data.length > 0) {
             setActiveChatId(result.data[0]._id);
           }
         } else {
           setError(result.error);
         }
-        
         setLoading(false);
       } catch (err) {
         console.error("Error fetching chats:", err);
@@ -48,114 +77,163 @@ const Chat = () => {
       }
     };
 
-    fetchChats();
+    const fetchLabelsAndStatuses = async () => {
+      try {
+        const labelsData = await LabelApi.getAllLabels();
+        setAvailableLabels(labelsData);
+        const statusData = await StatusApi.getAllStatuses();
+        setStatusOptions(statusData.map(s => ({
+          id: s._id,
+          label: s.name,
+          dot: s.color ? `bg-[${s.color}]` : 'bg-slate-300',
+          original: s
+        })));
+        const replies = await QuickReplyApi.getQuickReplies();
+        setQuickReplies(replies);
+      } catch (error) {
+        console.error("Error fetching dynamic chat data:", error);
+      }
+    };
 
-    // Listen for incoming messages
-    socket.on("receive_message", (data) => {
-      console.log('Received message:', data);
-      if (activeChatId === data.chatId) {
-        setMessages((prev) => {
-          const isDuplicate = prev.some(msg => 
-             msg._id === data.message._id || 
-             (msg.text === data.message.text && msg.time === data.message.time && msg.sender === 'me')
-          );
-          if (isDuplicate) return prev; 
-          return [...prev, data.message]; 
+    fetchChats();
+    fetchLabelsAndStatuses();
+
+    // ── SOCKET: incoming message from contact ('them') ──────────────────
+    socketRef.current.on("receive_message", (data) => {
+      const incomingChatId = data.chatId?.toString();
+
+
+      // Add to message list only if viewing that chat
+      if (activeChatIdRef.current?.toString() === incomingChatId) {
+        setMessages(prev => {
+          const isDuplicate = prev.some(m => m._id?.toString() === data.message?._id?.toString());
+          if (isDuplicate) return prev;
+          return [...prev, data.message];
         });
       }
 
-      // Update chat list - move to top only if it's not the active chat
-      setChats((prevChats) => {
-        const chatIndex = prevChats.findIndex(chat => chat._id === data.chatId);
-        if (chatIndex === -1) return prevChats;
-        
-        const updatedChat = {
-          ...prevChats[chatIndex],
-          lastMsg: data.message.media ? `📸 ${data.message.mediaType}` : data.message.text,
-          lastMsgTime: data.message.time,
-          unread: data.chatId === activeChatId ? prevChats[chatIndex].unread : (prevChats[chatIndex].unread || 0) + 1
-        };
-        
-        // If it's the active chat, keep it in the same position
-        if (data.chatId === activeChatId) {
-          const newChats = [...prevChats];
-          newChats[chatIndex] = updatedChat;
-          return newChats;
+      // Update sidebar chat preview
+      setChats(prevChats => {
+        const idx = prevChats.findIndex(c => c._id?.toString() === incomingChatId);
+        if (idx === -1) {
+          if (!data.chat) return prevChats;
+          const exists = prevChats.some(c => c._id?.toString() === data.chat._id?.toString());
+          if (exists) return prevChats;
+          return [data.chat, ...prevChats];
         }
-        
-        // If it's not the active chat, move it to the top
-        const newChats = prevChats.filter(chat => chat._id !== data.chatId);
-        return [updatedChat, ...newChats];
+        const updated = [
+          ...prevChats.slice(0, idx),
+          {
+            ...prevChats[idx],
+            lastMsg: data.message?.text || '📎 Media',
+            lastMsgTime: data.message?.time,
+            // Increment unread only if NOT viewing this chat
+            unread: activeChatIdRef.current?.toString() === incomingChatId
+              ? 0
+              : (prevChats[idx].unread || 0) + 1
+          },
+          ...prevChats.slice(idx + 1)
+        ];
+        return updated;
       });
     });
 
-    // Listen for sent messages
-    socket.on("message_sent", (data) => {
-      console.log('Message sent confirmation:', data);
-      // Update message status
-      setMessages((prev) => 
-        prev.map(msg => 
-          msg._id === data.message._id || msg._id.startsWith('temp_') 
-            ? { ...data.message, status: 'sent' } 
+    // ── SOCKET: our sent message confirmed by server ────────────────────
+    socketRef.current.on("message_sent", (data) => {
+      const sentChatId = data.chatId?.toString();
+
+      // Replace temp message with real one
+      if (activeChatIdRef.current?.toString() === sentChatId) {
+        setMessages(prev =>
+          prev.map(msg => {
+            // Replace either the matching temp ID or a matching real ID
+            if (
+              (msg._id?.toString().startsWith('temp_')) ||
+              msg._id?.toString() === data.message?._id?.toString()
+            ) {
+              return { ...data.message, status: data.message.status || 'sent' };
+            }
+            return msg;
+          })
+        );
+      }
+    });
+
+    // ── SOCKET: delivery / read status update ──────────────────────────
+    socketRef.current.on("message_status_update", (data) => {
+      if (data.status === 'failed' && data.error) {
+        setSendError(data.errorCode ? `[${data.errorCode}] ${data.error}` : data.error);
+        setTimeout(() => setSendError(null), 10000);
+      }
+
+      setMessages(prev =>
+        prev.map(msg =>
+          msg._id?.toString() === data.messageId?.toString() ||
+            msg.whatsappMessageId === data.whatsappMessageId
+            ? { ...msg, status: data.status, error: data.error || msg.error }
             : msg
         )
       );
     });
 
-    // Listen for message status updates
-    socket.on("message_status_update", (data) => {
-      console.log('Message status update:', data);
-      setMessages((prev) => 
-        prev.map(msg => 
-          msg._id === data.messageId || msg.whatsappMessageId === data.whatsappMessageId
-            ? { ...msg, status: data.status } 
-            : msg
+    // ── SOCKET: chat metadata updated ───────────────────────────────────
+    socketRef.current.on("chat_updated", (updatedChat) => {
+      setChats(prev =>
+        prev.map(c =>
+          c._id?.toString() === updatedChat._id?.toString() ? updatedChat : c
         )
       );
     });
 
-    // Listen for chat updates
-    socket.on("chat_updated", (updatedChat) => {
-      console.log('Chat updated:', updatedChat);
-      setChats((prevChats) => 
-        prevChats.map((chat) => 
-          chat._id === updatedChat._id ? updatedChat : chat
-        )
-      );
+    // ── SOCKET: brand-new chat created via WhatsApp webhook ────────────
+    socketRef.current.on("chat_created", (newChat) => {
+      setChats(prev => {
+        const exists = prev.some(c => c._id?.toString() === newChat._id?.toString());
+        if (exists) return prev;
+        return [newChat, ...prev];
+      });
     });
 
-    // Listen for new chats created
-    socket.on("chat_created", (newChat) => {
-      console.log('New chat created:', newChat);
-      setChats((prevChats) => [newChat, ...prevChats]);
-    });
-
-    return () => socket.disconnect();
-  }, [activeChatId]);
+    return () => {
+      if (!socketRef.current) return;
+      socketRef.current.off("receive_message");
+      socketRef.current.off("message_sent");
+      socketRef.current.off("message_status_update");
+      socketRef.current.off("chat_updated");
+      socketRef.current.off("chat_created");
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
-    if (!activeChatId) return;
+    if (!activeChatId || !socketRef.current) return;
 
     const fetchMessages = async () => {
       try {
+        if (previousChatIdRef.current) {
+          socketRef.current.emit("leave_chat", previousChatIdRef.current);
+        }
+
         const result = await chatService.getMessages(activeChatId);
-        
+
         if (result.success) {
           setMessages(result.data);
         } else {
           console.error('Failed to fetch messages:', result.error);
           setMessages([]);
         }
-        
+
         // Mark messages as read
         await chatService.markMessagesAsRead(activeChatId);
-        
+
         // Join socket room for this chat
-        socket.emit("join_chat", activeChatId);
-        
+        socketRef.current.emit("join_chat", activeChatId);
+        previousChatIdRef.current = activeChatId;
+
         // Update unread count in chat list
-        setChats((prevChats) => 
-          prevChats.map((chat) => 
+        setChats((prevChats) =>
+          prevChats.map((chat) =>
             chat._id === activeChatId ? { ...chat, unread: 0 } : chat
           )
         );
@@ -181,10 +259,12 @@ const Chat = () => {
 
   const handleSendMessage = async (text, media = null) => {
     if (!text?.trim() && !media) return;
-    
-    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+
+
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true }).toLowerCase();
     const tempId = 'temp_' + Date.now();
-    
+
     // Create temporary message for immediate UI update
     const tempMessage = {
       _id: tempId,
@@ -199,64 +279,139 @@ const Chat = () => {
 
     try {
       // Add temporary message to UI
+
       setMessages((prev) => [...prev, tempMessage]);
 
       // Update chat list optimistically - keep active chat in same position
       setChats((prev) => {
-        return prev.map(c => 
-          c._id === activeChatId 
-            ? { ...c, lastMsg: media ? `📸 ${media.type || 'Media'}` : text, lastMsgTime: time } 
+        return prev.map(c =>
+          c._id === activeChatId
+            ? { ...c, lastMsg: media ? `📸 ${media.type || 'Media'}` : text, lastMsgTime: time }
             : c
         );
       });
 
       // Send to backend
+
       let result;
       if (media) {
         // Determine media type from media object
         const mediaType = media.type || 'image';
+
         result = await chatService.sendMediaMessage(activeChatId, text, media, mediaType);
       } else {
+
         result = await chatService.sendMessage(activeChatId, text);
       }
 
+
+
       if (result.success) {
+
+        setSendError(null); // clear any previous error
         // Replace temporary message with actual message from server
-        setMessages((prev) => 
-          prev.map(msg => 
-            msg._id === tempId 
-              ? { ...result.data, status: result.data.status || 'sent' } 
-              : msg
-          )
+        setMessages((prev) =>
+          prev.map(msg => {
+            if (msg._id === tempId) {
+
+              return { ...result.data, status: result.data.status || 'sent' };
+            }
+            return msg;
+          })
         );
 
         // Emit via socket for real-time updates to other clients
-        socket.emit("send_message", { 
-          chatId: activeChatId, 
-          message: result.data 
+
+        socketRef.current?.emit("send_message", {
+          chatId: activeChatId,
+          message: result.data
         });
       } else {
-        // Mark message as failed
-        setMessages((prev) => 
-          prev.map(msg => 
-            msg._id === tempId 
-              ? { ...msg, status: 'failed', error: result.error } 
+        console.error('❌ Failed to send message:', result.error, 'Code:', result.errorCode);
+        // Show WhatsApp error to user (include error code if available)
+        const errMsg = result.error || 'Failed to send message via WhatsApp';
+        const displayErr = result.errorCode ? `[${result.errorCode}] ${errMsg}` : errMsg;
+        setSendError(displayErr);
+        setTimeout(() => setSendError(null), 10000); // auto-dismiss after 10s
+        // Replace temp message with the DB-saved failed message (or mark as failed)
+        setMessages((prev) =>
+          prev.map(msg =>
+            msg._id === tempId
+              ? result.data
+                ? { ...result.data, status: 'failed', error: errMsg }
+                : { ...msg, status: 'failed', error: errMsg }
               : msg
           )
         );
-        console.error('Failed to send message:', result.error);
       }
 
     } catch (error) {
-      console.error('Error in handleSendMessage:', error);
+      console.error('💥 Error in handleSendMessage:', error);
       // Mark message as failed
-      setMessages((prev) => 
-        prev.map(msg => 
-          msg._id === tempId 
-            ? { ...msg, status: 'failed' } 
+      setMessages((prev) =>
+        prev.map(msg =>
+          msg._id === tempId
+            ? { ...msg, status: 'failed' }
             : msg
         )
       );
+    }
+  };
+
+  const handleSendTemplate = async (template) => {
+    if (!activeChatId || !template?.name) return;
+
+    const getBodyParamCount = (selectedTemplate) => {
+      const bodyComponent = Array.isArray(selectedTemplate?.components)
+        ? selectedTemplate.components.find((component) => String(component?.type || '').toUpperCase() === 'BODY')
+        : null;
+      const bodyText = bodyComponent?.text || '';
+      const placeholders = bodyText.match(/{{\d+}}/g) || [];
+      return new Set(placeholders).size;
+    };
+
+    const bodyParamCount = getBodyParamCount(template);
+    const fallbackParamText = activeChat?.name || 'there';
+    const components = bodyParamCount > 0
+      ? [{
+        type: 'body',
+        parameters: Array.from({ length: bodyParamCount }, () => ({
+          type: 'text',
+          text: fallbackParamText
+        }))
+      }]
+      : [];
+
+    try {
+      const result = await chatService.sendTemplateMessage(
+        activeChatId,
+        template.name,
+        template.language || 'en_US',
+        components
+      );
+
+      if (result.success) {
+        setSendError(null);
+        setMessages((prev) => {
+          const msgId = result?.data?._id?.toString();
+          const alreadyExists = msgId && prev.some((msg) => msg._id?.toString() === msgId);
+          if (alreadyExists) return prev;
+          return [...prev, { ...result.data, status: result.data.status || 'sent' }];
+        });
+        socketRef.current?.emit('send_message', {
+          chatId: activeChatId,
+          message: result.data
+        });
+      } else {
+        const errMsg = result.error || `Failed to send template ${template.name}`;
+        const displayErr = result.errorCode ? `[${result.errorCode}] ${errMsg}` : errMsg;
+        setSendError(displayErr);
+        setTimeout(() => setSendError(null), 10000);
+      }
+    } catch (error) {
+      const errMsg = error?.message || `Failed to send template ${template.name}`;
+      setSendError(errMsg);
+      setTimeout(() => setSendError(null), 10000);
     }
   };
 
@@ -264,7 +419,7 @@ const Chat = () => {
     try {
       setLoading(true);
       const result = await chatService.createChat(name, phone, 'whatsapp');
-      
+
       if (result.success) {
         // Add to chat list if not already there
         setChats((prevChats) => {
@@ -274,12 +429,12 @@ const Chat = () => {
           }
           return [result.data, ...prevChats];
         });
-        
+
         // Select the new chat
         setActiveChatId(result.data._id);
         setShowProfile(false);
         setLoading(false);
-        
+
         return { success: true, data: result.data };
       } else {
         setLoading(false);
@@ -292,9 +447,119 @@ const Chat = () => {
     }
   };
 
+  const handleClearChat = () => {
+    if (!activeChatId) return;
+
+    setConfirmConfig({
+      title: "Clear Chat History",
+      message: "Are you sure you want to clear this chat history? This action will remove all messages from your view and cannot be undone.",
+      confirmText: "Clear History",
+      type: "danger",
+      onConfirm: async () => {
+        try {
+          const result = await chatService.clearChatHistory(activeChatId);
+          if (result.success) {
+            setMessages([]);
+            setChats(prev => prev.map(c => c._id === activeChatId ? { ...c, lastMsg: "Chat history cleared" } : c));
+          } else {
+            console.error("Failed to clear chat:", result.error);
+          }
+        } catch (err) {
+          console.error("Error clearing chat:", err);
+        }
+        setIsConfirmModalOpen(false);
+      }
+    });
+    setIsConfirmModalOpen(true);
+  };
+
+  const handleDeleteChat = () => {
+    if (!activeChatId) return;
+
+    setConfirmConfig({
+      title: "Delete Contact",
+      message: "Are you sure you want to delete this contact and all its messages? This action is permanent and cannot be reversed.",
+      confirmText: "Delete Contact",
+      type: "danger",
+      onConfirm: async () => {
+        try {
+          const result = await chatService.deleteChat(activeChatId);
+          if (result.success) {
+            const deletedId = activeChatId;
+            setActiveChatId(null);
+            setChats(prev => prev.filter(c => c._id !== deletedId));
+          } else {
+            console.error("Failed to delete chat:", result.error);
+          }
+        } catch (err) {
+          console.error("Error deleting chat:", err);
+        }
+        setIsConfirmModalOpen(false);
+      }
+    });
+    setIsConfirmModalOpen(true);
+  };
+
+  const handleUpdateStatus = async (chatId, status) => {
+    if (!chatId) return;
+    try {
+      const result = await chatService.updateChatStatus(chatId, status);
+      if (result.success) {
+        setChats(prev => prev.map(c => {
+          if ((c._id || c.id) === chatId) {
+            return {
+              ...c,
+              chatStatus: status,
+              isBlocked: status === 'blocked',
+              blocked: status === 'blocked',
+              contactStatus: status === 'blocked' ? 'blocked' : (String(c.contactStatus || '').toLowerCase() === 'blocked' ? status : c.contactStatus)
+            };
+          }
+          return c;
+        }));
+      }
+    } catch (err) {
+      console.error("Error updating status:", err);
+    }
+  };
+
+  const handleUpdateLabels = async (labels, targetChatId = activeChatId) => {
+    if (!targetChatId) return;
+    try {
+      const result = await chatService.updateChatLabels(targetChatId, labels);
+      if (result.success) {
+        setChats(prev => prev.map(c => c._id === targetChatId ? { ...c, labels: labels } : c));
+      }
+    } catch (err) {
+      console.error("Error updating labels:", err);
+    }
+  };
+
+  const handleTogglePin = async (targetChatId = activeChatId) => {
+    if (!targetChatId) return;
+    try {
+      const result = await chatService.toggleChatPin(targetChatId);
+      if (result.success) {
+        setChats(prev => prev.map(c => c._id === targetChatId ? { ...c, isPinned: !c.isPinned } : c));
+      }
+    } catch (err) {
+      console.error("Error toggling pin status:", err);
+    }
+  };
+
+  const handleUpdateProfile = async (chatId, profileData) => {
+    try {
+      const result = await chatService.updateChatProfile(chatId, profileData);
+      if (result.success) {
+        setChats(prev => prev.map(c => c._id === chatId ? result.data : c));
+      }
+    } catch (err) {
+      console.error("Error updating profile:", err);
+    }
+  };
+
   if (error && !loading) return <ErrorState onRetry={() => window.location.reload()} message={error} />;
 
-  // ✅ IF showActivityLog is true, completely swap out the UI with the Activity Log
   if (showActivityLog) {
     return <ActivityLog onBack={() => setShowActivityLog(false)} />;
   }
@@ -302,9 +567,9 @@ const Chat = () => {
   return (
     <div className="flex w-full h-full bg-white font-sans overflow-hidden">
       <style>{` .custom-scrollbar::-webkit-scrollbar { width: 5px; } .custom-scrollbar::-webkit-scrollbar-track { background: transparent; } .custom-scrollbar::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 10px; } .hide-scrollbar::-webkit-scrollbar { display: none; } `}</style>
-      
+
       {/* LEFT: CONTACT LIST */}
-      <div className={`w-full md:w-[350px] lg:w-[380px] flex flex-col border-r border-slate-100 h-full bg-white shrink-0 ${activeChatId ? 'hidden md:flex' : 'flex'}`}>
+      <div className="w-[330px] md:w-[350px] lg:w-[380px] flex flex-col border-r border-slate-100 h-full bg-white shrink-0">
         {loading ? (
           <div className="flex items-center justify-center h-full">
             <div className="text-center">
@@ -316,48 +581,115 @@ const Chat = () => {
             </div>
           </div>
         ) : (
-          <ContactCard 
-            chats={filteredChats} 
-            activeChatId={activeChatId} 
-            onChatSelect={(id) => { setActiveChatId(id); setShowProfile(false); }} 
-            activeTab={activeTab} 
-            setActiveTab={setActiveTab} 
-            onCreateChat={handleCreateChat} 
+          <ContactCard
+            chats={filteredChats}
+            activeChatId={activeChatId}
+            onChatSelect={(id) => { setActiveChatId(id); setShowProfile(false); }}
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            onCreateChat={handleCreateChat}
+            onUpdateStatus={handleUpdateStatus}
+            onTogglePin={(chatId) => handleTogglePin(chatId)}
+            onUpdateLabels={(chatId, labels) => handleUpdateLabels(labels, chatId)}
           />
         )}
       </div>
-      
+
       {/* MIDDLE: CONVERSATION AREA */}
-      <div className={`flex-1 flex flex-col h-full bg-white relative min-w-0 ${!activeChatId ? 'hidden md:flex' : 'flex'}`}>
+      <div className="flex-1 flex flex-col h-full bg-white relative min-w-0">
+        {/* WhatsApp Send Error Banner */}
+        {sendError && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 bg-red-50 border border-red-200 text-red-700 text-sm font-medium px-5 py-3 rounded-2xl shadow-lg max-w-[90%] animate-in fade-in slide-in-from-top-2 duration-300">
+            <svg className="w-5 h-5 shrink-0 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+            </svg>
+            <span>WhatsApp failed: {sendError}</span>
+            <button onClick={() => setSendError(null)} className="ml-2 text-red-400 hover:text-red-600 font-bold text-lg leading-none">&times;</button>
+          </div>
+        )}
         {activeChat ? (
           <div className="flex h-full w-full relative">
-             <div className="flex-1 h-full min-w-0 flex flex-col border-r border-slate-100">
-                <Conversion 
-                  data={{ ...activeChat, messages: messages }} 
-                  onSendMessage={handleSendMessage} 
-                  onBack={() => setActiveChatId(null)} 
-                  onToggleProfile={() => setShowProfile(!showProfile)} 
-                  // ✅ Pass this so the 3-dot menu inside Chat can open the Activity Log
-                  onViewHistory={() => setShowActivityLog(true)} 
+            <div className="flex-1 h-full min-w-0 flex flex-col border-r border-slate-100">
+              <Conversion
+                data={{ ...activeChat, messages: messages }}
+                onSendMessage={handleSendMessage}
+                onSendTemplate={handleSendTemplate}
+                onBack={() => setActiveChatId(null)}
+                onToggleProfile={() => setShowProfile(!showProfile)}
+                onClearChat={handleClearChat}
+                onDeleteChat={handleDeleteChat}
+                onUpdateStatus={handleUpdateStatus}
+                onUpdateLabels={handleUpdateLabels}
+                onTogglePin={handleTogglePin}
+                onViewHistory={() => setShowActivityLog(true)}
+                availableLabels={availableLabels}
+                statusOptions={statusOptions}
+                quickReplies={quickReplies}
+              />
+            </div>
+
+            {/* RIGHT: PROFILE PANEL */}
+            {showProfile && (
+              <>
+                {/* Mobile Backdrop */}
+                <div 
+                  className="xl:hidden fixed inset-0 z-40 bg-slate-900/10 backdrop-blur-[2px]" 
+                  onClick={() => setShowProfile(false)} 
                 />
-             </div>
-             
-             {/* RIGHT: PROFILE PANEL */}
-             {showProfile && (
-                <div className="w-[320px] lg:w-[340px] bg-white h-full shrink-0 hidden xl:block">
-                   <UserProfilePanel 
-                     data={activeChat} 
-                     onClose={() => setShowProfile(false)} 
-                     // ✅ Pass this so the button in the profile panel can open the Activity Log
-                     onViewHistory={() => setShowActivityLog(true)} 
-                   />
+                <div className="absolute right-0 top-0 z-50 w-[85%] max-w-[340px] bg-white h-full shadow-2xl xl:relative xl:shadow-none xl:block xl:w-[320px] lg:xl:w-[340px] shrink-0 border-l border-slate-100 animate-in slide-in-from-right duration-300">
+                  <UserProfilePanel
+                    data={activeChat}
+                    onClose={() => setShowProfile(false)}
+                    onViewHistory={() => setShowActivityLog(true)}
+                    availableLabels={availableLabels}
+                    statusOptions={statusOptions}
+                    onUpdateProfile={handleUpdateProfile}
+                    onUpdateLabels={handleUpdateLabels}
+                  />
                 </div>
-             )}
+              </>
+            )}
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-slate-400 bg-slate-50/50"><p className="font-semibold text-slate-500">Select a conversation</p></div>
         )}
       </div>
+
+      {/* CUSTOM CONFIRMATION MODAL */}
+      {isConfirmModalOpen && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onClick={() => setIsConfirmModalOpen(false)}></div>
+          <div className="bg-white w-full max-w-[400px] rounded-3xl shadow-2xl relative overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="p-6">
+              <div className="flex items-center justify-center w-14 h-14 bg-red-50 rounded-2xl mb-5 mx-auto">
+                <ExclamationTriangleIcon className="w-8 h-8 text-red-500" />
+              </div>
+
+              <div className="text-center mb-8">
+                <h3 className="text-xl font-bold text-slate-900 mb-2">{confirmConfig.title}</h3>
+                <p className="text-sm font-medium text-slate-500 leading-relaxed px-2">
+                  {confirmConfig.message}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={() => setIsConfirmModalOpen(false)}
+                  className="px-6 py-3 text-sm font-bold text-slate-600 hover:bg-slate-50 rounded-2xl transition-colors border border-slate-100"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={confirmConfig.onConfirm}
+                  className="px-6 py-3 text-sm font-bold text-white bg-red-500 hover:bg-red-600 rounded-2xl transition-all shadow-lg shadow-red-100 active:scale-[0.98]"
+                >
+                  {confirmConfig.confirmText}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

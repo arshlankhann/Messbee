@@ -90,10 +90,13 @@ const chatService = {
         data: response.data.data || response.data
       };
     } catch (error) {
-      console.error('Error sending message:', error);
+      const serverData = error.response?.data;
+      console.error('Error sending message:', serverData || error.message);
       return {
         success: false,
-        error: error.response?.data?.error || error.message
+        error: serverData?.error || error.response?.data?.message || error.message,
+        errorCode: serverData?.errorCode,
+        data: serverData?.data  // The saved (failed) message object from DB
       };
     }
   },
@@ -122,10 +125,13 @@ const chatService = {
         data: response.data.data || response.data
       };
     } catch (error) {
-      console.error('Error sending media message:', error);
+      const serverData = error.response?.data;
+      console.error('Error sending media message:', serverData || error.message);
       return {
         success: false,
-        error: error.response?.data?.error || error.message
+        error: serverData?.error || error.response?.data?.message || error.message,
+        errorCode: serverData?.errorCode,
+        data: serverData?.data  // The saved (failed) message object from DB
       };
     }
   },
@@ -170,10 +176,14 @@ const chatService = {
         data: response.data.data || response.data
       };
     } catch (error) {
-      console.error('Error sending template:', error);
+      const serverData = error.response?.data;
+      console.error('Error sending template:', serverData || error.message);
       return {
         success: false,
-        error: error.response?.data?.error || error.message
+        error: serverData?.error || error.message,
+        errorCode: serverData?.errorCode,
+        details: serverData?.rawError,
+        data: serverData?.data
       };
     }
   },
@@ -193,6 +203,37 @@ const chatService = {
       return {
         success: false,
         error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Upload file to WhatsApp (returns media ID for sending)
+   */
+  async uploadFile(file) {
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const response = await axios.post('/chats/upload-file', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
+      });
+
+      return {
+        success: true,
+        mediaId: response.data.mediaId,
+        whatsappMediaId: response.data.whatsappMediaId,
+        fileUrl: response.data.fileUrl,
+        fileName: response.data.fileName,
+        mimeType: response.data.mimeType
+      };
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.message
       };
     }
   },
@@ -234,6 +275,196 @@ const chatService = {
       return {
         success: false,
         error: error.message
+      };
+    }
+  },
+
+  /**
+   * Clear all messages in a chat
+   */
+  async clearChatHistory(chatId) {
+    try {
+      const response = await axios.delete(`/chats/${chatId}/messages`);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error clearing chat history:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Delete a chat and all its messages
+   */
+  async deleteChat(chatId) {
+    try {
+      const response = await axios.delete(`/chats/${chatId}`);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error deleting chat:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Update chat status (fixed: calling existing status route)
+   */
+  async updateChatStatus(chatId, chatStatus) {
+    try {
+      const response = await axios.put(`/chats/${chatId}/status`, { chatStatus });
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error updating chat status:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Update chat labels
+   */
+  async updateChatLabels(chatId, labels) {
+    try {
+      const response = await axios.put(`/chats/${chatId}/labels`, { labels });
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error updating chat labels:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Update chat profile details
+   */
+  async updateChatProfile(chatId, profileData) {
+    try {
+      const response = await axios.put(`/chats/${chatId}/profile`, profileData);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error updating chat profile:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Toggle pinned status of a chat
+   */
+  async toggleChatPin(chatId) {
+    try {
+      const response = await axios.put(`/chats/${chatId}/pin`);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error toggling chat pin:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Get all media assets from the gallery
+   */
+  async getMediaAssets() {
+    try {
+      const response = await axios.get('/media');
+      return {
+        success: true,
+        data: response.data.data
+      };
+    } catch (error) {
+      console.error('Error fetching media assets:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Mute / Unmute a chat
+   */
+  async toggleMuteChat(chatId) {
+    try {
+      const response = await axios.put(`/chats/${chatId}/mute`);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error toggling mute status:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Archive / Unarchive a chat
+   */
+  async toggleArchiveChat(chatId) {
+    try {
+      const response = await axios.put(`/chats/${chatId}/archive`);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error toggling archive status:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
+  },
+
+  /**
+   * Delete a chat
+   */
+  async deleteChat(chatId) {
+    try {
+      const response = await axios.delete(`/chats/${chatId}`);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Error deleting chat:', error);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
       };
     }
   }

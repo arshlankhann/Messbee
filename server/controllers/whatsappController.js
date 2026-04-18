@@ -2,28 +2,180 @@ const whatsappService = require('../services/whatsappService');
 const Chat = require('../models/Chat');
 const Message = require('../models/Message');
 const { getIO } = require('../config/socket');
+const { normalizePhoneNumber } = require('../utils/phoneHelper');
+const { hasActiveCustomerWindow } = require('../utils/conversationWindow');
 
 /**
  * WhatsApp Webhook Controller
  * Handles incoming webhooks from WhatsApp Business API
  */
 
+// @desc    Test WhatsApp API connection
+// @route   GET /api/whatsapp/test-connection
+// @access  Private
+exports.testConnection = async (req, res, next) => {
+  try {
+    // Validate configuration
+    whatsappService.validateConfig();
+    
+    res.status(200).json({
+      success: true,
+      message: 'WhatsApp API configuration is valid',
+      config: {
+        phoneNumberId: whatsappService.phoneNumberId,
+        hasAccessToken: !!whatsappService.accessToken,
+        businessAccountId: whatsappService.businessAccountId,
+        apiVersion: whatsappService.apiVersion
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'WhatsApp API configuration error',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Register WhatsApp Number
+// @route   POST /api/whatsapp/register
+// @access  Private
+exports.registerNumber = async (req, res, next) => {
+  try {
+    const { pin } = req.body;
+    if (!pin) {
+      return res.status(400).json({
+        success: false,
+        message: 'PIN is required to register the number'
+      });
+    }
+
+    // Await the WhatsApp service registration
+    const response = await whatsappService.register(pin);
+
+    if (response.success) {
+      res.status(200).json({
+        success: true,
+        message: 'Number registered successfully',
+        data: response.data
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: 'Registration failed',
+        error: response.error
+      });
+    }
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Registration process failed',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Deregister WhatsApp Number
+// @route   POST /api/whatsapp/deregister
+// @access  Private
+exports.deregisterNumber = async (req, res, next) => {
+  try {
+    // Await the WhatsApp service deregistration
+    const response = await whatsappService.deregister();
+
+    if (response.success) {
+      res.status(200).json({
+        success: true,
+        message: 'Number deregistered successfully',
+        data: response.data
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: 'Deregistration failed',
+        error: response.error
+      });
+    }
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Deregistration process failed',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Get message delivery status from database
+// @route   GET /api/whatsapp/message-status/:messageId
+// @access  Private
+exports.getMessageStatus = async (req, res, next) => {
+  try {
+    const messageId = req.params.messageId;
+    
+    // Find message by WhatsApp message ID or MongoDB ID
+    const message = await Message.findOne({
+      $or: [
+        { whatsappMessageId: messageId },
+        { _id: messageId }
+      ]
+    }).populate('chatId');
+
+    if (!message) {
+      return res.status(404).json({
+        success: false,
+        message: 'Message not found'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        messageId: message._id,
+        whatsappMessageId: message.whatsappMessageId,
+        text: message.text,
+        status: message.status,
+        statusTimestamp: message.statusTimestamp,
+        createdAt: message.createdAt,
+        chat: message.chatId ? {
+          name: message.chatId.name,
+          phone: message.chatId.phone
+        } : null
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching message status',
+      error: error.message
+    });
+  }
+};
+
 // @desc    Verify webhook (GET request from WhatsApp)
 // @route   GET /api/whatsapp/webhook
 // @access  Public
-exports.verifyWebhook = (req, res) => {
+exports.verifyWebhook = async (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'your_verify_token';
+  try {
+    const Setting = require('../models/Setting');
+    const setting = await Setting.findOne({ key: 'whatsapp_config' });
+    const VERIFY_TOKEN = (setting && setting.value && setting.value.verifyToken) || 
+                        process.env.WHATSAPP_VERIFY_TOKEN || 
+                        'your_verify_token';
 
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('✅ Webhook verified successfully');
-    res.status(200).send(challenge);
-  } else {
-    console.error('❌ Webhook verification failed');
-    res.sendStatus(403);
+    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+
+      res.status(200).send(challenge);
+    } else {
+      console.error('❌ Webhook verification failed');
+      res.sendStatus(403);
+    }
+  } catch (error) {
+    console.error('❌ Error verifying webhook:', error);
+    res.sendStatus(500);
   }
 };
 
@@ -33,41 +185,62 @@ exports.verifyWebhook = (req, res) => {
 exports.handleWebhook = async (req, res) => {
   try {
     // Verify webhook signature in production
-    // const signature = req.headers['x-hub-signature-256'];
-    // const isValid = whatsappService.verifyWebhookSignature(
-    //   signature,
-    //   JSON.stringify(req.body),
-    //   process.env.WHATSAPP_APP_SECRET
-    // );
-    // if (!isValid) {
-    //   return res.sendStatus(403);
-    // }
+    if (process.env.NODE_ENV === 'production' && process.env.WHATSAPP_APP_SECRET) {
+      const signature = req.headers['x-hub-signature-256'];
+      const isValid = whatsappService.verifyWebhookSignature(
+        signature,
+        req.rawBody || JSON.stringify(req.body),
+        process.env.WHATSAPP_APP_SECRET
+      );
+      if (!isValid) {
+        console.error('❌ Invalid webhook signature');
+        return res.sendStatus(403);
+      }
+    }
 
     const webhookData = req.body;
-    console.log('📱 Received WhatsApp Webhook:', JSON.stringify(webhookData, null, 2));
-
-    // Process the webhook
-    const result = whatsappService.processWebhook(webhookData);
-
-    if (!result.success) {
-      console.error('Webhook processing failed:', result.error);
-      return res.sendStatus(200); // Still return 200 to acknowledge receipt
-    }
-
-    // Handle incoming message
-    if (result.type === 'message') {
-      await handleIncomingMessage(result.data);
-    }
-
-    // Handle status update (delivered, read, etc.)
-    if (result.type === 'status') {
-      await handleStatusUpdate(result.data);
-    }
-
+    
+    // Acknowledge immediately so WhatsApp does not retry while we process.
     res.sendStatus(200);
+
+    setImmediate(async () => {
+      try {
+        const entries = Array.isArray(webhookData.entry) ? webhookData.entry : [];
+
+        for (const entry of entries) {
+          const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+
+          for (const change of changes) {
+            const value = change?.value;
+            if (!value) continue;
+
+            if (Array.isArray(value.messages) && value.messages.length > 0) {
+            }
+
+            if (Array.isArray(value.statuses) && value.statuses.length > 0) {
+            }
+
+            const result = whatsappService.processWebhook({ entry: [{ changes: [change] }] });
+
+            if (!result.success) {
+              continue;
+            }
+
+            if (result.type === 'message') {
+              await handleIncomingMessage(result.data);
+            }
+
+            if (result.type === 'status') {
+              await handleStatusUpdate(result.data);
+            }
+          }
+        }
+      } catch (backgroundError) {
+      }
+    });
   } catch (error) {
-    console.error('Webhook Error:', error);
-    res.sendStatus(500);
+    // Always return 200 to prevent WhatsApp from retrying
+    res.sendStatus(200);
   }
 };
 
@@ -78,62 +251,163 @@ async function handleIncomingMessage(data) {
   try {
     const { from, contact, message, messageId, messageType, timestamp } = data;
 
-    // Find or create chat
-    let chat = await Chat.findOne({ phone: from });
+    // Normalize the phone number
+    const normalizedFrom = normalizePhoneNumber(from);
+    const contactName = contact?.name || contact?.profile?.name || normalizedFrom;
+
+    // Find or create chat (check both phone and whatsappId with normalized number)
+    let chat = await Chat.findOne({ 
+      $or: [
+        { phone: normalizedFrom },
+        { whatsappId: normalizedFrom },
+        { phone: from },
+        { whatsappId: from }
+      ]
+    });
 
     if (!chat) {
       chat = await Chat.create({
-        name: contact.name,
-        phone: from,
+        name: contactName,
+        phone: normalizedFrom,
         status: 'active',
         chatStatus: 'open',
-        avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(contact.name)}&background=random`,
+        avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(contactName)}&background=random`,
         teamMember: 'Unassigned',
-        whatsappId: from,
+        whatsappId: normalizedFrom,
         source: 'whatsapp'
       });
+      
+      // Emit chat_created event
+      try {
+        const io = getIO();
+        if (io) {
+          io.emit('chat_created', chat);
+        }
+      } catch (socketError) {
+      }
     } else {
+      
+      // Update with normalized phone if needed
+      if (chat.phone !== normalizedFrom || chat.whatsappId !== normalizedFrom) {
+        chat.phone = normalizedFrom;
+        chat.whatsappId = normalizedFrom;
+      }
+      
       // Update chat status if it was closed
       if (chat.chatStatus === 'closed') {
         chat.chatStatus = 'open';
       }
       chat.status = 'active';
+      chat.lastActivity = new Date();
+      chat.lastInboundAt = new Date(parseInt(timestamp) * 1000);
+      // Ensure whatsappId is set (for older chats)
+      if (!chat.whatsappId) {
+        chat.whatsappId = from;
+      }
     }
 
     // Create message based on type
     let messageText = '';
+    let lastMsgText = '';
     let mediaUrl = null;
-    let mediaType = null;
+    let mediaId = null;
+    let mediaTypeStr = null;
+    let caption = null;
+    let fileName = null;
+    let location = null;
 
     switch (messageType) {
       case 'text':
-        messageText = message.text;
+        messageText = message.text || '';
+        lastMsgText = messageText;
         break;
+        
       case 'image':
-        messageText = message.caption || '📷 Image';
-        mediaUrl = message.mediaId;
-        mediaType = 'image';
+        caption = message.caption;
+        messageText = caption || '';
+        lastMsgText = caption || '📷 Image';
+        mediaId = message.mediaId;
+        mediaTypeStr = message.mimeType;
+        
+        // Optionally download and store media locally
+        if (mediaId) {
+          const mediaInfo = await whatsappService.getMediaUrl(mediaId);
+          if (mediaInfo.success) {
+            mediaUrl = mediaInfo.url;
+          }
+        }
         break;
+        
       case 'video':
-        messageText = message.caption || '🎥 Video';
-        mediaUrl = message.mediaId;
-        mediaType = 'video';
+        caption = message.caption;
+        messageText = caption || '';
+        lastMsgText = caption || '🎥 Video';
+        mediaId = message.mediaId;
+        mediaTypeStr = message.mimeType;
+        
+        if (mediaId) {
+          const mediaInfo = await whatsappService.getMediaUrl(mediaId);
+          if (mediaInfo.success) {
+            mediaUrl = mediaInfo.url;
+          }
+        }
         break;
+        
       case 'audio':
-        messageText = '🎵 Audio';
-        mediaUrl = message.mediaId;
-        mediaType = 'audio';
+        messageText = '';
+        lastMsgText = '🎵 Audio message';
+        mediaId = message.mediaId;
+        mediaTypeStr = message.mimeType;
+        
+        if (mediaId) {
+          const mediaInfo = await whatsappService.getMediaUrl(mediaId);
+          if (mediaInfo.success) {
+            mediaUrl = mediaInfo.url;
+          }
+        }
         break;
+        
       case 'document':
-        messageText = message.filename || '📄 Document';
-        mediaUrl = message.mediaId;
-        mediaType = 'document';
+        fileName = message.filename;
+        caption = message.caption;
+        messageText = caption || '';
+        lastMsgText = fileName || caption || '📄 Document';
+        mediaId = message.mediaId;
+        mediaTypeStr = message.mimeType;
+        
+        if (mediaId) {
+          const mediaInfo = await whatsappService.getMediaUrl(mediaId);
+          if (mediaInfo.success) {
+            mediaUrl = mediaInfo.url;
+          }
+        }
         break;
+        
       case 'location':
-        messageText = `📍 Location: ${message.name || message.address}`;
+        location = {
+          latitude: message.latitude,
+          longitude: message.longitude,
+          name: message.name,
+          address: message.address
+        };
+        messageText = caption || '';
+        lastMsgText = `📍 ${message.name || message.address || 'Location'}`;
         break;
+        
+      case 'contacts':
+        messageText = '';
+        lastMsgText = '👤 Contact Card';
+        break;
+        
+      case 'sticker':
+        messageText = '';
+        lastMsgText = '😊 Sticker';
+        mediaId = message.mediaId;
+        break;
+        
       default:
-        messageText = 'Unsupported message type';
+        messageText = '';
+        lastMsgText = 'Unsupported message type';
     }
 
     // Create message record
@@ -143,19 +417,25 @@ async function handleIncomingMessage(data) {
       sender: 'them',
       time: new Date(parseInt(timestamp) * 1000).toLocaleTimeString([], { 
         hour: '2-digit', 
-        minute: '2-digit' 
-      }),
+        minute: '2-digit',
+        hour12: true
+      }).toLowerCase(),
       whatsappMessageId: messageId,
       messageType: messageType,
       mediaUrl: mediaUrl,
-      mediaType: mediaType,
+      mediaId: mediaId,
+      mediaType: mediaTypeStr,
+      caption: caption,
+      fileName: fileName,
+      location: location,
       status: 'delivered'
     });
 
     // Update chat metadata
-    chat.lastMsg = messageText;
+    chat.lastMsg = lastMsgText || messageText || '📎 Media';
     chat.lastMsgTime = newMessage.time;
     chat.unread = (chat.unread || 0) + 1;
+    chat.lastInboundAt = new Date(parseInt(timestamp) * 1000);
     await chat.save();
 
     // Emit to socket for real-time update
@@ -167,20 +447,20 @@ async function handleIncomingMessage(data) {
           message: newMessage,
           chat: chat
         });
+        
+        // Also emit chat list update
+        io.emit('chat_updated', chat);
       }
-      
-      // Also emit chat list update
-      io.emit('chat_updated', chat);
     } catch (socketError) {
       console.error('Socket emit error:', socketError.message);
     }
 
-    // Mark message as read on WhatsApp
-    await whatsappService.markMessageAsRead(messageId);
+    // Mark message as read on WhatsApp (optional - you may want to do this manually)
+    // await whatsappService.markMessageAsRead(messageId);
 
-    console.log('✅ Message processed successfully:', messageId);
+
   } catch (error) {
-    console.error('Error handling incoming message:', error);
+    console.error('❌ Error handling incoming message:', error);
   }
 }
 
@@ -189,19 +469,33 @@ async function handleIncomingMessage(data) {
  */
 async function handleStatusUpdate(data) {
   try {
-    const { messageId, status, timestamp } = data;
+    const { messageId, status, timestamp, recipientId, errors } = data;
+
+    const firstError = Array.isArray(errors) && errors.length > 0 ? errors[0] : null;
+    const errorCode = firstError?.code;
+    const errorMessage = firstError?.title || firstError?.message || firstError?.details || null;
+
+
 
     // Update message status in database
+    const updatePayload = {
+      status: status,
+      statusTimestamp: new Date(parseInt(timestamp) * 1000)
+    };
+
+    if (status === 'failed' && errorMessage) {
+      updatePayload.error = errorCode ? `[${errorCode}] ${errorMessage}` : errorMessage;
+    }
+
     const message = await Message.findOneAndUpdate(
       { whatsappMessageId: messageId },
-      { 
-        status: status,
-        statusTimestamp: new Date(parseInt(timestamp) * 1000)
-      },
+      updatePayload,
       { new: true }
     );
 
     if (message) {
+
+      
       // Emit status update to frontend
       try {
         const io = getIO();
@@ -209,17 +503,22 @@ async function handleStatusUpdate(data) {
           io.emit('message_status_update', {
             messageId: message._id,
             status: status,
-            whatsappMessageId: messageId
+            whatsappMessageId: messageId,
+            error: message.error,
+            errorCode: errorCode
           });
+
         }
       } catch (socketError) {
-        console.error('Socket emit error:', socketError.message);
+        console.error('❌ Socket emit error:', socketError.message);
       }
+    } else {
+      console.warn(`⚠️  Message not found in database: ${messageId}`);
     }
 
-    console.log(`✅ Status updated for message ${messageId}: ${status}`);
+
   } catch (error) {
-    console.error('Error handling status update:', error);
+    console.error('❌ Error handling status update:', error);
   }
 }
 
@@ -247,6 +546,15 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
       });
     }
 
+    const canSendFreeText = await hasActiveCustomerWindow(chat);
+    if (!canSendFreeText) {
+      return res.status(500).json({
+        success: false,
+        message: '24-hour window expired — the contact must message you first, then you can reply within 24 hours. Use an approved template message to initiate.',
+        errorCode: 131047
+      });
+    }
+
     // Send via WhatsApp API
     const result = await whatsappService.sendTextMessage(chat.phone, text);
 
@@ -261,8 +569,9 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
     // Save message to database
     const time = new Date().toLocaleTimeString([], { 
       hour: '2-digit', 
-      minute: '2-digit' 
-    });
+      minute: '2-digit',
+      hour12: true
+    }).toLowerCase();
 
     const newMessage = await Message.create({
       chatId: chat._id,
@@ -310,18 +619,75 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
 // @access  Private
 exports.sendTemplateMessage = async (req, res, next) => {
   try {
-    const { chatId, templateName, languageCode, components } = req.body;
+    const {
+      chatId,
+      to,
+      phoneNumber,
+      templateName,
+      languageCode,
+      components = []
+    } = req.body;
 
-    const chat = await Chat.findById(chatId);
-    if (!chat) {
-      return res.status(404).json({
+    if (!templateName) {
+      return res.status(400).json({
         success: false,
-        message: 'Chat not found'
+        message: 'Template name is required'
       });
     }
 
+    let chat = null;
+    let recipientPhone = '';
+
+    if (chatId) {
+      chat = await Chat.findById(chatId);
+      if (!chat) {
+        return res.status(404).json({
+          success: false,
+          message: 'Chat not found'
+        });
+      }
+      recipientPhone = normalizePhoneNumber(chat.phone || chat.whatsappId);
+    } else {
+      const rawPhone = to || phoneNumber;
+      if (!rawPhone) {
+        return res.status(400).json({
+          success: false,
+          message: 'Either chatId or recipient phone number is required'
+        });
+      }
+
+      recipientPhone = normalizePhoneNumber(rawPhone);
+      if (!recipientPhone) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid recipient phone number'
+        });
+      }
+
+      chat = await Chat.findOne({
+        $or: [
+          { phone: recipientPhone },
+          { whatsappId: recipientPhone }
+        ]
+      });
+
+      if (!chat) {
+        const displayName = recipientPhone;
+        chat = await Chat.create({
+          name: displayName,
+          phone: recipientPhone,
+          status: 'active',
+          chatStatus: 'open',
+          avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}&background=random`,
+          teamMember: 'Unassigned',
+          whatsappId: recipientPhone,
+          source: 'whatsapp'
+        });
+      }
+    }
+
     const result = await whatsappService.sendTemplateMessage(
-      chat.phone,
+      recipientPhone,
       templateName,
       languageCode,
       components
@@ -335,9 +701,285 @@ exports.sendTemplateMessage = async (req, res, next) => {
       });
     }
 
+    const time = new Date().toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    }).toLowerCase();
+
+    const newMessage = await Message.create({
+      chatId: chat._id,
+      text: `Template: ${templateName}`,
+      sender: 'me',
+      time,
+      whatsappMessageId: result.messageId,
+      messageType: 'template',
+      templateName,
+      templateLanguage: languageCode || 'en_US',
+      metadata: {
+        components
+      },
+      status: 'sent'
+    });
+
+    chat.phone = recipientPhone;
+    chat.whatsappId = recipientPhone;
+    chat.source = 'whatsapp';
+    chat.status = 'active';
+    chat.lastMsg = `Template: ${templateName}`;
+    chat.lastMsgTime = time;
+    chat.lastActivity = new Date();
+    await chat.save();
+
+    try {
+      const io = getIO();
+      if (io) {
+        io.emit('message_sent', {
+          chatId: chat._id,
+          message: newMessage,
+          chat
+        });
+      }
+    } catch (socketError) {
+      console.error('Socket emit error:', socketError.message);
+    }
+
     res.status(200).json({
       success: true,
+      data: {
+        message: newMessage,
+        whatsappMessageId: result.messageId,
+        chat
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get WhatsApp message templates
+// @route   GET /api/whatsapp/templates
+// @access  Private
+exports.getTemplates = async (req, res, next) => {
+  try {
+
+    
+    const data = await whatsappService.getTemplates();
+    
+
+    
+    if (data?.data && Array.isArray(data.data)) {
+
+    }
+
+    const templates = Array.isArray(data?.data) ? data.data : [];
+    const approvedTemplates = templates.filter((template) => template.status === 'APPROVED');
+    const nonApprovedTemplates = templates.filter((template) => template.status !== 'APPROVED');
+    
+    res.status(200).json({
+      success: true,
+      data: data,
+      summary: {
+        total: templates.length,
+        approved: approvedTemplates.length,
+        nonApproved: nonApprovedTemplates.length
+      },
+      approvedTemplates,
+      nonApprovedTemplates
+    });
+  } catch (error) {
+    console.error('❌ [Server] Error in getTemplates controller:', error.message);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server Error fetching templates',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Create a new WhatsApp template
+// @route   POST /api/whatsapp/templates
+// @access  Private
+exports.createTemplate = async (req, res, next) => {
+  try {
+    const { name, category, language, components } = req.body;
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        message: 'Template name is required'
+      });
+    }
+
+    const result = await whatsappService.createTemplate({
+      name,
+      category: category || 'MARKETING',
+      language: language || 'en_US',
+      components: components || []
+    });
+
+    if (!result.success) {
+      const detailedMessage =
+        result?.error?.message ||
+        result?.error?.error?.message ||
+        result?.error?.error_user_msg ||
+        result?.error?.error?.error_user_msg ||
+        result?.error?.error_data?.details ||
+        result?.error?.error?.error_data?.details ||
+        'Failed to create template';
+      return res.status(400).json({
+        success: false,
+        message: detailedMessage,
+        error: result.error
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Template created successfully',
+      data: result.data,
+      templateName: result.templateName || name,
+      originalTemplateName: result.originalTemplateName || name,
+      usedFallbackName: !!result.usedFallbackName
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get template details
+// @route   GET /api/whatsapp/templates/:templateId
+// @access  Private
+exports.getTemplateDetails = async (req, res, next) => {
+  try {
+    const { templateId } = req.params;
+
+    const result = await whatsappService.getTemplateDetails(templateId);
+
+    if (!result.success) {
+      return res.status(404).json({
+        success: false,
+        message: 'Template not found',
+        error: result.error
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: result.data
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Test send a template message
+// @route   POST /api/whatsapp/test-template
+// @access  Private
+exports.testSendTemplate = async (req, res, next) => {
+  try {
+    const { phoneNumber, templateName, languageCode, testData } = req.body;
+
+    if (!phoneNumber || !templateName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone number and template name are required'
+      });
+    }
+
+    const result = await whatsappService.testSendTemplate(
+      phoneNumber,
+      templateName,
+      languageCode || 'en_US',
+      testData || {}
+    );
+
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send test template',
+        error: result.error
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Test template sent successfully',
       data: result
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Delete a template
+// @route   DELETE /api/whatsapp/templates/:templateId
+// @access  Private
+exports.deleteTemplate = async (req, res, next) => {
+  try {
+    const { templateId } = req.params;
+    const { templateName } = req.body;
+
+    if (!templateId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Template ID is required'
+      });
+    }
+
+    if (!templateName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Template name is required to delete a template'
+      });
+    }
+
+    console.log('🗑️ [Controller] Attempting to delete template:', { templateId, templateName });
+    const result = await whatsappService.deleteTemplate(templateId, templateName);
+
+    if (!result.success) {
+      console.error('❌ [Controller] Delete failed:', result.error);
+      return res.status(400).json({
+        success: false,
+        message: 'Failed to delete template',
+        error: result.error
+      });
+    }
+
+    console.log('✅ [Controller] Template deleted successfully:', templateName);
+    res.status(200).json({
+      success: true,
+      message: 'Template deleted successfully',
+      data: result.data
+    });
+  } catch (error) {
+    console.error('❌ [Controller] Delete template error:', error.message);
+    next(error);
+  }
+};
+
+// @desc    Update template
+// @route   PUT /api/whatsapp/templates/:templateId
+// @access  Private
+exports.updateTemplate = async (req, res, next) => {
+  try {
+    const { templateId } = req.params;
+    const updateData = req.body;
+
+    const result = await whatsappService.updateTemplate(templateId, updateData);
+
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'Failed to update template',
+        error: result.error
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Template updated successfully',
+      data: result.data
     });
   } catch (error) {
     next(error);

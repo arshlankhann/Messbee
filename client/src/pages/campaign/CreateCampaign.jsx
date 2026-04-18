@@ -1,62 +1,208 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import CampaignApi from '../../services/CampaignApi';
+import LabelApi from '../../services/LabelApi';
+import StatusApi from '../../services/StatusApi';
+import axios from '../../context/axios';
+import { toast } from 'react-toastify';
 import {
     X, Users, Tag, FileUp, ArrowRight, ChevronDown,
     Search, CheckCircle, Clock, Eye, Smartphone, ChevronLeft,
-    Zap, Calendar, Info, Rocket, ExternalLink, User
+    Zap, Calendar, Info, Rocket, ExternalLink, User,
+    Filter
 } from 'lucide-react';
 
 const CreateCampaign = () => {
     const navigate = useNavigate();
     const [currentStep, setCurrentStep] = useState(1);
 
+    // Dynamic Data State
+    const [labelsList, setLabelsList] = useState([]);
+    const [statusOptions, setStatusOptions] = useState([]);
+    const [totalContacts, setTotalContacts] = useState(0);
+    const [estimatedCount, setEstimatedCount] = useState(0);
+
+    // Initial Data Fetch
+    useEffect(() => {
+        const fetchInitialData = async () => {
+            try {
+                const [lbls, stats, contacts] = await Promise.all([
+                    LabelApi.getAllLabels(),
+                    StatusApi.getAllStatuses(),
+                    axios.get('/contacts?limit=1')
+                ]);
+                
+                if (Array.isArray(lbls)) setLabelsList(lbls.map(l => l.name));
+                if (Array.isArray(stats)) setStatusOptions(stats.map(s => s.name));
+                if (contacts.data?.success) {
+                    setTotalContacts(contacts.data.pagination.total);
+                    setEstimatedCount(contacts.data.pagination.total);
+                }
+            } catch (err) {
+                console.error("Failed to fetch campaign initial data:", err);
+            }
+        };
+        fetchInitialData();
+    }, []);
+
     // Step 1 State
     const [selectedOption, setSelectedOption] = useState('all');
-    const [labels, setLabels] = useState(['New Leads', 'Follow-up']);
+    const [selectedLabels, setSelectedLabels] = useState([]);
+    const [selectedStatus, setSelectedStatus] = useState('');
 
-    // Step 2 State
-    const [selectedTemplate, setSelectedTemplate] = useState('admission_promo_05');
+    // Step 1 Effect for estimated audience
+    useEffect(() => {
+        const updateEstimatedCount = async () => {
+            try {
+                let params = new URLSearchParams();
+                params.set('limit', '1');
+                
+                if (selectedOption === 'labels' && selectedLabels.length > 0) {
+                    params.set('labels', selectedLabels.join(','));
+                } else if (selectedOption === 'status' && selectedStatus) {
+                    params.set('status', selectedStatus);
+                }
+                
+                if (selectedOption !== 'csv') {
+                    const res = await axios.get(`/contacts?${params.toString()}`);
+                    if (res.data?.success) {
+                        setEstimatedCount(res.data.pagination.total);
+                    }
+                } else {
+                    setEstimatedCount(0); // For CSV, count comes from file parse which isn't implemented here yet
+                }
+            } catch (err) {
+                console.error("Error updating estimated count:", err);
+            }
+        };
+        updateEstimatedCount();
+    }, [selectedOption, selectedLabels, selectedStatus]);
+
+    const [selectedTemplate, setSelectedTemplate] = useState('new_food_menu');
     const [searchQuery, setSearchQuery] = useState('');
 
     // Step 3 State
     const [scheduleOption, setScheduleOption] = useState('now');
     const [completionAlert, setCompletionAlert] = useState(true);
-    const [campaignName, setCampaignName] = useState('Dev Demo Q3');
+    const [campaignName, setCampaignName] = useState(() => {
+        const now = new Date();
+        const dd = String(now.getDate()).padStart(2, '0');
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const yy = String(now.getFullYear()).slice(-2);
+        let hours = now.getHours();
+        const minutes = String(now.getMinutes()).padStart(2, '0');
+        const ampm = hours >= 12 ? 'pm' : 'am';
+        hours = hours % 12 || 12;
+        return `Camp (${dd}/${mm}/${yy} ${hours}:${minutes} ${ampm})`;
+    });
     const [scheduledDate, setScheduledDate] = useState('2025-07-24');
     const [scheduledTime, setScheduledTime] = useState('12:00');
+    const [isLaunching, setIsLaunching] = useState(false);
+    const [isSavingDraft, setIsSavingDraft] = useState(false);
+    const [csvFile, setCsvFile] = useState(null);
+    const fileInputRef = React.useRef(null);
+
+    const handleFileChange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            setCsvFile(file);
+            setSelectedOption('csv');
+        }
+    };
+
+    const handleLaunch = async () => {
+        try {
+            setIsLaunching(true);
+
+            const campaignData = {
+                name: campaignName,
+                messageTemplate: selectedTemplate, // Use name or ID based on backend expectation
+                status: scheduleOption === 'now' ? 'active' : 'scheduled',
+                scheduledDate: scheduleOption === 'later' ? new Date(`${scheduledDate}T${scheduledTime}`) : null,
+                audienceFilter: {
+                    tags: selectedOption === 'labels' ? selectedLabels : [],
+                    status: selectedOption === 'status' ? selectedStatus : null,
+                }
+            };
+
+            const res = await CampaignApi.createCampaign(campaignData);
+            if (res.success) {
+                toast.success(scheduleOption === 'now' ? 'Campaign launched successfully!' : 'Campaign scheduled successfully!');
+                navigate('/admin/campaigns');
+            }
+        } catch (error) {
+            console.error('Error launching campaign:', error);
+            toast.error(error.response?.data?.message || 'Failed to launch campaign');
+        } finally {
+            setIsLaunching(false);
+        }
+    };
+
+    const handleSaveAsDraft = async () => {
+        try {
+            setIsSavingDraft(true);
+            const campaignData = {
+                name: campaignName,
+                messageTemplate: selectedTemplate,
+                status: 'draft',
+                audienceFilter: {
+                    tags: selectedOption === 'labels' ? selectedLabels : [],
+                    status: selectedOption === 'status' ? selectedStatus : null,
+                }
+            };
+            const res = await CampaignApi.createCampaign(campaignData);
+            if (res.success) {
+                toast.success('Campaign saved as draft!');
+                navigate('/admin/campaigns');
+            }
+        } catch (error) {
+            console.error('Error saving draft:', error);
+            toast.error(error.response?.data?.message || 'Failed to save draft');
+        } finally {
+            setIsSavingDraft(false);
+        }
+    };
 
     const templates = [
         {
-            id: 'admission_promo_05',
+            id: 'new_food_menu',
             status: 'approved',
-            name: 'admission_promo_05',
-            preview: 'Hello {{name}}, thank you for showing interest in {{program}}.\n\nWe are excited to invite you to our upcoming webinar on June 15th.\n\nLooking forward to seeing you there!',
+            name: 'new_food_menu',
+            preview: "Hey {{1}}! We've just rolled out a brand new menu that's bursting with Italian flavors. 🍕 To celebrate this, we are offering a 20% discount!",
             lastUsed: '2 days ago',
             category: 'Marketing'
         },
         {
-            id: 'result_alert_mbbs',
+            id: 'food_order_on_the_way',
             status: 'approved',
-            name: 'result_alert_mbbs',
-            preview: 'Dear {{student_name}}, your {{exam_type}} results for the 2024 session have been published.\n\nCheck your portal for detailed breakdown.\n\nBest regards,\nUniversity Admin',
+            name: 'food_order_on_th...',
+            preview: "Hey {{1}}! Your pizza adventure is officially on its way! 🍕🚀 \n\nExpect the mouthwatering goodness to arrive at your doorstep by {{2}}!",
+            lastUsed: '1 day ago',
+            category: 'Utility'
+        },
+        {
+            id: 'food_order_delivered',
+            status: 'approved',
+            name: 'food_order_deliv...',
+            preview: "Hey {{1}}! Your order from {{2}} has been successfully delivered to your doorstep. 🍔🍟 \n\nWe hope you're as hungry as we are...",
             lastUsed: '5 days ago',
             category: 'Utility'
         },
         {
-            id: 'welcome_onboarding',
+            id: 'food_order_confirmed',
             status: 'approved',
-            name: 'welcome_onboarding',
-            preview: 'Welcome to {{company_name}}! We\'re thrilled to have you.\n\nClick the button below to complete your profile setup and get started.\n\nSee you inside!',
+            name: 'food_order_confi...',
+            preview: "Your Food Order is confirmed. Hey {{1}}! Thank you for placing an order with {{2}}. Our talented chefs are busy cooking...",
             lastUsed: 'Never',
-            category: 'Onboarding'
+            category: 'Utility'
         },
         {
-            id: 'event_reminder_01',
-            status: 'pending',
-            name: 'event_reminder_01',
-            preview: "Don't miss out! Our session {{event_name}} starts in {{time_left}}.\n\nMake sure to join 5 minutes early to test your audio.",
+            id: 'holiday_package_v1',
+            status: 'approved',
+            name: 'holiday_package_v1',
+            preview: "Ready for your next adventure? 🏖️ Book our exclusive Bali package today and get a complimentary spa voucher!",
             lastUsed: 'Never',
-            category: 'Alerts'
+            category: 'Marketing'
         }
     ];
 
@@ -85,8 +231,12 @@ const CreateCampaign = () => {
                     </div>
 
                     {currentStep === 3 ? (
-                        <button className="text-slate-500 font-bold hover:text-slate-700 transition-colors text-sm">
-                            Save as Draft
+                        <button
+                            onClick={handleSaveAsDraft}
+                            disabled={isSavingDraft}
+                            className="text-slate-500 font-bold hover:text-slate-700 transition-colors text-sm disabled:opacity-50"
+                        >
+                            {isSavingDraft ? 'Saving...' : 'Save as Draft'}
                         </button>
                     ) : (
                         <button
@@ -113,8 +263,30 @@ const CreateCampaign = () => {
                 {currentStep === 1 && (
                     <div className="px-12 pb-12 transition-all duration-300">
                         <div className="mb-6">
-                            <h2 className="text-xl font-bold text-slate-800">Who should receive this campaign?</h2>
-                            <p className="text-gray-500 mt-1">Select the contacts you want to reach out to.</p>
+                            <h2 className="text-xl font-bold text-slate-800">Create a New Campaign</h2>
+                            <p className="text-gray-500 mt-1">Give your campaign a name, then select the audience to reach.</p>
+                        </div>
+
+                        {/* Campaign Name Input */}
+                        <div className="mb-6 p-5 rounded-xl border-2 border-gray-100 bg-white">
+                            <label className="block text-[11px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
+                                Campaign Name <span className="text-red-400">*</span>
+                            </label>
+                            <input
+                                type="text"
+                                value={campaignName}
+                                onChange={(e) => setCampaignName(e.target.value)}
+                                placeholder="e.g. Summer Admission Drive 2025"
+                                className="w-full px-4 py-2.5 border border-gray-200 rounded-lg text-sm text-slate-800 font-medium placeholder:text-gray-300 focus:outline-none focus:ring-2 focus:ring-emerald-400/50 focus:border-emerald-400 bg-gray-50 transition"
+                            />
+                            {campaignName.trim() === '' && (
+                                <p className="text-[11px] text-gray-400 mt-1.5">A name helps you identify this campaign later.</p>
+                            )}
+                        </div>
+
+                        <div className="mb-4">
+                            <h3 className="text-base font-bold text-slate-800">Who should receive this campaign?</h3>
+                            <p className="text-gray-500 text-sm mt-0.5">Select the contacts you want to reach out to.</p>
                         </div>
 
                         <div className="space-y-4">
@@ -122,7 +294,7 @@ const CreateCampaign = () => {
                             <SelectionCard
                                 id="all"
                                 title="All Contacts"
-                                description="Send this campaign to everyone in your contact list (1,240 contacts)."
+                                description={`Send this campaign to everyone in your contact list (${totalContacts.toLocaleString()} contacts).`}
                                 icon={<Users className="w-5 h-5 text-gray-400" />}
                                 selected={selectedOption === 'all'}
                                 onClick={() => setSelectedOption('all')}
@@ -147,38 +319,118 @@ const CreateCampaign = () => {
                                         <p className="text-gray-500 text-sm mb-3">Select specific segments of your audience using labels.</p>
 
                                         {/* Tags Input Area */}
-                                        <div className="flex flex-wrap items-center gap-2 p-2 border border-gray-200 rounded-lg bg-gray-50/50">
-                                            {labels.map(label => (
+                                        <div className="flex flex-wrap items-center gap-2 p-2 border border-gray-200 rounded-lg bg-gray-50/50 relative">
+                                            {selectedLabels.map(label => (
                                                 <span key={label} className="flex items-center gap-1 px-3 py-1 bg-white border border-gray-200 rounded-md text-sm text-gray-700 shadow-sm">
-                                                    {label} <X className="w-3 h-3 text-gray-400 cursor-pointer" />
+                                                    {label} <X className="w-3 h-3 text-gray-400 cursor-pointer" onClick={() => setSelectedLabels(prev => prev.filter(l => l !== label))} />
                                                 </span>
                                             ))}
-                                            <input
-                                                placeholder="Add labels..."
-                                                className="flex-1 bg-transparent border-none focus:ring-0 text-sm text-gray-400 min-w-[100px]"
-                                            />
-                                            <ChevronDown className="w-4 h-4 text-gray-400" />
+                                            <select 
+                                                className="flex-1 bg-transparent border-none focus:ring-0 text-sm text-gray-400 min-w-[150px] outline-none"
+                                                onChange={(e) => {
+                                                    const val = e.target.value;
+                                                    if (val && !selectedLabels.includes(val)) {
+                                                        setSelectedLabels(prev => [...prev, val]);
+                                                    }
+                                                    e.target.value = "";
+                                                }}
+                                            >
+                                                <option value="">Add labels...</option>
+                                                {labelsList.filter(l => !selectedLabels.includes(l)).map(l => (
+                                                    <option key={l} value={l}>{l}</option>
+                                                ))}
+                                            </select>
                                         </div>
                                     </div>
                                 </div>
                             </div>
 
+                            {/* Option 2.5: Filter by Status */}
+                            <div
+                                onClick={() => setSelectedOption('status')}
+                                className={`p-4 rounded-xl border-2 transition-all cursor-pointer ${selectedOption === 'status' ? 'border-emerald-500 bg-white' : 'border-gray-100 bg-white'
+                                    }`}
+                            >
+                                <div className="flex items-start gap-4">
+                                    <div className={`mt-1 w-5 h-5 rounded-full border-2 flex items-center justify-center ${selectedOption === 'status' ? 'border-emerald-500' : 'border-gray-300'
+                                        }`}>
+                                        {selectedOption === 'status' && <div className="w-2.5 h-2.5 bg-emerald-500 rounded-full" />}
+                                    </div>
+                                    <div className="flex-1">
+                                        <div className="flex justify-between">
+                                            <h3 className="font-bold text-slate-800">Filter by Status</h3>
+                                            <Filter className="w-5 h-5 text-gray-300" />
+                                        </div>
+                                        <p className="text-gray-500 text-sm mb-3">Send messages based on contact lead status.</p>
+
+                                        <select 
+                                            value={selectedStatus}
+                                            onChange={(e) => setSelectedStatus(e.target.value)}
+                                            onClick={(e) => e.stopPropagation()}
+                                            className="w-full bg-gray-50 border border-gray-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-emerald-500"
+                                        >
+                                            <option value="">Select Status...</option>
+                                            {statusOptions.map(opt => (
+                                                <option key={opt} value={opt}>{opt}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+
                             {/* Option 3: Upload CSV */}
-                            <SelectionCard
-                                id="csv"
-                                title="Upload CSV"
-                                description="Import a list of contacts from a CSV or Excel file."
-                                icon={<FileUp className="w-5 h-5 text-gray-400" />}
-                                selected={selectedOption === 'csv'}
-                                onClick={() => setSelectedOption('csv')}
-                            />
+                            <div
+                                onClick={() => {
+                                    setSelectedOption('csv');
+                                    fileInputRef.current.click();
+                                }}
+                                className={`p-4 rounded-xl border-2 transition-all cursor-pointer ${selectedOption === 'csv' ? 'border-emerald-500 bg-white' : 'border-gray-100 bg-white'}`}
+                            >
+                                <div className="flex items-start gap-4">
+                                    <div className={`mt-1 w-5 h-5 rounded-full border-2 flex items-center justify-center ${selectedOption === 'csv' ? 'border-emerald-500' : 'border-gray-300'}`}>
+                                        {selectedOption === 'csv' && <div className="w-2.5 h-2.5 bg-emerald-500 rounded-full" />}
+                                    </div>
+                                    <div className="flex-1">
+                                        <div className="flex justify-between">
+                                            <h3 className="font-bold text-slate-800">Upload CSV</h3>
+                                            <FileUp className="w-5 h-5 text-gray-400" />
+                                        </div>
+                                        <p className="text-gray-500 text-sm mt-1">Import a list of contacts from a CSV or Excel file.</p>
+
+                                        {/* File Selected State */}
+                                        {csvFile && (
+                                            <div className="mt-3 flex items-center gap-2 px-3 py-2 bg-emerald-50 border border-emerald-100 rounded-lg animate-in slide-in-from-top-1 duration-300">
+                                                <div className="w-6 h-6 bg-emerald-100 rounded flex items-center justify-center text-emerald-600 font-bold text-[10px]">CSV</div>
+                                                <span className="text-xs font-bold text-emerald-700 truncate">{csvFile.name}</span>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        setCsvFile(null);
+                                                    }}
+                                                    className="ml-auto text-emerald-400 hover:text-emerald-600"
+                                                >
+                                                    <X className="w-4 h-4" />
+                                                </button>
+                                            </div>
+                                        )}
+
+                                        <input
+                                            type="file"
+                                            ref={fileInputRef}
+                                            className="hidden"
+                                            accept=".csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel"
+                                            onChange={handleFileChange}
+                                        />
+                                    </div>
+                                </div>
+                            </div>
                         </div>
 
                         {/* Footer Info & Actions */}
                         <div className="mt-12 pt-8 border-t border-gray-100 flex items-center justify-between">
                             <div className="flex items-center gap-2 text-sm text-gray-500">
                                 <div className="w-4 h-4 bg-gray-400 text-white rounded-full flex items-center justify-center text-[10px] italic font-serif">i</div>
-                                <span>Estimated audience: <strong className="text-slate-800 font-bold">1,240 contacts</strong></span>
+                                <span>Estimated audience: <strong className="text-slate-800 font-bold">{estimatedCount.toLocaleString()} contacts</strong></span>
                             </div>
                             <div className="flex gap-3">
                                 <button className="px-8 py-2.5 rounded-lg border border-gray-200 font-bold text-slate-700 hover:bg-gray-50 transition-colors">
@@ -186,7 +438,8 @@ const CreateCampaign = () => {
                                 </button>
                                 <button
                                     onClick={nextStep}
-                                    className="px-8 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 font-bold text-white flex items-center gap-2 transition-colors"
+                                    disabled={campaignName.trim() === ''}
+                                    className={`px-8 py-2.5 rounded-lg font-bold text-white flex items-center gap-2 transition-colors ${campaignName.trim() === '' ? 'bg-emerald-300 cursor-not-allowed' : 'bg-emerald-500 hover:bg-emerald-600'}`}
                                 >
                                     Next <ArrowRight className="w-4 h-4" />
                                 </button>
@@ -263,14 +516,14 @@ const CreateCampaign = () => {
 
                         {/* RIGHT SIDE: Preview */}
                         <div className="w-1/2 bg-slate-50 flex flex-col items-center justify-center p-6 relative overflow-hidden">
-                            
+
                             {/* Mobile Mockup */}
                             <div className="relative w-[280px] h-[400px] flex-shrink-0 bg-slate-900 rounded-[3rem] border-[10px] border-slate-800 shadow-2xl overflow-hidden transition-transform">
                                 <div className="h-full w-full bg-[#f0f2f5] flex flex-col overflow-hidden">
                                     {/* App Header */}
                                     <div className="bg-[#00a884] p-4 pt-5 flex items-center gap-3 text-white">
                                         <ArrowRight className="w-5 h-5 rotate-180" />
-                                        <User size={24} className="bg-white/20 rounded-full p-1"/>
+                                        <User size={24} className="bg-white/20 rounded-full p-1" />
                                         <div className="flex-1">
                                             <p className="text-xs font-bold">University Admission</p>
                                             <p className="text-[9px] text-white/80">Official Account</p>
@@ -429,7 +682,7 @@ const CreateCampaign = () => {
                                     </div>
                                     <div className="flex justify-between items-start">
                                         <span className="text-gray-500 text-sm">Selected Audience</span>
-                                        <span className="font-bold text-slate-800 text-right">1,248 Contacts</span>
+                                        <span className="font-bold text-slate-800 text-right">{estimatedCount.toLocaleString()} Contacts</span>
                                     </div>
                                     <div className="flex justify-between items-start pt-2">
                                         <span className="text-gray-500 text-sm">Estimated Cost</span>
@@ -449,8 +702,17 @@ const CreateCampaign = () => {
                                 </div>
 
                                 {/* Launch Button */}
-                                <button className="w-full bg-emerald-500 hover:bg-emerald-600 text-white py-3.5 rounded-xl font-bold flex items-center justify-center gap-2 transition-transform active:scale-[0.98] shadow-lg shadow-emerald-500/20">
-                                    <Rocket className="w-5 h-5" /> Launch Campaign
+                                <button
+                                    onClick={handleLaunch}
+                                    disabled={isLaunching}
+                                    className={`w-full bg-emerald-500 hover:bg-emerald-600 text-white py-3.5 rounded-xl font-bold flex items-center justify-center gap-2 transition-transform active:scale-[0.98] shadow-lg shadow-emerald-500/20 ${isLaunching ? 'opacity-70 cursor-not-allowed' : ''}`}
+                                >
+                                    {isLaunching ? (
+                                        <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                                    ) : (
+                                        <Rocket className="w-5 h-5" />
+                                    )}
+                                    {isLaunching ? 'Launching...' : 'Launch Campaign'}
                                 </button>
 
                                 <p className="text-[10px] text-gray-400 text-center mt-3">By launching, you agree to our WhatsApp Policy Guidelines.</p>
@@ -486,8 +748,12 @@ const CreateCampaign = () => {
                             <ChevronLeft className="w-5 h-5" /> Back
                         </button>
                         <div className="flex gap-4">
-                            <button className="text-slate-500 font-bold hover:text-slate-700 transition-colors">
-                                Save Draft
+                            <button
+                                onClick={handleSaveAsDraft}
+                                disabled={isSavingDraft}
+                                className="text-slate-500 font-bold hover:text-slate-700 transition-colors disabled:opacity-50"
+                            >
+                                {isSavingDraft ? 'Saving...' : 'Save Draft'}
                             </button>
                             <button
                                 onClick={nextStep}

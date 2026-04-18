@@ -6,60 +6,158 @@ import {
   InformationCircleIcon, 
   LockClosedIcon, 
   LinkIcon, 
-  PaperClipIcon 
+  PaperClipIcon,
+  TrashIcon
 } from "@heroicons/react/24/outline";
+import { getPresenceInfo } from "../../utils/presence";
 
-const UserProfilePanel = ({ data, onClose, onViewHistory }) => {
+const UserProfilePanel = ({ data, onClose, onViewHistory, availableLabels = [], statusOptions = [], onUpdateProfile, onUpdateLabels }) => {
   
   // --- 1. STATE FOR PROFILE DATA ---
-  // We store the profile data in state so we can update it instantly
   const [profileData, setProfileData] = useState({
-    name: data?.name || "Priyanshu Raghuvanshi",
-    phone: data?.phone || "+91 98765 43210",
-    email: data?.email || "priyanshu@example.com",
-    status: "Warm Lead",
-    institute: "University Of Delhi",
-    gstn: "09AAX... (Verified)",
-    city: "Ghaziabad, UP"
+    name: data?.name || "",
+    phone: data?.phone || "",
+    email: data?.email || "",
+    status: data?.chatStatus || "Open",
+    institute: data?.customFields?.institute || "",
+    gstn: data?.customFields?.gstn || "",
+    city: data?.customFields?.city || ""
   });
+
+  // Effect to sync when data changes
+  React.useEffect(() => {
+    setProfileData(prev => ({
+      ...prev,
+      name: data?.name || "",
+      phone: data?.phone || "",
+      email: data?.email || "",
+      status: data?.chatStatus || "Open",
+      institute: data?.customFields?.institute || "",
+      gstn: data?.customFields?.gstn || "",
+      city: data?.customFields?.city || ""
+    }));
+  }, [data]);
+
+  // Sync notes from data
+  const [notes, setNotes] = useState(data?.notes || []);
+  React.useEffect(() => {
+    setNotes(data?.notes || []);
+  }, [data?.notes]);
+
+  // Derived labels for display
+  const currentLabels = availableLabels.filter(l => data?.labels?.includes(l.name));
 
   // State to manage the Edit Form inputs before saving
   const [editForm, setEditForm] = useState({ ...profileData });
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [showLabelPicker, setShowLabelPicker] = useState(false);
+  const [showEditLabelPicker, setShowEditLabelPicker] = useState(false); // New state for edit modal
+  const [labelSearch, setLabelSearch] = useState("");
+
+  const labelPickerRef = React.useRef(null);
+  const editLabelPickerRef = React.useRef(null); // Ref for edit modal label picker
+  
+  React.useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (labelPickerRef.current && !labelPickerRef.current.contains(event.target)) {
+        setShowLabelPicker(false);
+      }
+      if (editLabelPickerRef.current && !editLabelPickerRef.current.contains(event.target)) {
+        setShowEditLabelPicker(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   // --- 2. STATE FOR NOTES ---
-  const [notes, setNotes] = useState([
-    { 
-      text: "Customer inquired about the new curriculum for Q3. Highly interested in the premium plan if GST billing is enabled.", 
-      author: "Agent John", 
-      date: "Feb 12" 
-    }
-  ]);
   const [isNoteModalOpen, setIsNoteModalOpen] = useState(false);
   const [newNoteContent, setNewNoteContent] = useState("");
+  const [presenceNow, setPresenceNow] = useState(Date.now());
+
+  React.useEffect(() => {
+    const timerId = setInterval(() => {
+      setPresenceNow(Date.now());
+    }, 30000);
+
+    return () => clearInterval(timerId);
+  }, []);
+
+  const presenceInfo = React.useMemo(() => getPresenceInfo(data, presenceNow), [data, presenceNow]);
 
   // --- HANDLERS ---
   const handleEditChange = (e) => {
     setEditForm({ ...editForm, [e.target.name]: e.target.value });
   };
 
-  const handleSaveProfile = () => {
-    setProfileData(editForm); // Applies changes to the UI instantly!
+  const handleSaveProfile = async () => {
+    // Optimistic UI update
+    setProfileData(editForm);
+    
+    // Preparation for backend
+    const updatePayload = {
+      name: editForm.name,
+      phone: editForm.phone,
+      email: editForm.email,
+      chatStatus: editForm.status,
+      customFields: {
+        institute: editForm.institute,
+        gstn: editForm.gstn,
+        city: editForm.city
+      }
+    };
+
+    if (onUpdateProfile) {
+      await onUpdateProfile(data._id, updatePayload);
+    }
+    
     setIsEditModalOpen(false);
   };
 
-  const handleSaveNote = () => {
+  const handleToggleLabel = async (labelName) => {
+    let newLabels;
+    const existingLabels = data?.labels || [];
+    
+    if (existingLabels.includes(labelName)) {
+      newLabels = existingLabels.filter(name => name !== labelName);
+    } else {
+      newLabels = [...existingLabels, labelName];
+    }
+    
+    if (onUpdateLabels) {
+      await onUpdateLabels(newLabels);
+    }
+  };
+
+  const handleSaveNote = async () => {
     if (!newNoteContent.trim()) return;
     
     const newNote = {
       text: newNoteContent,
-      author: "You", // Or current logged-in user
-      date: "Just now"
+      author: "Agent", 
+      date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
     };
 
-    setNotes([newNote, ...notes]); // Adds the new note to the top of the list!
+    const updatedNotes = [newNote, ...notes];
+    setNotes(updatedNotes); // Optimistic UI update
+
+    // Save to backend
+    if (onUpdateProfile) {
+       await onUpdateProfile(data._id, { notes: updatedNotes });
+    }
+
     setNewNoteContent("");
     setIsNoteModalOpen(false);
+  };
+
+  const handleDeleteNote = async (indexToDelete) => {
+    const updatedNotes = notes.filter((_, index) => index !== indexToDelete);
+    setNotes(updatedNotes); // Optimistic UI update
+
+    // Save to backend
+    if (onUpdateProfile) {
+       await onUpdateProfile(data._id, { notes: updatedNotes });
+    }
   };
 
   return (
@@ -80,17 +178,24 @@ const UserProfilePanel = ({ data, onClose, onViewHistory }) => {
         <div className="p-8 flex flex-col items-center border-b border-slate-50">
           <div className="relative mb-4">
               <img src={data?.avatar || `https://ui-avatars.com/api/?name=${profileData.name.replace(' ', '+')}&background=f3f4f6&color=6b7280`} alt="" className="w-24 h-24 rounded-2xl shadow-sm object-cover" />
-              <span className="absolute -bottom-1 -right-1 w-5 h-5 bg-[#22C55E] border-[3px] border-white rounded-full"></span>
+              <span className={`absolute -bottom-1 -right-1 w-5 h-5 border-[3px] border-white rounded-full ${presenceInfo.isOnline ? 'bg-[#22C55E]' : 'bg-slate-300'}`}></span>
           </div>
           
           <h2 className="text-lg font-extrabold text-slate-900 text-center">{profileData.name}</h2>
-          <p className="text-xs text-slate-500 font-medium mb-4">{profileData.phone}</p>
+          <p className="text-xs text-slate-500 font-medium mb-1">{profileData.phone}</p>
+          <p className="text-[11px] text-slate-500 font-medium mb-2">{presenceInfo.label}</p>
+          {profileData.email && (
+            <div className="flex items-center gap-1.5 text-xs text-slate-500 font-medium mb-4">
+              <AtSymbolIcon className="w-3 h-3 text-slate-400" />
+              <span>{profileData.email}</span>
+            </div>
+          )}
           
-          <span className={`px-4 py-1 text-[10px] font-bold rounded-md border uppercase tracking-widest shadow-sm
-            ${profileData.status === 'Warm Lead' ? 'bg-[#f0fdf4] text-[#16a34a] border-[#bbf7d0]' : 
-              profileData.status === 'Cold Lead' ? 'bg-slate-100 text-slate-600 border-slate-200' : 
-              'bg-blue-50 text-blue-600 border-blue-200'}`}
-          >
+          <span className="px-4 py-1 text-[10px] font-bold rounded-md border uppercase tracking-widest shadow-sm" style={{
+             backgroundColor: (statusOptions.find(s => s.label.toLowerCase() === profileData.status?.toLowerCase())?.original?.color + '15') || '#f1f5f9',
+             color: statusOptions.find(s => s.label.toLowerCase() === profileData.status?.toLowerCase())?.original?.color || '#64748b',
+             borderColor: (statusOptions.find(s => s.label.toLowerCase() === profileData.status?.toLowerCase())?.original?.color + '30') || '#e2e8f0'
+          }}>
              {profileData.status}
           </span>
         </div>
@@ -101,11 +206,63 @@ const UserProfilePanel = ({ data, onClose, onViewHistory }) => {
           {/* LABELS */}
           <div>
              <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">Labels</h4>
-             <div className="flex flex-wrap gap-2 items-center">
-                 <span className="px-3 py-1.5 bg-[#eff6ff] text-[#2563eb] text-xs font-bold rounded-lg border border-[#dbeafe]">Priority</span>
-                 <span className="px-3 py-1.5 bg-[#faf5ff] text-[#9333ea] text-xs font-bold rounded-lg border border-[#f3e8ff]">Education</span>
-                 <span className="px-3 py-1.5 bg-[#fff7ed] text-[#ea580c] text-xs font-bold rounded-lg border border-[#ffedd5]">Delhi-NCR</span>
-                 <button className="w-8 h-8 flex items-center justify-center bg-white text-slate-400 rounded-full hover:bg-slate-50 border border-slate-200 transition-colors shadow-sm"><PlusIcon className="w-4 h-4" /></button>
+             <div className="flex flex-wrap gap-2 items-center relative">
+                 {currentLabels.length === 0 && <p className="text-[10px] text-slate-400 italic">No labels applied</p>}
+                 {currentLabels.map(label => (
+                    <span key={label._id || label.id} className="px-3 py-1.5 text-xs font-bold rounded-lg border shadow-sm group relative" style={{
+                       backgroundColor: label.color + '15',
+                       color: label.color,
+                       borderColor: label.color + '30'
+                    }}>
+                      {label.name}
+                      <button 
+                        onClick={() => handleToggleLabel(label.name)}
+                        className="absolute -top-1.5 -right-1.5 bg-white rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity border border-slate-100"
+                      >
+                        <XMarkIcon className="w-3 h-3 text-red-500" />
+                      </button>
+                    </span>
+                 ))}
+                 <div className="relative">
+                    <button 
+                      onClick={() => setShowLabelPicker(!showLabelPicker)}
+                      className="w-8 h-8 flex items-center justify-center bg-white text-slate-400 rounded-full hover:bg-slate-50 border border-slate-200 transition-colors shadow-sm"
+                    >
+                      <PlusIcon className="w-4 h-4" />
+                    </button>
+                    
+                    {showLabelPicker && (
+                      <div ref={labelPickerRef} className="absolute left-0 top-10 w-52 bg-white border border-slate-100 shadow-xl rounded-xl py-2 z-50 animate-in fade-in zoom-in-95 duration-100 origin-top-left">
+                        <div className="px-3 pb-2 border-b border-slate-50 mb-1">
+                          <input 
+                            type="text" 
+                            placeholder="Find labels..." 
+                            className="w-full text-xs outline-none bg-slate-50 px-2 py-1.5 rounded-lg border-none"
+                            value={labelSearch}
+                            onChange={(e) => setLabelSearch(e.target.value)}
+                            autoFocus
+                          />
+                        </div>
+                        <div className="max-h-40 overflow-y-auto custom-scrollbar">
+                          {availableLabels
+                            .filter(l => l.name.toLowerCase().includes(labelSearch.toLowerCase()))
+                            .map(label => (
+                              <button 
+                                key={label._id || label.id}
+                                onClick={() => { handleToggleLabel(label.name); setShowLabelPicker(false); }}
+                                className="w-full text-left px-4 py-2 hover:bg-slate-50 flex items-center justify-between group transition-colors"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span className="w-2 h-2 rounded-full" style={{ backgroundColor: label.color }}></span>
+                                  <span className={`text-xs font-bold ${data?.labels?.includes(label.name) ? 'text-green-600' : 'text-slate-600'}`}>{label.name}</span>
+                                </div>
+                                {data?.labels?.includes(label.name) && <span className="text-[10px] text-green-500 font-bold">✓</span>}
+                              </button>
+                            ))}
+                        </div>
+                      </div>
+                    )}
+                 </div>
              </div>
           </div>
 
@@ -137,7 +294,16 @@ const UserProfilePanel = ({ data, onClose, onViewHistory }) => {
              
              <div className="space-y-3">
                {notes.map((note, index) => (
-                 <div key={index} className="bg-[#FFFDF0] border border-[#FDF0B4] p-4 rounded-xl relative">
+                 <div key={index} className="bg-[#FFFDF0] border border-[#FDF0B4] p-4 rounded-xl relative group">
+                    {/* Delete Note Button */}
+                    <button 
+                      onClick={() => handleDeleteNote(index)}
+                      className="absolute top-2 right-2 p-1.5 text-red-300 hover:text-red-500 hover:bg-red-50 rounded-lg opacity-0 group-hover:opacity-100 transition-all"
+                      title="Delete Note"
+                    >
+                      <TrashIcon className="w-3.5 h-3.5" />
+                    </button>
+
                     <p className="text-xs text-slate-700 italic leading-relaxed mb-4">"{note.text}"</p>
                     <div className="flex justify-between items-center text-[10px] font-bold text-slate-400">
                        <span>By {note.author}</span>
@@ -179,7 +345,7 @@ const UserProfilePanel = ({ data, onClose, onViewHistory }) => {
 
               <div className="p-6 overflow-y-auto custom-scrollbar space-y-6 flex-1">
                  <div className="flex justify-center mb-2">
-                    <img src={`https://ui-avatars.com/api/?name=${editForm.name.replace(' ', '+')}`} alt="Avatar" className="w-16 h-16 rounded-full object-cover shadow-sm border border-slate-100" />
+                    <img src={data?.avatar || `https://ui-avatars.com/api/?name=${editForm.name.replace(' ', '+')}`} alt="Avatar" className="w-16 h-16 rounded-full object-cover shadow-sm border border-slate-100" />
                  </div>
 
                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -189,7 +355,7 @@ const UserProfilePanel = ({ data, onClose, onViewHistory }) => {
                     </div>
                     <div>
                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block">WhatsApp Number</label>
-                       <input type="text" value={editForm.phone} className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm font-medium text-slate-500 outline-none cursor-not-allowed" readOnly/>
+                       <input type="text" name="phone" value={editForm.phone} onChange={handleEditChange} className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-800 focus:border-[#22C55E] outline-none transition-shadow"/>
                     </div>
                  </div>
 
@@ -201,22 +367,67 @@ const UserProfilePanel = ({ data, onClose, onViewHistory }) => {
                     <div>
                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block">Status</label>
                        <select name="status" value={editForm.status} onChange={handleEditChange} className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-800 focus:border-[#22C55E] focus:ring-1 focus:ring-[#22C55E] outline-none transition-shadow">
-                          <option value="Warm Lead">Warm Lead</option>
-                          <option value="Cold Lead">Cold Lead</option>
-                          <option value="Closed">Closed</option>
+                          {statusOptions.map(option => (
+                             <option key={option.id} value={option.label.toLowerCase()}>{option.label}</option>
+                          ))}
+                          {statusOptions.length === 0 && <option value="open">Open</option>}
                        </select>
                     </div>
                  </div>
 
-                 {/* Labels Box (Visual Only) */}
-                 <div>
+                 {/* Labels Box */}
+                 <div className="relative">
                     <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block">Labels</label>
-                    <div className="min-h-[46px] border border-slate-200 rounded-xl p-2 flex flex-wrap gap-2 items-center focus-within:border-[#22C55E] focus-within:ring-1 focus-within:ring-[#22C55E] bg-white transition-shadow">
-                       <span className="flex items-center gap-1.5 px-2.5 py-1 bg-[#eff6ff] text-[#2563eb] text-xs font-bold rounded-lg">Priority <XMarkIcon className="w-3 h-3 cursor-pointer hover:text-blue-800"/></span>
-                       <span className="flex items-center gap-1.5 px-2.5 py-1 bg-[#faf5ff] text-[#9333ea] text-xs font-bold rounded-lg">Education <XMarkIcon className="w-3 h-3 cursor-pointer hover:text-purple-800"/></span>
-                       <span className="flex items-center gap-1.5 px-2.5 py-1 bg-[#fff7ed] text-[#ea580c] text-xs font-bold rounded-lg">Delhi-NCR <XMarkIcon className="w-3 h-3 cursor-pointer hover:text-orange-800"/></span>
-                       <input type="text" placeholder="Search and add labels..." className="flex-1 min-w-[150px] outline-none text-sm px-1 py-1 text-slate-700 placeholder:text-slate-400 bg-transparent" />
+                    <div 
+                      className="min-h-[46px] border border-slate-200 rounded-xl p-2 flex flex-wrap gap-2 items-center focus-within:border-[#22C55E] focus-within:ring-1 focus-within:ring-[#22C55E] bg-white transition-shadow cursor-pointer" 
+                      onClick={() => setShowEditLabelPicker(!showEditLabelPicker)}
+                    >
+                        {currentLabels.map(label => (
+                           <span key={label._id || label.id} className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold rounded-lg border" style={{
+                              backgroundColor: label.color + '15',
+                              color: label.color,
+                              borderColor: label.color + '30'
+                           }}>{label.name} <XMarkIcon className="w-3 h-3 cursor-pointer opacity-70 hover:opacity-100" onClick={(e) => { e.stopPropagation(); handleToggleLabel(label.name); }}/></span>
+                        ))}
+                        {currentLabels.length === 0 && <p className="text-xs text-slate-400 px-2 italic">Select labels...</p>}
+                        {currentLabels.length > 0 && <span className="w-6 h-6 flex items-center justify-center bg-slate-50 text-slate-400 rounded-full hover:bg-slate-100"><PlusIcon className="w-3.5 h-3.5"/></span>}
                     </div>
+
+                    {showEditLabelPicker && (
+                      <div ref={editLabelPickerRef} className="absolute left-0 top-full mt-2 w-full max-w-[300px] bg-white border border-slate-100 shadow-2xl rounded-2xl py-3 z-[110] animate-in fade-in slide-in-from-top-2 duration-200">
+                        <div className="px-3 pb-3 border-b border-slate-50 mb-2">
+                          <input 
+                            type="text" 
+                            placeholder="Search labels..." 
+                            className="w-full text-xs outline-none bg-slate-50 px-3 py-2 rounded-xl border border-slate-100 focus:border-[#22C55E] transition-all"
+                            value={labelSearch}
+                            onChange={(e) => setLabelSearch(e.target.value)}
+                            autoFocus
+                            onClick={(e) => e.stopPropagation()}
+                          />
+                        </div>
+                        <div className="max-h-52 overflow-y-auto custom-scrollbar px-1">
+                          {availableLabels
+                            .filter(l => l.name.toLowerCase().includes(labelSearch.toLowerCase()))
+                            .map(label => (
+                              <button 
+                                key={label._id || label.id}
+                                onClick={(e) => { 
+                                  e.stopPropagation();
+                                  handleToggleLabel(label.name); 
+                                }}
+                                className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center justify-between group transition-colors rounded-xl mx-1"
+                              >
+                                <div className="flex items-center gap-3">
+                                  <span className="w-2.5 h-2.5 rounded-full shadow-sm" style={{ backgroundColor: label.color }}></span>
+                                  <span className={`text-xs font-bold ${data?.labels?.includes(label.name) ? 'text-[#22C55E]' : 'text-slate-600'}`}>{label.name}</span>
+                                </div>
+                                {data?.labels?.includes(label.name) && <span className="text-[10px] text-[#22C55E] font-extrabold bg-green-50 px-1.5 py-0.5 rounded">SELECTED</span>}
+                              </button>
+                            ))}
+                        </div>
+                      </div>
+                    )}
                  </div>
 
                  {/* Custom Fields */}

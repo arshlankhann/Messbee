@@ -43,7 +43,7 @@ const corsOptions = {
 
     const allowedOrigins = [
       'http://localhost:5173',
-      process.env.CLIENT_URL
+      process.env.CLIENT_URL ? process.env.CLIENT_URL.trim() : null
     ].filter(Boolean);
 
     // Allow any subdomain or explicitly allowed origins
@@ -61,7 +61,11 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 app.use(cookieParser());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 app.use(express.urlencoded({ extended: true }));
 
 // Handle OPTIONS method for all routes (CORS preflight)
@@ -123,6 +127,8 @@ app.use('/api/quick-replies', require('./routes/quickReplyRoutes'));
 app.use('/api/custom-fields', require('./routes/customFieldRoutes'));
 app.use('/api/labels', require('./routes/labelRoutes'));
 app.use('/api/statuses', require('./routes/statusRoutes'));
+app.use('/api/media', require('./routes/mediaRoutes'));
+app.use('/api/settings', require('./routes/settingsRoutes'));
 
 // ================== HEALTH CHECK ==================
 
