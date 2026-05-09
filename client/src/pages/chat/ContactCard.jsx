@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   MagnifyingGlassIcon,
   ChevronRightIcon,
@@ -26,8 +26,16 @@ const LAST_SEEN_FILTERS = [
   { value: "30d", label: "Last 30 days" }
 ];
 
-const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTab, onCreateChat, onUpdateStatus, onTogglePin, onUpdateLabels }) => {
+const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTab, onCreateChat, onUpdateStatus, onTogglePin, onUpdateLabels, onLoadMore, hasMoreChats, isLoadingMore }) => {
   const [searchTerm, setSearchTerm] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+
+  // Debounce search input — only update the filter value 200ms after typing stops
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchTerm), 200);
+    return () => clearTimeout(t);
+  }, [searchTerm]);
+
 
   // State for the New Chat Modal
   const [isNewChatModalOpen, setIsNewChatModalOpen] = useState(false);
@@ -134,6 +142,24 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
     return () => clearInterval(timerId);
   }, []);
 
+  // ── Infinite scroll sentinel for loading more chats ───────────────────────
+  const loadMoreSentinelRef = useRef(null);
+  useEffect(() => {
+    if (!onLoadMore || !hasMoreChats) return;
+    const el = loadMoreSentinelRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && !isLoadingMore) {
+          onLoadMore();
+        }
+      },
+      { threshold: 0.1 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [onLoadMore, hasMoreChats, isLoadingMore]);
+
   const normalizedChats = chats || [];
 
   const toTitleCase = (text) => {
@@ -213,6 +239,29 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
     return chatModifications.pinned[chatId] !== undefined
       ? chatModifications.pinned[chatId]
       : !!chat.isPinned;
+  };
+
+  const formatChatTime = (updatedAt) => {
+    if (!updatedAt) return "";
+    const date = new Date(updatedAt);
+    if (isNaN(date.getTime())) return "";
+
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfYesterday = new Date(startOfToday);
+    startOfYesterday.setDate(startOfToday.getDate() - 1);
+
+    if (date >= startOfToday) {
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+    } else if (date >= startOfYesterday) {
+      return "Yesterday";
+    } else {
+      return date.toLocaleDateString('en-GB', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric'
+      });
+    }
   };
 
   const getIsMuted = (chat) => {
@@ -521,21 +570,23 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
 
     try {
       setOpenMenuId(null);
+
+      // Optimistic UI update
+      setChatModifications(prev => ({
+        ...prev,
+        blocked: {
+          ...prev.blocked,
+          [chatId]: !isCurrentlyBlocked
+        },
+        status: {
+          ...prev.status,
+          [chatId]: newStatus
+        }
+      }));
+
       if (onUpdateStatus) {
         onUpdateStatus(chatId, newStatus);
       } else {
-        // Optimistic UI for local component without parent sync
-        setChatModifications(prev => ({
-          ...prev,
-          blocked: {
-            ...prev.blocked,
-            [chatId]: !isCurrentlyBlocked
-          },
-          status: {
-            ...prev.status,
-            [chatId]: newStatus
-          }
-        }));
         await chatService.updateChatStatus(chatId, newStatus);
       }
     } catch (error) {
@@ -543,10 +594,10 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
     }
   };
 
-  const displayChats = (normalizedChats || [])
+  const displayChats = useMemo(() => (normalizedChats || [])
     .filter((c) => {
       const chatId = c._id || c.id;
-      const searchValue = searchTerm.trim().toLowerCase();
+      const searchValue = debouncedSearch.trim().toLowerCase();
       const normalizedActiveTab = String(activeTab || "All Chats").toLowerCase();
       const matchesSearch =
         searchValue.length === 0 ||
@@ -616,7 +667,9 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
       if (aIsPinned && !bIsPinned) return -1;
       if (!aIsPinned && bIsPinned) return 1;
       return 0;
-    });
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [normalizedChats, debouncedSearch, activeTab, quickFilters, advancedFilters, chatModifications, presenceNow]);
 
   // Helper function to get chat's unread count considering modifications
   const getUnreadCount = (chat) => {
@@ -631,6 +684,18 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
   // Helper function to check if chat is muted
   const isChatMuted = (chat) => {
     return getIsMuted(chat);
+  };
+
+  // Helper function to check if chat is blocked
+  const isChatBlocked = (chat) => {
+    const chatId = chat._id || chat.id;
+    const chatStatus = getChatStatus(chat);
+    return chatModifications.blocked[chatId] !== undefined
+      ? chatModifications.blocked[chatId]
+      : (chat.isBlocked ||
+        chat.blocked ||
+        chatStatus === "blocked" ||
+        String(chat.contactStatus || "").toLowerCase() === "blocked");
   };
 
   const handleBulkMarkAsRead = async () => {
@@ -1490,8 +1555,8 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
       {appNotice.isOpen && (
         <div className="px-5 pt-3">
           <div className={`rounded-xl px-3 py-2 text-xs font-semibold border ${appNotice.type === "success"
-              ? "bg-green-50 text-green-700 border-green-200"
-              : "bg-blue-50 text-blue-700 border-blue-200"
+            ? "bg-green-50 text-green-700 border-green-200"
+            : "bg-blue-50 text-blue-700 border-blue-200"
             }`}>
             {appNotice.message}
           </div>
@@ -1889,7 +1954,6 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
                 />
               </div>
 
-              {/* Enter Number */}
               <div>
                 <label className="block text-[11px] font-bold text-slate-400 uppercase tracking-widest mb-2">WhatsApp Number *</label>
                 <div className="flex focus-within:ring-1 focus-within:ring-[#22C55E] focus-within:border-[#22C55E] rounded-xl transition-all shadow-sm">
@@ -1898,7 +1962,7 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
                   </span>
                   <input
                     type="text"
-                    placeholder="Enter 10-digit number"
+                    placeholder="9876543210"
                     value={newChatPhone}
                     onChange={(e) => setNewChatPhone(e.target.value.replace(/\D/g, '').slice(0, 10))}
                     className="flex-1 min-w-0 block w-full px-4 py-3 rounded-r-xl border border-slate-200 text-sm font-medium text-slate-900 outline-none"
@@ -1907,7 +1971,7 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
                     maxLength={10}
                   />
                 </div>
-                <p className="mt-1 text-xs text-slate-500">Enter the WhatsApp number without country code</p>
+                <p className="mt-1 text-xs text-slate-500">Enter the 10-digit WhatsApp number without country code</p>
               </div>
 
               {/* Info Box */}
@@ -2004,8 +2068,8 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
             key={tab}
             onClick={() => setActiveTab(tab)}
             className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors shadow-sm ${activeTab === tab
-                ? "bg-[#22C55E] text-white border border-[#22C55E]"
-                : "bg-slate-50 text-slate-600 border border-slate-200 hover:bg-slate-100"
+              ? "bg-[#22C55E] text-white border border-[#22C55E]"
+              : "bg-slate-50 text-slate-600 border border-slate-200 hover:bg-slate-100"
               }`}
           >
             {tab}
@@ -2015,7 +2079,7 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
 
       {/* 4. CHAT LIST */}
       <div className="flex-1 overflow-y-auto custom-scrollbar">
-        {displayChats.length > 0 ? displayChats.map((chat) => (
+        {displayChats.map((chat) => (
           <div
             key={chat._id || chat.id}
             onClick={() => {
@@ -2043,7 +2107,13 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
                 </div>
               )}
               <div className="relative">
-                <img src={chat.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(chat.name)}&background=random`} alt="" className="w-12 h-12 rounded-full object-cover" />
+                <img
+                  src={chat.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(chat.name)}&background=random&size=48`}
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                  className="w-12 h-12 rounded-full object-cover bg-slate-100"
+                />
                 {getPresenceInfo(chat, presenceNow).isOnline && (
                   <span className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-[#22C55E] border-2 border-white rounded-full"></span>
                 )}
@@ -2074,7 +2144,7 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
                   )}
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-bold text-slate-400 whitespace-nowrap">{chat.lastMsgTime || new Date(chat.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true })}</span>
+                  <span className="text-[10px] font-bold text-slate-400 whitespace-nowrap">{formatChatTime(chat.updatedAt || chat.createdAt || chat.created_at) || chat.lastMsgTime}</span>
 
                   {/* Three Dot Menu Button */}
                   <div className="relative">
@@ -2126,9 +2196,18 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
                           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9-3h4" />
                           </svg>
-                          Archive
+                          {getIsArchived(chat) ? "Unarchive" : "Archive"}
                         </button>
                         <div className="border-t border-slate-200 my-1"></div>
+                        <button
+                          onClick={(e) => handleBlockChat(chat._id || chat.id, e)}
+                          className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition-colors flex items-center gap-2"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                          </svg>
+                          {isChatBlocked(chat) ? "Unblock" : "Block"}
+                        </button>
                         <button
                           onClick={(e) => handleDeleteChat(chat._id || chat.id, e)}
                           className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors flex items-center gap-2"
@@ -2149,8 +2228,8 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
               <div className="mt-1 flex justify-between items-center">
                 {getChatStatus(chat) && (
                   <span className={`inline-block px-2 py-0.5 rounded text-[9px] font-extrabold uppercase tracking-wider shadow-sm ${getChatStatus(chat) === 'open' ? 'text-[#16a34a] bg-[#f0fdf4] border border-[#bbf7d0]' :
-                      getChatStatus(chat) === 'closed' ? 'text-slate-600 bg-slate-100 border border-slate-200' :
-                        'text-blue-600 bg-blue-50 border border-blue-200'
+                    getChatStatus(chat) === 'closed' ? 'text-slate-600 bg-slate-100 border border-slate-200' :
+                      'text-blue-600 bg-blue-50 border border-blue-200'
                     }`}>
                     {getChatStatus(chat)}
                   </span>
@@ -2163,7 +2242,27 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
               </div>
             </div>
           </div>
-        )) : (
+        ))}
+
+        {/* Load-more sentinel — triggers onLoadMore via IntersectionObserver */}
+        {hasMoreChats && (
+          <div ref={loadMoreSentinelRef} className="flex items-center justify-center py-4">
+            {isLoadingMore ? (
+              <div className="flex items-center gap-2 text-xs text-slate-400">
+                <svg className="animate-spin h-4 w-4 text-[#22C55E]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Loading more chats...
+              </div>
+            ) : (
+              <div className="h-1" />
+            )}
+          </div>
+        )}
+
+        {/* Empty state */}
+        {displayChats.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full px-6 text-center">
             <div className="w-20 h-20 rounded-full bg-slate-100 flex items-center justify-center mb-4">
               <svg className="w-10 h-10 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">

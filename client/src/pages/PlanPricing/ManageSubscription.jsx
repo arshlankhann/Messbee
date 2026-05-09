@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useContext } from "react";
 import { useNavigate } from "react-router-dom";
 import {
     ChartBarIcon,
@@ -6,15 +6,50 @@ import {
     DocumentTextIcon,
 } from "@heroicons/react/24/outline";
 import { CheckCircleIcon } from "@heroicons/react/24/solid";
-
-const usageItems = [
-    { label: "Monthly Messages", used: 14200, total: 50000 },
-    { label: "Team Members", used: 4, total: 10 },
-    { label: "API Endpoints", used: 2, total: 5 },
-];
+import { userContext } from "../../context/Context";
+import { getDaysRemaining, getSubscriptionProgress } from "../../utils/subscription";
 
 function ManageSubscription() {
     const navigate = useNavigate();
+    const { user } = useContext(userContext);
+
+    const isFreePlan = !user?.subscriptionPlan || user.subscriptionPlan.toLowerCase() === "free";
+    const planName = user?.subscriptionPlan ? user.subscriptionPlan.charAt(0).toUpperCase() + user.subscriptionPlan.slice(1) : "Free";
+
+    const planLimits = {
+        free: { messages: 1000, seats: 1, endpoints: 0, price: 0 },
+        basic: { messages: 10000, seats: 5, endpoints: 2, price: 1537 },
+        professional: { messages: 50000, seats: 10, endpoints: 5, price: 2306 },
+        enterprise: { messages: 100000, seats: 20, endpoints: 10, price: 3844 }
+    };
+
+    const currentPlan = user?.subscriptionPlan?.toLowerCase() || "free";
+    const limits = planLimits[currentPlan] || planLimits.free;
+
+    const usageItems = [
+        { label: "Monthly Messages", used: user?.monthlyMessagesUsed || 0, total: limits.messages },
+        { label: "Team Members", used: user?.agents?.length || 1, total: limits.seats },
+        { label: "API Endpoints", used: user?.apiEndpointsCount || 0, total: limits.endpoints },
+    ];
+
+    let daysRemaining = 0;
+    let nextBillingCycleStr = "";
+    
+    if (user?.subscriptionEndDate) {
+      const endDate = new Date(user.subscriptionEndDate);
+            daysRemaining = getDaysRemaining(endDate);
+      nextBillingCycleStr = endDate.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    }
+
+    const isYearly = daysRemaining > 100;
+    const cycleText = isYearly ? "Annually" : "Quarterly";
+    const cycleSuffix = isYearly ? "/ year" : "/ quarter";
+
+    const planAmount = isYearly
+      ? Math.round(limits.price * 12 * 0.65)
+      : Math.round(limits.price * 0.75 * 3);
+    const gstAmount = Math.round(planAmount * 0.18);
+    const amount = planAmount + gstAmount;
 
     const fmtNum = (n) => n.toLocaleString("en-US");
 
@@ -30,22 +65,56 @@ function ManageSubscription() {
                         {/* Left: Plan Info */}
                         <div>
                             <div className="flex items-center gap-3 mb-1">
-                                <h2 className="text-2xl font-black text-slate-900">Enterprise Plan</h2>
+                                <h2 className="text-2xl font-black text-slate-900">{planName} Plan</h2>
                                 <span className="flex items-center gap-1 text-[10px] font-bold bg-emerald-500 text-white px-2.5 py-1 rounded-full uppercase tracking-wider">
                                     <CheckCircleIcon className="w-3 h-3" /> Active
                                 </span>
                             </div>
-                            <p className="text-sm text-slate-400">Billed Annually • Next renewal: Oct 24, 2024</p>
+                            <p className="text-sm text-slate-400">
+                                {isFreePlan ? "Free plan is active with basic restrictions" : `Billed ${cycleText} • Next renewal: ${nextBillingCycleStr}`}
+                            </p>
                         </div>
 
                         {/* Right: Days + Buttons */}
                         <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
                             {/* Days Remaining Box */}
                             <div className="bg-[#1e293b] text-white rounded-xl px-6 py-3 text-center min-w-[100px]">
-                                <p className="text-3xl font-black leading-none">76</p>
-                                <p className="text-[10px] font-bold uppercase tracking-widest mt-1 opacity-70">
-                                    Days Remaining
-                                </p>
+                                {isFreePlan ? (
+                                    <>
+                                        <p className="text-3xl font-black leading-none">∞</p>
+                                        <p className="text-[10px] font-bold uppercase tracking-widest mt-1 opacity-70">
+                                            Unlimited
+                                        </p>
+                                    </>
+                                ) : (
+                                    <>
+                                        {!isFreePlan && (
+                                            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+                                                <div className="flex items-center justify-between mb-4">
+                                                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Plan Progress</p>
+                                                    <span className="text-xs font-bold text-slate-500">{Math.round(getSubscriptionProgress(daysRemaining))}% remaining</span>
+                                                </div>
+                                                <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                                                    <div
+                                                        className="h-full bg-slate-800 rounded-full transition-all duration-500"
+                                                        style={{ width: `${getSubscriptionProgress(daysRemaining)}%` }}
+                                                        role="progressbar"
+                                                        aria-valuemin="0"
+                                                        aria-valuemax="100"
+                                                        aria-valuenow={Math.round(getSubscriptionProgress(daysRemaining))}
+                                                    ></div>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        <div>
+                                            <p className="text-3xl font-black leading-none">{daysRemaining}</p>
+                                            <p className="text-[10px] font-bold uppercase tracking-widest mt-1 opacity-70">
+                                                Days Remaining
+                                            </p>
+                                        </div>
+                                    </>
+                                )}
                             </div>
 
                             {/* Action Buttons */}
@@ -135,8 +204,8 @@ function ManageSubscription() {
                                 Next Payment
                             </p>
                             <p className="text-3xl font-black text-slate-900">
-                                $249.00{" "}
-                                <span className="text-base font-medium text-slate-400">/ year</span>
+                                {isFreePlan ? "₹0.00" : `₹${amount.toLocaleString("en-IN")}.00`}{" "}
+                                {!isFreePlan && <span className="text-base font-medium text-slate-400">{cycleSuffix}</span>}
                             </p>
                         </div>
 
@@ -155,11 +224,13 @@ function ManageSubscription() {
                 <div className="flex flex-col items-center gap-3 py-6">
                     <p className="text-sm text-slate-400 font-medium">
                         Managing subscription for Organization ID:{" "}
-                        <span className="font-bold text-slate-600">NX-9921-X</span>
+                        <span className="font-bold text-slate-600">{user?._id || user?.id || "NX-9921-X"}</span>
                     </p>
-                    <button className="text-sm font-semibold text-red-400 hover:text-red-600 transition-colors">
-                        Cancel Subscription
-                    </button>
+                    {!isFreePlan && (
+                        <button className="text-sm font-semibold text-red-400 hover:text-red-600 transition-colors">
+                            Cancel Subscription
+                        </button>
+                    )}
                 </div>
             </div>
         </div>

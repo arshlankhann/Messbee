@@ -1,13 +1,19 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useContext } from 'react';
 import { getAllLabels, createLabel, updateLabel, deleteLabel } from '../../services/LabelApi';
 import { toast } from 'react-toastify';
 import ErrorState from '../../components/ui/ErrorState';
+import { userContext } from '../../context/Context';
 
 const Label = () => {
+  const { user } = useContext(userContext);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingLabel, setEditingLabel] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  
+  // Plan based limit
+  const isFreePlan = !user?.subscriptionPlan || user.subscriptionPlan.toLowerCase() === "free";
+  const PLAN_LIMIT = 5; 
   
   // --- DELETE MODAL STATE ---
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -48,8 +54,8 @@ const Label = () => {
   };
 
   const handleOpenModal = (label = null) => {
-    if (!label && labels.length >= 5) {
-      return toast.warning('⚠️ Limit Reached: You can only create up to 5 labels');
+    if (!label && labels.length >= PLAN_LIMIT) {
+      return toast.warning(`⚠️ Limit Reached: You can only create up to ${PLAN_LIMIT} labels`);
     }
     if (label) {
       setEditingLabel(label);
@@ -83,12 +89,12 @@ const Label = () => {
         // Update existing label
         await updateLabel(editingLabel._id, labelData);
         await fetchLabels(); // Refresh the list
-        toast.success('✅ Label updated successfully');
+        toast.success('Label updated successfully');
       } else {
         // Create new label
         await createLabel(labelData);
         await fetchLabels(); // Refresh the list
-        toast.success('✅ Label created successfully');
+        toast.success('Label created successfully');
       }
       closeModal();
     } catch (error) {
@@ -108,7 +114,7 @@ const Label = () => {
       await fetchLabels(); // Refresh the list
       setIsDeleteModalOpen(false);
       setLabelToDelete(null);
-      toast.success('✅ Label deleted successfully');
+      toast.success('Label deleted successfully');
     } catch (error) {
       console.error('Failed to delete label:', error);
       toast.error(`❌ ${error.response?.data?.message || 'Failed to delete label'}`);
@@ -136,9 +142,13 @@ const Label = () => {
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center bg-blue-50 border border-blue-100 px-4 py-1.5 rounded-full">
             <span className="w-2 h-2 bg-blue-600 rounded-full mr-2"></span>
-            <span className="text-blue-700 font-semibold text-xs whitespace-nowrap">Label used: {labels.length}/5</span>
+            <span className="text-blue-700 font-semibold text-xs whitespace-nowrap">Label used: {labels.length}/{PLAN_LIMIT}</span>
           </div>
-          <button onClick={() => handleOpenModal()} className="bg-[#10B981] hover:bg-[#059669] text-white px-4 py-2 rounded-lg font-semibold text-sm flex items-center gap-2 transition-all shadow-sm">
+          <button 
+            onClick={() => handleOpenModal()} 
+            disabled={labels.length >= PLAN_LIMIT}
+            className={`${labels.length >= PLAN_LIMIT ? 'bg-gray-300 cursor-not-allowed' : 'bg-[#10B981] hover:bg-[#059669]'} text-white px-4 py-2 rounded-lg font-semibold text-sm flex items-center gap-2 transition-all shadow-sm`}
+          >
             <span className="text-lg">+</span> Add Labels
           </button>
         </div>

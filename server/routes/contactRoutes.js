@@ -9,6 +9,9 @@ const {
   updateContact,
   deleteContact,
   bulkDelete,
+  bulkUpdateStatus,
+  bulkAddLabels,
+  bulkRemoveLabels,
   importContacts,
 } = require('../controllers/contactControllers');
 
@@ -22,6 +25,9 @@ router.route('/')
 
 // ── Bulk action routes (must come BEFORE /:id) ───────────────────────────────
 router.delete('/bulk-delete', bulkDelete); // DELETE /api/contacts/bulk-delete
+router.put('/bulk-status',    bulkUpdateStatus);
+router.put('/bulk-labels',    bulkAddLabels);
+router.put('/bulk-labels-remove', bulkRemoveLabels);
 
 // ── CSV import ────────────────────────────────────────────────────────────────
 router.post('/import', upload.single('file'), importContacts); // POST /api/contacts/import

@@ -1,9 +1,13 @@
 const whatsappService = require('../services/whatsappService');
 const Chat = require('../models/Chat');
 const Message = require('../models/Message');
+const Contact = require('../models/Contact');
+const Campaign = require('../models/Campaign');
+
 const { getIO } = require('../config/socket');
 const { normalizePhoneNumber } = require('../utils/phoneHelper');
 const { hasActiveCustomerWindow } = require('../utils/conversationWindow');
+const Template = require('../models/Template');
 
 /**
  * WhatsApp Webhook Controller
@@ -222,16 +226,18 @@ exports.handleWebhook = async (req, res) => {
 
             const result = whatsappService.processWebhook({ entry: [{ changes: [change] }] });
 
-            if (!result.success) {
+            if (!result.success || !Array.isArray(result.results)) {
               continue;
             }
 
-            if (result.type === 'message') {
-              await handleIncomingMessage(result.data);
-            }
+            for (const item of result.results) {
+              if (item.type === 'message') {
+                await handleIncomingMessage(item.data);
+              }
 
-            if (result.type === 'status') {
-              await handleStatusUpdate(result.data);
+              if (item.type === 'status') {
+                await handleStatusUpdate(item.data);
+              }
             }
           }
         }
@@ -256,6 +262,7 @@ async function handleIncomingMessage(data) {
     const contactName = contact?.name || contact?.profile?.name || normalizedFrom;
 
     // Find or create chat (check both phone and whatsappId with normalized number)
+    // We sort by 'user' desc to prefer chats that already have an owner assigned
     let chat = await Chat.findOne({ 
       $or: [
         { phone: normalizedFrom },
@@ -263,9 +270,21 @@ async function handleIncomingMessage(data) {
         { phone: from },
         { whatsappId: from }
       ]
-    });
+    }).sort({ user: -1 });
 
     if (!chat) {
+      // Try to find if this contact belongs to any user in the CRM (Contact model)
+      const crmContact = await Contact.findOne({ 
+        $or: [
+          { whatsapp: normalizedFrom },
+          { phone: normalizedFrom },
+          { whatsapp: from },
+          { phone: from }
+        ]
+      }).sort({ updatedAt: -1 });
+
+      const assignedUserId = crmContact ? crmContact.user : null;
+
       chat = await Chat.create({
         name: contactName,
         phone: normalizedFrom,
@@ -274,7 +293,8 @@ async function handleIncomingMessage(data) {
         avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(contactName)}&background=random`,
         teamMember: 'Unassigned',
         whatsappId: normalizedFrom,
-        source: 'whatsapp'
+        source: 'whatsapp',
+        user: assignedUserId // Link to the user who owns the contact in CRM
       });
       
       // Emit chat_created event
@@ -286,6 +306,20 @@ async function handleIncomingMessage(data) {
       } catch (socketError) {
       }
     } else {
+      // If found chat has NO user assigned, but we find a CRM contact with a user, assign it
+      if (!chat.user) {
+        const crmContact = await Contact.findOne({ 
+          $or: [
+            { whatsapp: normalizedFrom },
+            { phone: normalizedFrom }
+          ]
+        }).sort({ updatedAt: -1 });
+        
+        if (crmContact) {
+          chat.user = crmContact.user;
+        }
+      }
+
       
       // Update with normalized phone if needed
       if (chat.phone !== normalizedFrom || chat.whatsappId !== normalizedFrom) {
@@ -413,6 +447,7 @@ async function handleIncomingMessage(data) {
     // Create message record
     const newMessage = await Message.create({
       chatId: chat._id,
+      user: chat.user, // Associate message with chat's owner
       text: messageText,
       sender: 'them',
       time: new Date(parseInt(timestamp) * 1000).toLocaleTimeString([], { 
@@ -475,48 +510,107 @@ async function handleStatusUpdate(data) {
     const errorCode = firstError?.code;
     const errorMessage = firstError?.title || firstError?.message || firstError?.details || null;
 
+    // First, find the message to know its previous status
+    const message = await Message.findOne({ whatsappMessageId: messageId });
 
+    if (!message) {
+      console.warn(`⚠️  Message not found in database: ${messageId}`);
+      return;
+    }
+
+    const oldStatus = message.status;
+    const newStatus = status;
 
     // Update message status in database
     const updatePayload = {
-      status: status,
+      status: newStatus,
       statusTimestamp: new Date(parseInt(timestamp) * 1000)
     };
 
-    if (status === 'failed' && errorMessage) {
+    if (newStatus === 'failed' && errorMessage) {
       updatePayload.error = errorCode ? `[${errorCode}] ${errorMessage}` : errorMessage;
     }
 
-    const message = await Message.findOneAndUpdate(
+    const updatedMessage = await Message.findOneAndUpdate(
       { whatsappMessageId: messageId },
       updatePayload,
       { new: true }
     );
 
-    if (message) {
-
+    // Check if this message belongs to a campaign and update stats
+    const campaignId = updatedMessage.metadata?.campaignId || message.metadata?.campaignId;
+    if (campaignId) {
+      console.log(`📊 Message belongs to campaign: ${campaignId}. Processing status: ${newStatus} (from ${oldStatus})`);
       
-      // Emit status update to frontend
-      try {
-        const io = getIO();
-        if (io) {
-          io.emit('message_status_update', {
-            messageId: message._id,
-            status: status,
-            whatsappMessageId: messageId,
-            error: message.error,
-            errorCode: errorCode
-          });
+      let incUpdate = {};
+      let statsUpdated = false;
 
+      // Ensure campaignId is a string for the query
+      const campaignIdStr = String(campaignId);
+
+      // Status transition logic for accuracy using $inc
+      if (newStatus === 'delivered' && oldStatus !== 'delivered' && oldStatus !== 'read') {
+        incUpdate['stats.delivered'] = 1;
+        statsUpdated = true;
+      } 
+      else if (newStatus === 'read' && oldStatus !== 'read') {
+        incUpdate['stats.read'] = 1;
+        if (oldStatus !== 'delivered') {
+          incUpdate['stats.delivered'] = 1;
         }
-      } catch (socketError) {
-        console.error('❌ Socket emit error:', socketError.message);
+        statsUpdated = true;
+      } 
+      else if (newStatus === 'failed' && oldStatus !== 'failed') {
+        incUpdate['stats.failed'] = 1;
+        statsUpdated = true;
       }
-    } else {
-      console.warn(`⚠️  Message not found in database: ${messageId}`);
+
+      if (statsUpdated) {
+        const updatedCampaign = await Campaign.findByIdAndUpdate(
+          campaignIdStr,
+          { $inc: incUpdate },
+          { new: true }
+        );
+
+        if (updatedCampaign) {
+          console.log(`✅ Campaign stats incremented for ${campaignIdStr}:`, incUpdate);
+          
+          // Emit campaign update via socket to the user who owns it
+          try {
+            const io = getIO();
+            if (io && updatedCampaign.user) {
+              const userId = updatedCampaign.user.toString();
+              console.log(`📢 Emitting campaign_stats_updated to user ${userId} for campaign ${updatedCampaign._id}`);
+              io.to(userId).emit('campaign_stats_updated', {
+                campaignId: updatedCampaign._id,
+                stats: updatedCampaign.stats,
+                status: updatedCampaign.status
+              });
+            }
+          } catch (socketError) {
+            console.error('❌ Socket emit error (campaign):', socketError.message);
+          }
+        }
+      } else {
+        console.log(`ℹ️  No stat increment needed for campaign ${campaignId} (transition: ${oldStatus} -> ${newStatus})`);
+      }
     }
 
-
+    // Emit message status update to frontend (existing)
+    try {
+      const io = getIO();
+      if (io) {
+        io.emit('message_status_update', {
+          messageId: updatedMessage._id,
+          status: newStatus,
+          whatsappMessageId: messageId,
+          error: updatedMessage.error,
+          errorCode: errorCode
+        });
+      }
+    } catch (socketError) {
+      console.error('❌ Socket emit error:', socketError.message);
+    }
   } catch (error) {
     console.error('❌ Error handling status update:', error);
   }
@@ -765,22 +859,25 @@ exports.getTemplates = async (req, res, next) => {
 
     
     const data = await whatsappService.getTemplates();
+    const allTemplates = Array.isArray(data?.data) ? data.data : [];
     
 
     
-    if (data?.data && Array.isArray(data.data)) {
+    // Get templates owned by this user from our DB
+    const userTemplates = await Template.find({ user: req.user.id });
+    const userTemplateNames = new Set(userTemplates.map(t => t.name));
 
-    }
+    // Filter Graph API templates to only show those owned by this user
+    const filteredTemplates = allTemplates.filter(t => userTemplateNames.has(t.name));
 
-    const templates = Array.isArray(data?.data) ? data.data : [];
-    const approvedTemplates = templates.filter((template) => template.status === 'APPROVED');
-    const nonApprovedTemplates = templates.filter((template) => template.status !== 'APPROVED');
+    const approvedTemplates = filteredTemplates.filter((template) => template.status === 'APPROVED');
+    const nonApprovedTemplates = filteredTemplates.filter((template) => template.status !== 'APPROVED');
     
     res.status(200).json({
       success: true,
-      data: data,
+      data: { data: filteredTemplates },
       summary: {
-        total: templates.length,
+        total: filteredTemplates.length,
         approved: approvedTemplates.length,
         nonApproved: nonApprovedTemplates.length
       },
@@ -789,11 +886,34 @@ exports.getTemplates = async (req, res, next) => {
     });
   } catch (error) {
     console.error('❌ [Server] Error in getTemplates controller:', error.message);
-    res.status(500).json({
-      success: false,
-      message: error.message || 'Server Error fetching templates',
-      error: error.message
-    });
+    
+    // Fallback: If we can't reach WhatsApp, return the templates stored in our database
+    try {
+      const userTemplates = await Template.find({ user: req.user.id });
+      
+      const approvedTemplates = userTemplates.filter((template) => template.status === 'APPROVED');
+      const nonApprovedTemplates = userTemplates.filter((template) => template.status !== 'APPROVED');
+
+      return res.status(200).json({
+        success: true,
+        isOfflineFallback: true,
+        message: 'Could not connect to WhatsApp API. Showing locally saved templates.',
+        data: { data: userTemplates },
+        summary: {
+          total: userTemplates.length,
+          approved: approvedTemplates.length,
+          nonApproved: nonApprovedTemplates.length
+        },
+        approvedTemplates,
+        nonApprovedTemplates
+      });
+    } catch (fallbackError) {
+      res.status(500).json({
+        success: false,
+        message: error.message || 'Server Error fetching templates',
+        error: error.message
+      });
+    }
   }
 };
 
@@ -834,11 +954,23 @@ exports.createTemplate = async (req, res, next) => {
       });
     }
 
+    // Save template ownership to our DB
+    const templateName = result.templateName || name;
+    await Template.create({
+      name: templateName,
+      whatsappTemplateId: result.data?.id,
+      category: category || 'MARKETING',
+      language: language || 'en_US',
+      components: components || [],
+      user: req.user.id,
+      status: 'PENDING'
+    });
+
     res.status(201).json({
       success: true,
       message: 'Template created successfully',
       data: result.data,
-      templateName: result.templateName || name,
+      templateName: templateName,
       originalTemplateName: result.originalTemplateName || name,
       usedFallbackName: !!result.usedFallbackName
     });
@@ -986,4 +1118,44 @@ exports.updateTemplate = async (req, res, next) => {
   }
 };
 
+// @desc    Upload image/document for use in a template header
+// @route   POST /api/whatsapp/templates/upload-media
+// @access  Private
+exports.uploadTemplateMedia = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'No file uploaded'
+      });
+    }
+
+    const { getPublicUrl } = require('../middleware/upload');
+    const publicUrl = getPublicUrl(req.file.filename);
+
+    console.log('📎 [uploadTemplateMedia] File uploaded successfully:');
+    console.log('   ├─ Original name :', req.file.originalname);
+    console.log('   ├─ Saved as      :', req.file.filename);
+    console.log('   ├─ MIME type     :', req.file.mimetype);
+    console.log('   ├─ Size          :', (req.file.size / 1024).toFixed(2), 'KB');
+    console.log('   └─ Public URL    :', publicUrl);
+
+    return res.status(200).json({
+      success: true,
+      message: 'File uploaded successfully',
+      data: {
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        url: publicUrl
+      }
+    });
+  } catch (error) {
+    console.error('❌ [uploadTemplateMedia] Error:', error.message);
+    next(error);
+  }
+};
+
 module.exports = exports;
+

@@ -36,20 +36,27 @@ exports.getUsers = async (req, res, next) => {
 // @access  Private
 exports.updateProfile = async (req, res, next) => {
   try {
-    const fieldsToUpdate = {
-      name: req.body.name,
-      email: req.body.email,
-      phone: req.body.phone,
-      company: req.body.company,
-      avatar: req.body.avatar
-    };
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-    // Remove undefined fields
-    Object.keys(fieldsToUpdate).forEach(key => 
-      fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]
-    );
+    const fieldsToUpdate = {};
+    const allowed = ['name', 'email', 'phone', 'company', 'avatar', 'timezone', 'language', 'isPhoneVerified', 'credits'];
+    
+    allowed.forEach(key => {
+      if (req.body[key] !== undefined) {
+        // Protection: If email is verified, don't allow changing it
+        if (key === 'email' && user.isEmailVerified && req.body[key] !== user.email) {
+          return; 
+        }
+        // Protection: If phone is verified, don't allow changing it
+        if (key === 'phone' && user.isPhoneVerified && req.body[key] !== user.phone) {
+          return;
+        }
+        fieldsToUpdate[key] = req.body[key];
+      }
+    });
 
-    const user = await User.findByIdAndUpdate(
+    const updatedUser = await User.findByIdAndUpdate(
       req.user.id, 
       fieldsToUpdate, 
       {
@@ -60,7 +67,7 @@ exports.updateProfile = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
-      data: user
+      data: updatedUser
     });
   } catch (error) {
     next(error);
@@ -108,7 +115,7 @@ exports.updateSubscription = async (req, res, next) => {
 
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { subscriptionPlan, subscriptionEndDate },
+      { $set: { subscriptionPlan, subscriptionEndDate } },
       { new: true, runValidators: true }
     );
 

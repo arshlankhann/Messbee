@@ -1,10 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useContext } from 'react';
 import { useNavigate } from 'react-router-dom';
 import CampaignApi from '../../services/CampaignApi';
 import LabelApi from '../../services/LabelApi';
 import StatusApi from '../../services/StatusApi';
 import axios from '../../context/axios';
+import { fetchWhatsAppTemplates, mergeTemplates } from '../../services/TemplateApi';
 import { toast } from 'react-toastify';
+import { userContext } from '../../context/Context';
+import MapFieldsModal from './MapFieldsModal';
+import ReviewSummaryModal from './ReviewSummaryModal';
 import {
     X, Users, Tag, FileUp, ArrowRight, ChevronDown,
     Search, CheckCircle, Clock, Eye, Smartphone, ChevronLeft,
@@ -14,6 +18,7 @@ import {
 
 const CreateCampaign = () => {
     const navigate = useNavigate();
+    const { user, updateUser } = useContext(userContext);
     const [currentStep, setCurrentStep] = useState(1);
 
     // Dynamic Data State
@@ -21,6 +26,7 @@ const CreateCampaign = () => {
     const [statusOptions, setStatusOptions] = useState([]);
     const [totalContacts, setTotalContacts] = useState(0);
     const [estimatedCount, setEstimatedCount] = useState(0);
+    const [templates, setTemplates] = useState([]);
 
     // Initial Data Fetch
     useEffect(() => {
@@ -45,10 +51,47 @@ const CreateCampaign = () => {
         fetchInitialData();
     }, []);
 
+    const loadTemplates = useCallback(async () => {
+        try {
+            const whatsappTemplates = await fetchWhatsAppTemplates();
+            const approvedTemplates = whatsappTemplates.approvedTemplates || whatsappTemplates.data?.approvedTemplates || [];
+            const formatted = mergeTemplates(approvedTemplates, []).map((template) => ({
+                id: template.id,
+                name: template.name,
+                status: String(template.status || 'Pending').toLowerCase(),
+                preview: template.bodyText || '',
+                language: template.language || 'en_US',
+                lastUsed: template.updated || 'Never',
+                category: template.category || 'General',
+                headerMediaUrl: template.headerMediaUrl,
+                headerType: template.headerType,
+                buttons: template.buttons
+            }));
+
+            setTemplates(formatted);
+            if (formatted.length > 0) {
+                setSelectedTemplate((prev) => prev || formatted[0].id);
+            }
+        } catch (error) {
+            console.error('Failed to fetch approved templates:', error);
+        }
+    }, []);
+
+    useEffect(() => {
+        loadTemplates();
+    }, [loadTemplates]);
+
     // Step 1 State
     const [selectedOption, setSelectedOption] = useState('all');
     const [selectedLabels, setSelectedLabels] = useState([]);
-    const [selectedStatus, setSelectedStatus] = useState('');
+    const [selectedStatus, setSelectedStatus] = useState([]);
+    const [csvFile, setCsvFile] = useState(null);
+    const fileInputRef = React.useRef(null);
+    const [showMapFieldsModal, setShowMapFieldsModal] = useState(false);
+    const [csvHeaders, setCsvHeaders] = useState([]);
+    const [csvSampleRows, setCsvSampleRows] = useState([]);
+    const [showReviewModal, setShowReviewModal] = useState(false);
+    const [importData, setImportData] = useState(null);
 
     // Step 1 Effect for estimated audience
     useEffect(() => {
@@ -57,10 +100,20 @@ const CreateCampaign = () => {
                 let params = new URLSearchParams();
                 params.set('limit', '1');
                 
-                if (selectedOption === 'labels' && selectedLabels.length > 0) {
-                    params.set('labels', selectedLabels.join(','));
-                } else if (selectedOption === 'status' && selectedStatus) {
-                    params.set('status', selectedStatus);
+                if (selectedOption === 'labels') {
+                    if (selectedLabels.length > 0) {
+                        params.set('labels', selectedLabels.join(','));
+                    } else {
+                        setEstimatedCount(0);
+                        return;
+                    }
+                } else if (selectedOption === 'status') {
+                    if (selectedStatus.length > 0) {
+                        params.set('status', selectedStatus.join(','));
+                    } else {
+                        setEstimatedCount(0);
+                        return;
+                    }
                 }
                 
                 if (selectedOption !== 'csv') {
@@ -69,16 +122,26 @@ const CreateCampaign = () => {
                         setEstimatedCount(res.data.pagination.total);
                     }
                 } else {
-                    setEstimatedCount(0); // For CSV, count comes from file parse which isn't implemented here yet
+                    if (csvFile) {
+                        const reader = new FileReader();
+                        reader.onload = (event) => {
+                            const text = event.target.result;
+                            const lines = text.split(/\r\n|\n/).filter(line => line.trim() !== '');
+                            setEstimatedCount(Math.max(0, lines.length - 1));
+                        };
+                        reader.readAsText(csvFile);
+                    } else {
+                        setEstimatedCount(0);
+                    }
                 }
             } catch (err) {
                 console.error("Error updating estimated count:", err);
             }
         };
         updateEstimatedCount();
-    }, [selectedOption, selectedLabels, selectedStatus]);
+    }, [selectedOption, selectedLabels, selectedStatus, csvFile]);
 
-    const [selectedTemplate, setSelectedTemplate] = useState('new_food_menu');
+    const [selectedTemplate, setSelectedTemplate] = useState('');
     const [searchQuery, setSearchQuery] = useState('');
 
     // Step 3 State
@@ -99,36 +162,125 @@ const CreateCampaign = () => {
     const [scheduledTime, setScheduledTime] = useState('12:00');
     const [isLaunching, setIsLaunching] = useState(false);
     const [isSavingDraft, setIsSavingDraft] = useState(false);
-    const [csvFile, setCsvFile] = useState(null);
-    const fileInputRef = React.useRef(null);
+    const [showCreditModal, setShowCreditModal] = useState(false);
+    const [showTemplateModal, setShowTemplateModal] = useState(false);
 
-    const handleFileChange = (e) => {
+    const handleFileChange = async (e) => {
         const file = e.target.files[0];
         if (file) {
             setCsvFile(file);
             setSelectedOption('csv');
+            
+            try {
+                const text = await file.text();
+                const lines = text.trim().split(/\r?\n/).filter(Boolean);
+                if (lines.length > 0) {
+                    const splitCSVLine = (line) => {
+                        const values = [];
+                        let cur = "", inQ = false;
+                        for (let i = 0; i < line.length; i++) {
+                            const ch = line[i];
+                            if (ch === '"') { inQ = !inQ; }
+                            else if (ch === ',' && !inQ) { values.push(cur.trim().replace(/^"|"$/g, "")); cur = ""; }
+                            else { cur += ch; }
+                        }
+                        values.push(cur.trim().replace(/^"|"$/g, ""));
+                        return values;
+                    };
+                    
+                    const headers = splitCSVLine(lines[0]);
+                    const sampleRows = lines.slice(1, 4).map((line) => {
+                        const vals = splitCSVLine(line);
+                        const row = {};
+                        headers.forEach((h, i) => { row[h] = vals[i] || ""; });
+                        return row;
+                    });
+                    
+                    setCsvHeaders(headers);
+                    setCsvSampleRows(sampleRows);
+                    setShowMapFieldsModal(true);
+                }
+            } catch (err) {
+                toast.error("Failed to parse CSV file");
+            }
         }
     };
 
+    const estimatedCost = estimatedCount * 0.80;
+
     const handleLaunch = async () => {
+        if (!campaignName.trim()) {
+            toast.error('Campaign name is required.');
+            return;
+        }
+
+        if (scheduleOption === 'later') {
+            if (!scheduledDate || !scheduledTime) {
+                toast.error('Please specify the date and time for the scheduled campaign.');
+                return;
+            }
+            const selectedDateTime = new Date(`${scheduledDate}T${scheduledTime}`);
+            if (selectedDateTime <= new Date()) {
+                toast.error('Scheduled time must be in the future.');
+                return;
+            }
+        }
+
+        if (user?.credits < estimatedCost) {
+            setShowCreditModal(true);
+            return;
+        }
+
         try {
             setIsLaunching(true);
 
             const campaignData = {
                 name: campaignName,
-                messageTemplate: selectedTemplate, // Use name or ID based on backend expectation
+                messageTemplate: activeTemplate?.name || selectedTemplate,
+                templateLanguage: activeTemplate?.language || 'en_US',
                 status: scheduleOption === 'now' ? 'active' : 'scheduled',
                 scheduledDate: scheduleOption === 'later' ? new Date(`${scheduledDate}T${scheduledTime}`) : null,
                 audienceFilter: {
                     tags: selectedOption === 'labels' ? selectedLabels : [],
                     status: selectedOption === 'status' ? selectedStatus : null,
-                }
+                },
+                headerMediaUrl: activeTemplate?.headerMediaUrl,
+                headerType: activeTemplate?.headerType
             };
 
             const res = await CampaignApi.createCampaign(campaignData);
             if (res.success) {
+                // Record the transaction - The backend will now automatically deduct the credits
+                await axios.post("/billing/transactions", {
+                    desc: `Campaign Launch - ${campaignName}`,
+                    amount: -estimatedCost,
+                    status: "Paid"
+                });
+
+                // Fetch latest user data to sync credits
+                try {
+                    const userRes = await axios.get("/auth/me");
+                    if (userRes.data && userRes.data.data) {
+                        updateUser(userRes.data.data);
+                    }
+                } catch (err) {
+                    const newCredits = parseFloat((user.credits - estimatedCost).toFixed(2));
+                    if (user) updateUser({ ...user, credits: newCredits });
+                }
+
+                const calculatedMinutes = Math.max(1, Math.ceil(estimatedCount / 100));
+                
                 toast.success(scheduleOption === 'now' ? 'Campaign launched successfully!' : 'Campaign scheduled successfully!');
-                navigate('/admin/campaigns');
+                navigate('/admin/campaign-success', {
+                    state: {
+                        campaignName,
+                        contacts: estimatedCount,
+                        credits: estimatedCost,
+                        duration: `${calculatedMinutes} minute${calculatedMinutes > 1 ? 's' : ''}`
+                    }
+                });
+            } else {
+                toast.error(res.message || 'Failed to launch campaign');
             }
         } catch (error) {
             console.error('Error launching campaign:', error);
@@ -143,17 +295,22 @@ const CreateCampaign = () => {
             setIsSavingDraft(true);
             const campaignData = {
                 name: campaignName,
-                messageTemplate: selectedTemplate,
+                messageTemplate: activeTemplate?.name || selectedTemplate,
+                templateLanguage: activeTemplate?.language || 'en_US',
                 status: 'draft',
                 audienceFilter: {
                     tags: selectedOption === 'labels' ? selectedLabels : [],
                     status: selectedOption === 'status' ? selectedStatus : null,
-                }
+                },
+                headerMediaUrl: activeTemplate?.headerMediaUrl,
+                headerType: activeTemplate?.headerType
             };
             const res = await CampaignApi.createCampaign(campaignData);
             if (res.success) {
                 toast.success('Campaign saved as draft!');
                 navigate('/admin/campaigns');
+            } else {
+                toast.error(res.message || 'Failed to save draft');
             }
         } catch (error) {
             console.error('Error saving draft:', error);
@@ -163,50 +320,32 @@ const CreateCampaign = () => {
         }
     };
 
-    const templates = [
-        {
-            id: 'new_food_menu',
-            status: 'approved',
-            name: 'new_food_menu',
-            preview: "Hey {{1}}! We've just rolled out a brand new menu that's bursting with Italian flavors. 🍕 To celebrate this, we are offering a 20% discount!",
-            lastUsed: '2 days ago',
-            category: 'Marketing'
-        },
-        {
-            id: 'food_order_on_the_way',
-            status: 'approved',
-            name: 'food_order_on_th...',
-            preview: "Hey {{1}}! Your pizza adventure is officially on its way! 🍕🚀 \n\nExpect the mouthwatering goodness to arrive at your doorstep by {{2}}!",
-            lastUsed: '1 day ago',
-            category: 'Utility'
-        },
-        {
-            id: 'food_order_delivered',
-            status: 'approved',
-            name: 'food_order_deliv...',
-            preview: "Hey {{1}}! Your order from {{2}} has been successfully delivered to your doorstep. 🍔🍟 \n\nWe hope you're as hungry as we are...",
-            lastUsed: '5 days ago',
-            category: 'Utility'
-        },
-        {
-            id: 'food_order_confirmed',
-            status: 'approved',
-            name: 'food_order_confi...',
-            preview: "Your Food Order is confirmed. Hey {{1}}! Thank you for placing an order with {{2}}. Our talented chefs are busy cooking...",
-            lastUsed: 'Never',
-            category: 'Utility'
-        },
-        {
-            id: 'holiday_package_v1',
-            status: 'approved',
-            name: 'holiday_package_v1',
-            preview: "Ready for your next adventure? 🏖️ Book our exclusive Bali package today and get a complimentary spa voucher!",
-            lastUsed: 'Never',
-            category: 'Marketing'
+    const nextStep = () => {
+        if (currentStep === 1) {
+            if (selectedOption === 'labels' && selectedLabels.length === 0) {
+                toast.error('Please select at least one label.');
+                return;
+            }
+            if (selectedOption === 'status' && selectedStatus.length === 0) {
+                toast.error('Please select at least one status.');
+                return;
+            }
+            if (selectedOption === 'csv' && !csvFile) {
+                toast.error('Please upload a CSV file.');
+                return;
+            }
+            if (estimatedCount === 0) {
+                toast.error('Selected audience has 0 contacts.');
+                return;
+            }
+        } else if (currentStep === 2) {
+            if (!selectedTemplate) {
+                setShowTemplateModal(true);
+                return;
+            }
         }
-    ];
-
-    const nextStep = () => setCurrentStep(prev => Math.min(prev + 1, 3));
+        setCurrentStep(prev => Math.min(prev + 1, 3));
+    };
     const prevStep = () => {
         if (currentStep === 1) {
             navigate('/admin/campaigns');
@@ -215,11 +354,89 @@ const CreateCampaign = () => {
         }
     };
 
-    const activeTemplate = templates.find(t => t.id === selectedTemplate);
+    const activeTemplate = templates.find(t => t.id === selectedTemplate) || templates[0] || null;
 
     return (
-        <div className="min-h-screen bg-white font-sans">
-            <div className="w-full">
+        <>
+            {showMapFieldsModal && csvFile && csvHeaders.length > 0 && (
+                <MapFieldsModal 
+                    file={csvFile}
+                    headers={csvHeaders}
+                    sampleRows={csvSampleRows}
+                    onClose={() => setShowMapFieldsModal(false)}
+                    onSuccess={(data) => {
+                        toast.success(data.message || 'Contacts imported successfully!');
+                        setEstimatedCount(data.successful || 0);
+                        setImportData(data);
+                        setShowMapFieldsModal(false);
+                        setShowReviewModal(true);
+                    }}
+                />
+            )}
+            {showReviewModal && importData && (
+                <ReviewSummaryModal
+                    importData={importData}
+                    onClose={() => setShowReviewModal(false)}
+                />
+            )}
+            {showCreditModal && (
+                <div className="fixed inset-0 z-[700] flex items-center justify-center font-sans">
+                    <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px]" onClick={() => setShowCreditModal(false)} />
+                    <div className="relative bg-white rounded-[1.5rem] shadow-2xl w-[92vw] max-w-[400px] p-8 flex flex-col items-center text-center animate-in fade-in zoom-in-95 duration-200 border border-gray-100">
+                        <div className="w-14 h-14 rounded-full bg-red-50 flex items-center justify-center mb-5 ring-8 ring-red-50/50">
+                            <Zap className="w-6 h-6 text-red-500 stroke-[2.5]" />
+                        </div>
+                        <h2 className="text-xl font-extrabold text-gray-900 mb-2 tracking-tight">Insufficient Credits!</h2>
+                        <p className="text-[13.5px] text-gray-500 mb-8 leading-relaxed px-2 font-medium">
+                            You need <span className="font-bold text-gray-900">₹{estimatedCost.toFixed(2)}</span> to launch this campaign.
+                        </p>
+                        <div className="flex gap-3 w-full">
+                            <button
+                                onClick={() => setShowCreditModal(false)}
+                                className="flex-1 px-4 py-3 bg-white border-2 border-gray-100 rounded-xl text-[13px] font-bold text-gray-600 hover:border-gray-200 hover:bg-gray-50 transition-all active:scale-[0.98]"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={() => navigate('/admin/plan/addons')}
+                                className="flex-1 px-4 py-3 bg-red-500 hover:bg-red-600 text-white rounded-xl text-[13px] font-bold transition-all shadow-[0_4px_12px_rgba(239,68,68,0.25)] hover:shadow-[0_6px_16px_rgba(239,68,68,0.3)] hover:-translate-y-0.5 active:translate-y-0 active:scale-[0.98]"
+                            >
+                                Add Credits
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {showTemplateModal && (
+                <div className="fixed inset-0 z-[700] flex items-center justify-center font-sans">
+                    <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px]" onClick={() => setShowTemplateModal(false)} />
+                    <div className="relative bg-white rounded-[1.5rem] shadow-2xl w-[92vw] max-w-[400px] p-8 flex flex-col items-center text-center animate-in fade-in zoom-in-95 duration-200 border border-gray-100">
+                        <div className="w-14 h-14 rounded-full bg-emerald-50 flex items-center justify-center mb-5 ring-8 ring-emerald-50/50">
+                            <Info className="w-6 h-6 text-emerald-500 stroke-[2.5]" />
+                        </div>
+                        <h2 className="text-xl font-extrabold text-gray-900 mb-2 tracking-tight">No Template Selected</h2>
+                        <p className="text-[13.5px] text-gray-500 mb-8 leading-relaxed px-2 font-medium">
+                            You haven't selected a message template. If you don't have one ready, you can create a new template now.
+                        </p>
+                        <div className="flex gap-3 w-full">
+                            <button
+                                onClick={() => setShowTemplateModal(false)}
+                                className="flex-1 px-4 py-3 bg-white border-2 border-gray-100 rounded-xl text-[13px] font-bold text-gray-600 hover:border-gray-200 hover:bg-gray-50 transition-all active:scale-[0.98]"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={() => navigate('/admin/templates/create')}
+                                className="flex-1 px-4 py-3 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-[13px] font-bold transition-all shadow-[0_4px_12px_rgba(16,185,129,0.25)] hover:shadow-[0_6px_16px_rgba(16,185,129,0.3)] hover:-translate-y-0.5 active:translate-y-0 active:scale-[0.98]"
+                            >
+                                Create Template
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            <div className="min-h-screen bg-white font-sans">
+                <div className="w-full">
 
                 {/* Header */}
                 <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
@@ -322,7 +539,10 @@ const CreateCampaign = () => {
                                         <div className="flex flex-wrap items-center gap-2 p-2 border border-gray-200 rounded-lg bg-gray-50/50 relative">
                                             {selectedLabels.map(label => (
                                                 <span key={label} className="flex items-center gap-1 px-3 py-1 bg-white border border-gray-200 rounded-md text-sm text-gray-700 shadow-sm">
-                                                    {label} <X className="w-3 h-3 text-gray-400 cursor-pointer" onClick={() => setSelectedLabels(prev => prev.filter(l => l !== label))} />
+                                                    {label} <X className="w-3 h-3 text-gray-400 cursor-pointer" onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        setSelectedLabels(prev => prev.filter(l => l !== label));
+                                                    }} />
                                                 </span>
                                             ))}
                                             <select 
@@ -334,6 +554,7 @@ const CreateCampaign = () => {
                                                     }
                                                     e.target.value = "";
                                                 }}
+                                                onClick={(e) => e.stopPropagation()}
                                             >
                                                 <option value="">Add labels...</option>
                                                 {labelsList.filter(l => !selectedLabels.includes(l)).map(l => (
@@ -363,17 +584,33 @@ const CreateCampaign = () => {
                                         </div>
                                         <p className="text-gray-500 text-sm mb-3">Send messages based on contact lead status.</p>
 
-                                        <select 
-                                            value={selectedStatus}
-                                            onChange={(e) => setSelectedStatus(e.target.value)}
-                                            onClick={(e) => e.stopPropagation()}
-                                            className="w-full bg-gray-50 border border-gray-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-emerald-500"
-                                        >
-                                            <option value="">Select Status...</option>
-                                            {statusOptions.map(opt => (
-                                                <option key={opt} value={opt}>{opt}</option>
+                                        {/* Status Multi-select Area */}
+                                        <div className="flex flex-wrap items-center gap-2 p-2 border border-gray-200 rounded-lg bg-gray-50/50 relative">
+                                            {selectedStatus.map(status => (
+                                                <span key={status} className="flex items-center gap-1 px-3 py-1 bg-white border border-gray-200 rounded-md text-sm text-gray-700 shadow-sm">
+                                                    {status} <X className="w-3 h-3 text-gray-400 cursor-pointer" onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        setSelectedStatus(prev => prev.filter(s => s !== status));
+                                                    }} />
+                                                </span>
                                             ))}
-                                        </select>
+                                            <select 
+                                                className="flex-1 bg-transparent border-none focus:ring-0 text-sm text-gray-400 min-w-[150px] outline-none"
+                                                onChange={(e) => {
+                                                    const val = e.target.value;
+                                                    if (val && !selectedStatus.includes(val)) {
+                                                        setSelectedStatus(prev => [...prev, val]);
+                                                    }
+                                                    e.target.value = "";
+                                                }}
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                <option value="">Add status...</option>
+                                                {statusOptions.filter(s => !selectedStatus.includes(s)).map(s => (
+                                                    <option key={s} value={s}>{s}</option>
+                                                ))}
+                                            </select>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -534,8 +771,31 @@ const CreateCampaign = () => {
                                     <div className="flex-1 p-4 space-y-4 overflow-y-auto bg-[#e5ddd5]">
                                         {activeTemplate && (
                                             <div className="bg-white p-3 rounded-xl rounded-tl-none shadow-sm text-xs max-w-[85%] animate-in slide-in-from-left duration-300">
+                                                {activeTemplate.headerMediaUrl && activeTemplate.headerType === 'Image' && (
+                                                    <div className="mb-2 rounded-lg overflow-hidden border border-gray-100">
+                                                        <img src={activeTemplate.headerMediaUrl} alt="Template Header" className="w-full h-auto object-cover max-h-[120px]" />
+                                                    </div>
+                                                )}
+                                                {activeTemplate.headerMediaUrl && activeTemplate.headerType === 'Document' && (
+                                                    <div className="mb-2 bg-gray-50 p-2 rounded-lg border border-gray-100 flex items-center gap-2">
+                                                        <div className="w-8 h-8 bg-red-100 text-red-500 rounded flex items-center justify-center font-bold text-[10px]">PDF</div>
+                                                        <div className="flex-1 min-w-0">
+                                                            <div className="text-[11px] font-bold text-gray-700 truncate">Document</div>
+                                                            <div className="text-[9px] text-gray-400">PDF Document</div>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                {activeTemplate.headerMediaUrl && activeTemplate.headerType === 'Video' && (
+                                                    <div className="mb-2 bg-black rounded-lg overflow-hidden border border-gray-100 relative h-[120px] flex items-center justify-center">
+                                                        <video src={activeTemplate.headerMediaUrl} className="w-full h-full object-cover opacity-80" />
+                                                        <div className="absolute w-8 h-8 bg-white/30 backdrop-blur-sm rounded-full flex items-center justify-center border border-white/50">
+                                                            <div className="w-0 h-0 border-t-[5px] border-t-transparent border-l-[8px] border-l-white border-b-[5px] border-b-transparent ml-1"></div>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                
                                                 <p className="whitespace-pre-wrap leading-relaxed mb-2">
-                                                    {activeTemplate.preview.split(/(\{\{.*?\}\})/).map((part, index) =>
+                                                    {(activeTemplate?.preview || '').split(/(\{\{.*?\}\})/).map((part, index) =>
                                                         part.startsWith('{{') ? (
                                                             <span key={index} className="text-emerald-600 font-bold bg-emerald-50 px-1 rounded mx-0.5">{part}</span>
                                                         ) : (
@@ -547,14 +807,15 @@ const CreateCampaign = () => {
                                                     <span className="text-[9px] text-gray-400">12:45 PM</span>
                                                 </div>
                                                 {/* Action Buttons */}
-                                                <div className="mt-3 pt-3 border-t border-gray-100 space-y-2">
-                                                    <button className="w-full py-2 text-center text-emerald-500 font-bold text-[10px] border border-emerald-100 rounded bg-emerald-50 hover:bg-emerald-100 transition-colors">
-                                                        📅 Join Webinar
-                                                    </button>
-                                                    <button className="w-full py-2 text-center text-emerald-500 font-bold text-[10px] border border-emerald-100 rounded bg-emerald-50 hover:bg-emerald-100 transition-colors">
-                                                        📞 Contact Counselor
-                                                    </button>
-                                                </div>
+                                                {activeTemplate.buttons && activeTemplate.buttons.length > 0 && (
+                                                    <div className="mt-3 pt-3 border-t border-gray-100 space-y-2">
+                                                        {activeTemplate.buttons.map(btn => (
+                                                            <button key={btn.id} className="w-full py-2 text-center text-[#00a884] font-bold text-[11px] border border-gray-100 rounded bg-gray-50/50 flex justify-center items-center gap-1.5">
+                                                                {btn.type.includes('Visit') ? '🌐' : btn.type.includes('Call') ? '📞' : '↩️'} {btn.text}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                )}
                                             </div>
                                         )}
                                     </div>
@@ -677,7 +938,7 @@ const CreateCampaign = () => {
                                     <div className="flex justify-between items-start">
                                         <span className="text-gray-500 text-sm">Template</span>
                                         <a href="#" className="font-bold text-emerald-500 text-right flex items-center gap-1 hover:text-emerald-600">
-                                            {selectedTemplate} <ExternalLink className="w-3 h-3" />
+                                            {activeTemplate?.name || selectedTemplate} <ExternalLink className="w-3 h-3" />
                                         </a>
                                     </div>
                                     <div className="flex justify-between items-start">
@@ -687,8 +948,8 @@ const CreateCampaign = () => {
                                     <div className="flex justify-between items-start pt-2">
                                         <span className="text-gray-500 text-sm">Estimated Cost</span>
                                         <div className="text-right">
-                                            <div className="font-bold text-slate-800">₹936.00</div>
-                                            <div className="text-[10px] text-gray-400 italic">~1,248 Credits</div>
+                                            <div className="font-bold text-slate-800">₹{estimatedCost.toFixed(2)}</div>
+                                            <div className="text-[10px] text-gray-400 italic">~{estimatedCount} Messages</div>
                                         </div>
                                     </div>
                                 </div>
@@ -766,6 +1027,7 @@ const CreateCampaign = () => {
                 )}
             </div>
         </div>
+        </>
     );
 };
 

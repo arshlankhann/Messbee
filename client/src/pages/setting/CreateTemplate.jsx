@@ -1,16 +1,21 @@
 /* eslint-disable react/prop-types */
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { RotateCw, ArrowLeft, Image as ImageIcon, Send, Plus, ChevronRight, ExternalLink, Trash2, Globe, X, Clock, Bold, Italic, Link2, Strikethrough, Smile, Info } from 'lucide-react';
+import { RotateCw, ArrowLeft, Image as ImageIcon, Send, Plus, ChevronRight, ExternalLink, Trash2, Globe, X, Clock, Bold, Italic, Link2, Strikethrough, Smile, Info, Copy, Zap } from 'lucide-react';
 import { toast } from 'react-toastify';
-import { createWhatsAppTemplate, saveTemplateHeaderPreview } from '../../services/TemplateApi';
-const Templates = () => {
+import { createWhatsAppTemplate, updateWhatsAppTemplate, saveTemplateHeaderPreview, uploadTemplateMedia } from '../../services/TemplateApi';
+import { formatWhatsAppMarkdown } from '../../utils/markdownParser';
+const CreateTemplate = () => {
   const navigate = useNavigate();
   const location = useLocation();
 
-  // ✅ KEY FIX: gallery vs direct create
+  const isEditing = location.state?.isEditing;
+  const isDuplicate = location.state?.isDuplicate;
+  const templateData = location.state?.templateData;
+
+  // ✅ KEY FIX: gallery vs direct create vs edit
   const [view, setView] = useState(
-    location.state?.editTemplate ? 'content' : (location.state?.fromGallery ? 'setup' : 'choose')
+    isEditing ? 'content' : (isDuplicate || location.state?.fromGallery ? 'setup' : 'choose')
   );
 
   const [templateType, setTemplateType] = useState('CUSTOM');
@@ -19,8 +24,22 @@ const Templates = () => {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [charCount, setCharCount] = useState(0);
   const [bodyVariables, setBodyVariables] = useState([]);
-  const [bodySamples, setBodySamples] = useState({});
-  const [headerMedia, setHeaderMedia] = useState(null);
+  const [bodySamples, setBodySamples] = useState(location.state?.templateData?.bodySamples || {});
+  const [headerMedia, setHeaderMedia] = useState(
+    location.state?.templateData?.headerMediaUrl 
+      ? { 
+          preview: location.state.templateData.headerMediaUrl, 
+          type: location.state.templateData.headerType?.toLowerCase() || 'image',
+          name: 'Existing Media',
+          hostedUrl: location.state.templateData.headerMediaUrl // already a hosted URL
+        } 
+      : null
+  );
+  // Tracks the actual uploaded file URL returned by the server (DOCUMENT_GET_URL)
+  const [uploadedMediaUrl, setUploadedMediaUrl] = useState(
+    location.state?.templateData?.headerMediaUrl || null
+  );
+  const [isUploadingMedia, setIsUploadingMedia] = useState(false);
   const headerFileRef = useRef(null);
 
   const EMOJIS = [
@@ -33,13 +52,14 @@ const Templates = () => {
   // Initialize editor with bodyText on mount
   useEffect(() => {
     if (editorRef.current) {
-      editorRef.current.innerHTML = formData.bodyText;
+      // Ensure we render the markdown as HTML in the editor
+      editorRef.current.innerHTML = formatWhatsAppMarkdown(formData.bodyText);
       const plainText = editorRef.current.innerText;
       setCharCount(plainText.length);
       syncBodyVariableState(plainText);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view]); // re-run when view changes so editor always has initial content
+  }, [view]);
 
   const extractBodyVariables = (text = '') => {
     const matches = text.match(/\{\{\s*(\d+)\s*\}\}/g) || [];
@@ -103,17 +123,28 @@ const Templates = () => {
   };
 
   const [formData, setFormData] = useState({
-    category: 'Marketing',
-    name: '',
-    language: 'English (US)',
+    category: (location.state?.templateData?.category 
+      ? location.state.templateData.category.charAt(0).toUpperCase() + location.state.templateData.category.slice(1).toLowerCase() 
+      : 'Marketing'),
+    name: location.state?.templateData?.name || '',
+    language: location.state?.templateData?.language || 'English (US)',
     offerTitle: '20% OFF',
-    headerType: 'None',
-    bodyText: 'Hello {{1}}, our Summer Sale is now live! Use code BUYONEGETONE for 50% off. Shop now!',
-    footerText: 'Reply STOP to opt out',
+    headerType: location.state?.templateData?.headerType || 'None',
+    bodyText: location.state?.templateData?.bodyText || 'Hello {{1}}, our Summer Sale is now live! Use code BUYONEGETONE for 50% off. Shop now!',
+    footerText: location.state?.templateData?.footerText || 'Reply STOP to opt out',
     expirationDate: '24h',
   });
 
+  // Prepopulate buttons if editing
+  useEffect(() => {
+    if (location.state?.templateData?.buttons) {
+      setButtons(location.state.templateData.buttons);
+    }
+  }, [location.state]);
+
   const handleCategoryChange = (cat) => {
+    if (formData.category === cat) return; // Skip if no change
+    
     let newBody = '';
     if (cat === 'Marketing') {
       newBody = 'Hello {{1}}, our Summer Sale is now live! Use code BUYONEGETONE for 50% off. Shop now!';
@@ -148,31 +179,58 @@ const Templates = () => {
     setButtons(buttons.map(btn => btn.id === id ? { ...btn, [field]: value } : btn));
   };
 
-  const handleHeaderMediaUpload = (e) => {
+  const handleHeaderMediaUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     const maxSize = 16 * 1024 * 1024; // 16MB max
     if (file.size > maxSize) {
-      toast.error("File size must be less than 16MB");
+      toast.error('File size must be less than 16MB');
       return;
     }
 
+    const mediaType = file.type.startsWith('image/')
+      ? 'image'
+      : file.type.startsWith('video/')
+        ? 'video'
+        : 'document';
+
+    // Show a local preview immediately
     const reader = new FileReader();
     reader.onload = (event) => {
       setHeaderMedia({
         file: file,
         preview: event.target?.result,
-        type: file.type.startsWith('image/') ? 'image' : file.type.startsWith('video/') ? 'video' : 'document',
-        name: file.name
+        type: mediaType,
+        name: file.name,
+        hostedUrl: null // will be set after upload completes
       });
     };
     reader.readAsDataURL(file);
-    toast.success("Media uploaded successfully!");
+
+    // Upload to server and get the public DOCUMENT_GET_URL-based URL
+    setIsUploadingMedia(true);
+    try {
+      const response = await uploadTemplateMedia(file);
+      if (response?.success && response?.data?.url) {
+        const hostedUrl = response.data.url;
+        setUploadedMediaUrl(hostedUrl);
+        setHeaderMedia((prev) => prev ? { ...prev, hostedUrl } : prev);
+        toast.success('Media uploaded successfully!');
+      } else {
+        toast.warn('Media selected, but server upload failed. A placeholder URL will be used.');
+      }
+    } catch (uploadErr) {
+      console.error('Template media upload error:', uploadErr);
+      toast.warn('Media selected, but server upload failed. A placeholder URL will be used.');
+    } finally {
+      setIsUploadingMedia(false);
+    }
   };
 
   const removeHeaderMedia = () => {
     setHeaderMedia(null);
+    setUploadedMediaUrl(null);
     if (headerFileRef.current) {
       headerFileRef.current.value = '';
     }
@@ -186,11 +244,16 @@ const Templates = () => {
   };
 
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [nameError, setNameError] = useState(null);
+  const [templateNameSuggestion, setTemplateNameSuggestion] = useState(null);
 
   const handleSubmit = async () => {
     if (isSubmitting) {
       return;
     }
+
+    setNameError(null);
+    setTemplateNameSuggestion(null);
 
     if (!formData.name.trim()) {
       toast.error("Template name is mandatory");
@@ -210,7 +273,48 @@ const Templates = () => {
     }
     
     const bodyText = formData.bodyText.trim();
-    const strippedBody = editorRef.current ? editorRef.current.innerText : bodyText.replace(/<[^>]+>/g, '');
+    
+    // Convert HTML formatting to WhatsApp Markdown formatting
+    let markdownBody = bodyText;
+    if (editorRef.current) {
+        let html = editorRef.current.innerHTML;
+        // Convert breaks to newlines
+        html = html.replace(/<br\s*\/?>/gi, '\n');
+        html = html.replace(/<\/div>/gi, '\n');
+        html = html.replace(/<\/p>/gi, '\n');
+        // Replace formats with trimmed content inside markers to ensure WhatsApp compatibility
+        // WhatsApp markdown markers (*, _, ~) must be immediately adjacent to non-whitespace characters
+        const formatReplacer = (marker) => (match, tag, content) => {
+            // Strip any internal HTML tags first
+            const textOnly = content.replace(/<[^>]+>/g, '');
+            // Get leading and trailing whitespace
+            const leading = textOnly.match(/^\s*/)[0];
+            const trailing = textOnly.match(/\s*$/)[0];
+            // Trim the core content
+            const trimmed = textOnly.trim();
+            
+            // If there's content, return it with markers tight around the trimmed text, 
+            // and original spacing preserved OUTSIDE the markers.
+            if (trimmed) {
+                return `${leading}${marker}${trimmed}${marker}${trailing}`;
+            }
+            return textOnly;
+        };
+
+        html = html.replace(/<(b|strong)>([\s\S]*?)<\/\1>/gi, formatReplacer('*'));
+        html = html.replace(/<(i|em)>([\s\S]*?)<\/\1>/gi, formatReplacer('_'));
+        html = html.replace(/<(strike|s)>([\s\S]*?)<\/\1>/gi, formatReplacer('~'));
+        // Strip remaining tags
+        html = html.replace(/<[^>]+>/g, '');
+        // Decode HTML entities (e.g. &nbsp;)
+        const textarea = document.createElement('textarea');
+        textarea.innerHTML = html;
+        markdownBody = textarea.value.trim();
+    } else {
+        markdownBody = bodyText.replace(/<[^>]+>/g, '');
+    }
+    
+    const strippedBody = markdownBody;
     const templateVariables = extractBodyVariables(strippedBody);
 
     if (bodyText.length < 20) {
@@ -231,6 +335,11 @@ const Templates = () => {
         return;
       }
     }
+
+    if (strippedBody.length > 1024) {
+      toast.error(`Template body is ${strippedBody.length} characters. WhatsApp allows a maximum of 1024 characters.`);
+      return;
+    }
     
     // Convert name to WA format (lowercase, underscores)
     // If overrideName is provided, it's already formatted; otherwise format formData.name
@@ -249,11 +358,17 @@ const Templates = () => {
         inputName = String(formData.name || '');
       }
       
-      // Ensure inputName is always a string before calling methods
+      // Ensure waName is always a string before calling methods
       inputName = String(inputName).trim();
       
       // Format the name
       waName = inputName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+
+      // Force waName to originalName if editing to ensure we update the existing template
+      const originalName = typeof templateData?.name === 'string' ? templateData.name : '';
+      if (isEditing && originalName) {
+        waName = originalName;
+      }
     } catch (err) {
       console.error('Error processing template name:', err);
       toast.error("Error processing template name. Please try again.");
@@ -282,12 +397,21 @@ const Templates = () => {
 
     try {
       const components = [];
-      const mediaHeaderExamples = {
+
+      // Fallback public URLs (only used if no file was uploaded by the user)
+      const mediaHeaderFallbacks = {
         Image: 'https://images.unsplash.com/photo-1497366811353-6870744d04b2?auto=format&fit=crop&w=1200&q=80',
         Video: 'https://samplelib.com/lib/preview/mp4/sample-5s.mp4',
         Document: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf'
       };
-      
+
+      // Prefer the real server-hosted URL from DOCUMENT_GET_URL
+      const getHeaderUrl = (type) => {
+        if (uploadedMediaUrl) return uploadedMediaUrl;
+        if (headerMedia?.hostedUrl) return headerMedia.hostedUrl;
+        return mediaHeaderFallbacks[type];
+      };
+
       // Add HEADER component only if valid
       if (formData.headerType && formData.headerType !== 'None') {
         if (formData.headerType === 'Text') {
@@ -298,25 +422,22 @@ const Templates = () => {
             text: formData.name.substring(0, 60) // Max 60 chars for header
           });
         } else if (formData.headerType === 'Image') {
-          // Keep media header payload minimal; invalid sample handles/URLs often trigger
-          // WhatsApp "Invalid parameter" on creation.
           components.push({ 
             type: 'HEADER', 
-            format: 'IMAGE'
+            format: 'IMAGE',
+            example: { header_url: [getHeaderUrl('Image')] }
           });
         } else if (formData.headerType === 'Video') {
-          // Keep media header payload minimal; invalid sample handles/URLs often trigger
-          // WhatsApp "Invalid parameter" on creation.
           components.push({ 
             type: 'HEADER', 
-            format: 'VIDEO'
+            format: 'VIDEO',
+            example: { header_url: [getHeaderUrl('Video')] }
           });
         } else if (formData.headerType === 'Document') {
-          // Keep media header payload minimal; invalid sample handles/URLs often trigger
-          // WhatsApp "Invalid parameter" on creation.
           components.push({ 
             type: 'HEADER', 
-            format: 'DOCUMENT'
+            format: 'DOCUMENT',
+            example: { header_url: [getHeaderUrl('Document')] }
           });
         }
       }
@@ -359,9 +480,39 @@ const Templates = () => {
 
 
       let createdTemplateResponse = null;
+      const originalName = typeof templateData?.name === 'string' ? templateData.name : '';
+      
+      const submitTemplate = async (payload) => {
+        if (isEditing && templateData?.id) {
+          // Check if template is approved - WhatsApp doesn't allow editing approved templates
+          if (templateData?.status === 'APPROVED') {
+            throw new Error(
+              'This template has been approved by Meta and cannot be edited. '
+              + 'To make changes, please duplicate this template to create a new version. '
+              + 'Once the new template is approved, you can use it for sending messages.'
+            );
+          }
+          console.log(`Updating existing template: ${originalName} (ID: ${templateData.id})`);
+          return await updateWhatsAppTemplate(templateData.id, { components: payload.components });
+        }
+        
+        console.log(`Creating new template: ${waName}`);
+        return await createWhatsAppTemplate(payload);
+      };
+
       try {
-        createdTemplateResponse = await createWhatsAppTemplate(templatePayload);
+        createdTemplateResponse = await submitTemplate(templatePayload);
       } catch (primaryError) {
+        let latestError = primaryError;
+
+        // ── Network-level errors (ENOTFOUND, timeout, etc.) should never trigger
+        //    a "retry without HEADER" — that just causes WhatsApp to accept the
+        //    template without media and immediately reject it as INVALID_FORMAT.
+        const isNetworkError = !primaryError?.response;
+        if (isNetworkError) {
+          throw primaryError; // propagate immediately
+        }
+
         const hasMediaHeader = ['Image', 'Video', 'Document'].includes(formData.headerType);
         const payloadWithoutHeader = {
           ...templatePayload,
@@ -383,43 +534,61 @@ const Templates = () => {
             ''
           ).toLowerCase().includes('invalid parameter');
 
+        const isBodyCharacterLimitError = (error) => {
+          const subcode =
+            error?.response?.data?.error?.errorSubcode ??
+            error?.response?.data?.error?.error_subcode;
+          const details = String(
+            error?.response?.data?.error?.error_user_msg ||
+            error?.response?.data?.error?.message ||
+            error?.response?.data?.message ||
+            ''
+          ).toLowerCase();
+
+          return subcode === 2388040 || details.includes('1024 characters');
+        };
+
+        if (isBodyCharacterLimitError(latestError)) {
+          throw latestError;
+        }
+
         let recovered = false;
 
         if (hasMediaHeader) {
           try {
             console.warn('⚠️ Media header template creation failed, retrying without HEADER component');
-            createdTemplateResponse = await createWhatsAppTemplate(payloadWithoutHeader);
-            toast.warn('Template created without media header sample due to WhatsApp validation constraints.');
+            createdTemplateResponse = await submitTemplate(payloadWithoutHeader);
+            toast.warn('Template saved without media header sample due to WhatsApp validation constraints.');
             recovered = true;
           } catch (errorWithoutHeader) {
-            primaryError = errorWithoutHeader;
+            latestError = errorWithoutHeader;
           }
         }
 
-        if (!recovered && isInvalidParameterError(primaryError)) {
+        if (!recovered && isInvalidParameterError(latestError) && !isBodyCharacterLimitError(latestError)) {
           try {
             console.warn('⚠️ Invalid parameter from WhatsApp API, retrying with BODY/FOOTER only');
-            createdTemplateResponse = await createWhatsAppTemplate(payloadBodyFooterOnly);
-            toast.warn('Template created with simplified components due to WhatsApp parameter validation.');
+            createdTemplateResponse = await submitTemplate(payloadBodyFooterOnly);
+            toast.warn('Template saved with simplified components due to WhatsApp parameter validation.');
             recovered = true;
           } catch (errorBodyFooter) {
-            primaryError = errorBodyFooter;
+            latestError = errorBodyFooter;
           }
         }
 
-        if (!recovered && isInvalidParameterError(primaryError)) {
+        if (!recovered && isInvalidParameterError(latestError) && !isBodyCharacterLimitError(latestError)) {
           try {
             console.warn('⚠️ Invalid parameter persists, retrying with sanitized BODY-only payload');
-            createdTemplateResponse = await createWhatsAppTemplate(payloadBodyOnlySanitized);
-            toast.warn('Template created with BODY-only payload due to WhatsApp parameter validation.');
+            createdTemplateResponse = await submitTemplate(payloadBodyOnlySanitized);
+            toast.warn('Template saved with BODY-only payload due to WhatsApp parameter validation.');
             recovered = true;
           } catch (errorBodyOnly) {
-            primaryError = errorBodyOnly;
+            latestError = errorBodyOnly;
           }
         }
 
         if (!recovered) {
-          throw primaryError;
+          throw latestError;
         }
       }
 
@@ -428,21 +597,24 @@ const Templates = () => {
           createdTemplateResponse?.templateName ||
           createdTemplateResponse?.data?.name ||
           waName;
-        const previewByType = {
-          Image: headerMedia?.preview || mediaHeaderExamples.Image,
-          Video: headerMedia?.preview || mediaHeaderExamples.Video,
-          Document: headerMedia?.preview || mediaHeaderExamples.Document
-        };
 
-        saveTemplateHeaderPreview(actualCreatedName, {
-          url: previewByType[formData.headerType],
-          type: formData.headerType
-        });
+        // Use the real hosted URL (DOCUMENT_GET_URL) for the preview cache
+        const resolvedPreviewUrl =
+          uploadedMediaUrl ||
+          headerMedia?.hostedUrl ||
+          headerMedia?.preview ||
+          null;
+
+        if (resolvedPreviewUrl) {
+          saveTemplateHeaderPreview(actualCreatedName, {
+            url: resolvedPreviewUrl,
+            type: formData.headerType
+          });
+        }
       }
       
-      // Template created successfully on WhatsApp API
-      // No need to save locally - always fetch from API
-      showToast("Template submitted successfully to WhatsApp!");
+      // Template saved/updated successfully
+      showToast(isEditing ? "Template updated successfully!" : "Template submitted successfully to WhatsApp!");
       setTimeout(() => {
         navigate('/admin/templates/list');
       }, 1500);
@@ -451,14 +623,14 @@ const Templates = () => {
       console.error("Template Creation Error:", error?.response?.data || error);
       const waError = error?.response?.data?.error || {};
       const nestedWaError = waError?.error || {};
-      const errorSubcode = waError?.errorSubcode ?? waError?.error_subcode;
+      const errorSubcode = nestedWaError?.error_subcode ?? nestedWaError?.errorSubcode ?? waError?.error_subcode ?? waError?.errorSubcode;
       const errorMsg =
-        waError?.message ||
         nestedWaError?.message ||
-        waError?.error_user_msg ||
+        waError?.message ||
         nestedWaError?.error_user_msg ||
-        waError?.error_data?.details ||
+        waError?.error_user_msg ||
         nestedWaError?.error_data?.details ||
+        waError?.error_data?.details ||
         error?.response?.data?.message;
       const suggestedName = waError?.suggestedName;
       
@@ -466,16 +638,50 @@ const Templates = () => {
       let errorMessage =
         errorMsg ||
         error?.response?.data?.message ||
+        error?.message ||
         "Failed to create template on WhatsApp. Please try again.";
       
-      // Handle specific WhatsApp error codes with actionable guidance
-      if (errorSubcode === 2388023) {
-        errorMessage = `Template language is being deleted on WhatsApp for this name. Please wait 1-3 minutes and retry with the same name.${suggestedName ? `\n\nSuggested alternate name (manual): ${suggestedName}` : ''}`;
+      // Handle specific user-facing errors (like approved template edit attempts)
+      if (!error?.response && (error?.code === 'ENOTFOUND' || error?.message?.includes('ENOTFOUND') || error?.message?.includes('getaddrinfo'))) {
+        // Network error — server can't reach graph.facebook.com
+        errorMessage = 'Cannot reach WhatsApp servers. Please check that the server has a working internet connection and try again.';
+        toast.error(errorMessage);
+      } else if (error?.message?.includes('This template has been approved by Meta')) {
+        errorMessage = 'Approved Template - Cannot Edit\n\n' +
+          'WhatsApp does not allow editing templates that have been approved by Meta. ' +
+          'To make changes:\n\n' +
+          '1. Duplicate this template to create a new version\n' +
+          '2. Make your changes in the new template\n' +
+          '3. Submit for Meta approval\n' +
+          '4. Once approved, use the new template for sending messages';
+        toast.error(errorMessage);
+      } else if (errorSubcode === 2388023) {
+        errorMessage = `WhatsApp is currently deleting this template language variant. During this 30-day lock period, you cannot add English (US) back to the same name. Please use a new name now.`;
+        toast.error(errorMessage);
+        setNameError(errorMessage);
+        if (suggestedName) setTemplateNameSuggestion(suggestedName);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else if (errorSubcode === 2388040) {
+        errorMessage = 'Character limit exceeded: The template BODY content cannot be more than 1024 characters. Please shorten your message and try again.';
+        toast.error(errorMessage);
+      } else if (errorSubcode === 2388025) {
+        errorMessage = `WhatsApp is blocking this change because the template is in deletion flow. Use a new template name or retry after the deletion window completes.`;
+        toast.error(errorMessage);
+        setNameError(errorMessage);
+        if (suggestedName) setTemplateNameSuggestion(suggestedName);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
       } else if (errorSubcode === 2388024) {
-        errorMessage = `Template content already exists in this language for the same name.${suggestedName ? `\n\nTry this alternate name: ${suggestedName}` : '\n\nPlease change template name and retry.'}`;
+        errorMessage = `Template content already exists in this language for the same name. Please change template name and retry.`;
+        toast.error(errorMessage);
+        setNameError(errorMessage);
+        if (suggestedName) setTemplateNameSuggestion(suggestedName);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else if (errorSubcode === 2388124) {
+        errorMessage = "WhatsApp limitation: You can only edit an active template once every 24 hours. Please wait or try creating a new template with a different name.";
+        toast.error(errorMessage);
+      } else {
+        toast.error(errorMessage);
       }
-      
-      toast.error(errorMessage);
           } finally {
             setIsSubmitting(false);
     }
@@ -555,24 +761,33 @@ const Templates = () => {
       <div className="flex-1 p-4 md:p-6 lg:p-10 overflow-y-auto border-r border-slate-100 bg-[#F8FAFC]">
         <div className="max-w-3xl mx-auto space-y-5 pb-20">
           <div className="flex items-center justify-between mb-4">
-            <button onClick={() => setView('choose')} className="flex items-center gap-2 text-gray-500 font-semibold hover:text-gray-800 text-sm transition-colors">
-                <ArrowLeft size={16}/> Back
+            <button
+              onClick={() => view === 'setup' ? (isEditing || isDuplicate ? navigate('/admin/templates/list') : setView('choose')) : setView('setup')}
+              className="flex items-center gap-2 text-gray-500 font-semibold hover:text-gray-800 text-sm transition-colors"
+            >
+                <ArrowLeft size={16}/> {view === 'setup' && (isEditing || isDuplicate) ? 'Back to Templates' : 'Back'}
             </button>
             <div className="text-xs font-medium text-gray-400 uppercase tracking-wide">
-                {view === 'setup' ? 'Step 1 of 2: Setup' : 'Step 2 of 2: Content'}
+                {view === 'setup' ? (isEditing ? 'Step 1 of 2: Edit Setup' : 'Step 1 of 2: Setup') : (isEditing ? 'Step 2 of 2: Edit Content' : 'Step 2 of 2: Content')}
             </div>
           </div>
 
           {view === 'setup' ? (
             <div className="space-y-5">
                 <div className="bg-white rounded-xl p-6 md:p-8 border border-gray-200 shadow-sm space-y-4 md:space-y-5">
-                    <h2 className="text-2xl md:text-3xl font-bold text-gray-800 tracking-tight">Set Up Your Template</h2>
-                    <div className="space-y-2">
-                        <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Choose Category</label>
-                        <div className="bg-gray-50 p-1 rounded-xl flex flex-wrap gap-1 border border-gray-100">
+                    <h2 className="text-2xl md:text-3xl font-bold text-gray-800 tracking-tight">
+                      {isEditing ? 'Edit Your Template' : 'Set Up Your Template'}
+                    </h2>
+                    <div className="space-y-4">
+                        <label className="text-xs font-bold text-gray-500 uppercase tracking-widest block mb-2">Choose Category</label>
+                        <div className="bg-gray-50/50 p-1.5 rounded-xl flex flex-wrap gap-1 border border-gray-100 max-w-fit">
                             {['Marketing', 'Utility', 'Authentication'].map(cat => (
-                                <button key={cat} onClick={() => handleCategoryChange(cat)} className={`flex-1 min-w-[100px] py-3 md:py-4 px-3 rounded-lg flex items-center justify-center gap-2 text-xs md:text-sm font-semibold transition-all ${formData.category === cat ? 'bg-white shadow-sm text-gray-900' : 'text-gray-400'}`}>
-                                    {cat === 'Marketing' && <Send size={12}/>} {cat}
+                                <button 
+                                  key={cat} 
+                                  onClick={() => handleCategoryChange(cat)} 
+                                  className={`min-w-[120px] py-2.5 px-3 rounded-lg flex items-center justify-center gap-2 text-sm font-semibold transition-all ${formData.category === cat ? 'bg-white shadow-sm text-gray-900 border border-gray-100' : 'text-gray-500 hover:text-gray-700'}`}
+                                >
+                                    {cat === 'Marketing' && <Zap size={14} className={formData.category === 'Marketing' ? 'text-gray-900' : 'text-gray-500'}/>} {cat}
                                 </button>
                             ))}
                         </div>
@@ -580,33 +795,58 @@ const Templates = () => {
                     
                     <div className="space-y-3">
                         {formData.category === 'Authentication' ? (
-                            <div className="p-4 md:p-5 border-2 rounded-xl border-[#10B981] bg-green-50/20">
-                                <div className="flex items-center gap-3 mb-1">
-                                    <div className="w-3 h-3 rounded-full bg-[#10B981]"></div>
-                                    <span className="text-sm md:text-base font-semibold text-gray-800">One-time Passcode</span>
+                            <div className="p-4 rounded-xl cursor-pointer transition-all duration-200 border-2 border-[#10B981] bg-[#F0FDF4]/30">
+                                <div className="flex items-start gap-4">
+                                    <div className="mt-1 w-4 h-4 shrink-0 rounded-full bg-[#10B981] flex items-center justify-center border-2 border-[#10B981]">
+                                      <div className="w-1.5 h-1.5 bg-white rounded-full"></div>
+                                    </div>
+                                    <div className="flex-1">
+                                      <span className="text-[13px] font-bold text-gray-800 block mb-1 tracking-wide uppercase">
+                                        One-time Passcode
+                                      </span>
+                                      <p className="text-[13px] text-gray-500 leading-relaxed">
+                                        Send codes to verify a transaction or login.
+                                      </p>
+                                    </div>
                                 </div>
-                                <p className="text-xs md:text-sm text-gray-500 font-medium ml-6">Send codes to verify a transaction or login.</p>
                             </div>
                         ) : (
                             (formData.category === 'Marketing' ? ['CUSTOM', 'CATALOG', 'LIMITED_TIME_OFFER'] : ['CUSTOM']).map((type) => (
-                              <div key={type} onClick={() => setTemplateType(type)} className={`p-4 md:p-5 border-2 rounded-xl cursor-pointer transition-all duration-300 ${templateType === type ? 'border-[#10B981] bg-green-50/20' : 'border-gray-100 bg-white hover:border-gray-200'}`}>
-                                <div className="flex items-center gap-3 mb-1">
-                                    <div className={`w-3 h-3 rounded-full transition-all ${templateType === type ? 'bg-[#10B981] scale-110' : 'bg-gray-200'}`}></div>
-                                    <span className="text-sm md:text-base font-semibold text-gray-800">{type.replace(/_/g, ' ')}</span>
+                              <div key={type} onClick={() => setTemplateType(type)} className={`p-4 rounded-xl cursor-pointer transition-all duration-200 ${templateType === type ? 'border-2 border-[#10B981] bg-[#F0FDF4]/30' : 'border border-gray-200 bg-white hover:border-gray-300'}`}>
+                                <div className="flex items-start gap-4">
+                                    {templateType === type ? (
+                                      <div className="mt-1 w-4 h-4 shrink-0 rounded-full bg-[#10B981] flex items-center justify-center border-2 border-[#10B981]">
+                                        <div className="w-1.5 h-1.5 bg-white rounded-full"></div>
+                                      </div>
+                                    ) : (
+                                      <div className="mt-1 w-4 h-4 shrink-0 rounded-full border-2 border-gray-300" />
+                                    )}
+                                    <div className="flex-1">
+                                      <span className="text-[13px] font-bold text-gray-800 block mb-1 tracking-wide">
+                                        {type === 'CUSTOM' ? 'CUSTOM' : type === 'CATALOG' ? 'CATALOG' : 'LIMITED TIME OFFER'}
+                                      </span>
+                                      <p className="text-[13px] text-gray-500 leading-relaxed">
+                                          {type === 'CUSTOM' ? (formData.category === 'Utility' ? 'Send messages about an existing order or account.' : 'Send promotional offers & announcements') 
+                                          : type === 'CATALOG' ? 'Display your entire product catalog'
+                                          : 'Send an offer with a countdown timer to drive urgency'}
+                                      </p>
+                                    </div>
                                 </div>
-                                <p className="text-xs md:text-sm text-gray-500 font-medium ml-6">
-                                    {type === 'CUSTOM' ? (formData.category === 'Utility' ? 'Send messages about an existing order or account.' : 'Send promotional offers & announcements.') 
-                                    : type === 'CATALOG' ? 'Display your entire product catalog.'
-                                    : 'Send an offer with a countdown timer to drive urgency.'}
-                                </p>
                               </div>
                             ))
                         )}
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3">
                         <div className="space-y-2">
-                            <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Template Name</label>
-                            <input type="text" placeholder="Enter template name..." className="w-full p-4 md:p-5 border border-gray-200 rounded-lg outline-none text-sm font-medium bg-white focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/10 transition-all" onChange={(e) => setFormData({...formData, name: e.target.value})} />
+                            <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">Template Name</label>
+                            <input 
+                              type="text" 
+                              placeholder="Enter template name..." 
+                              disabled={isEditing}
+                              value={typeof formData.name === 'string' ? formData.name : (formData.name?.name || '')}
+                              className={`w-full p-4 border border-gray-200 rounded-lg outline-none text-sm font-medium focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all ${isEditing ? 'bg-gray-100 cursor-not-allowed opacity-75' : 'bg-white'}`} 
+                              onChange={(e) => setFormData({...formData, name: e.target.value})} 
+                            />
                             {formData.name && (
                               <div className="text-xs text-gray-500 mt-1">
                                 <span className="text-gray-600 font-medium">WhatsApp name:</span>{' '}
@@ -617,8 +857,16 @@ const Templates = () => {
                             )}
                         </div>
                         <div className="space-y-2">
-                            <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Languages</label>
-                            <select className="w-full p-4 md:p-5 border border-gray-200 rounded-lg bg-white outline-none text-sm font-medium appearance-none focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/10 transition-all"><option>English (US)</option><option>Hindi</option></select>
+                            <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">Languages</label>
+                            <select 
+                              disabled={isEditing}
+                              className={`w-full p-4 border border-gray-200 rounded-lg outline-none text-sm font-medium appearance-none focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all ${isEditing ? 'bg-gray-100 cursor-not-allowed opacity-75' : 'bg-white'}`} 
+                              value={formData.language} 
+                              onChange={(e) => setFormData({...formData, language: e.target.value})}
+                            >
+                                <option>English (US)</option>
+                                <option>Hindi</option>
+                            </select>
                         </div>
                     </div>
 
@@ -630,7 +878,6 @@ const Templates = () => {
             </div>
           ) : (
             <div className="space-y-5 animate-in fade-in slide-in-from-right-4 duration-500">
-                {(formData.category === 'Marketing' || templateType === 'LIMITED_TIME_OFFER') && (
                 <div className="bg-white rounded-xl border border-gray-200 p-6 md:p-8 shadow-sm">
                     <div className="flex items-center gap-2 mb-4">
                         <div className="w-6 h-6 bg-green-50 text-green-600 rounded-lg flex items-center justify-center"><Clock size={14}/></div>
@@ -638,24 +885,59 @@ const Templates = () => {
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-3">
-                            <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Name your template</label>
+                            <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">Name your template</label>
                             <input 
                               type="text" 
+                              disabled={isEditing}
                               value={typeof formData.name === 'string' ? formData.name : (formData.name?.name || '')}
-                              onChange={(e) => setFormData({...formData, name: e.target.value})} 
-                              className="w-full p-4 border border-gray-200 rounded-lg text-sm font-medium bg-white outline-none focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/10 transition-all" 
+                              onChange={(e) => {
+                                setFormData({...formData, name: e.target.value});
+                                if (nameError) {
+                                  setNameError(null);
+                                  setTemplateNameSuggestion(null);
+                                }
+                              }} 
+                              className={`w-full p-4 border rounded-lg text-sm font-medium outline-none focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all ${isEditing ? 'bg-gray-100 cursor-not-allowed opacity-75 border-gray-200' : nameError ? 'bg-red-50 border-red-400 focus:border-red-500' : 'bg-white border-gray-200 focus:border-[#10B981]'}`} 
                             />
+                            {nameError && (
+                              <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2 text-red-700 animate-in fade-in">
+                                <Info size={16} className="mt-0.5 flex-shrink-0" />
+                                <div className="text-sm">
+                                  <p className="font-medium mb-1">{nameError}</p>
+                                  {templateNameSuggestion && (
+                                    <div className="mt-2 flex items-center flex-wrap gap-2 text-xs">
+                                      <span className="text-gray-600">Suggested name:</span>
+                                      <code className="bg-white px-2 py-1 rounded border border-red-200 font-semibold">{templateNameSuggestion}</code>
+                                      <button 
+                                        onClick={() => {
+                                          setFormData({...formData, name: templateNameSuggestion});
+                                          setNameError(null);
+                                          setTemplateNameSuggestion(null);
+                                        }}
+                                        className="bg-red-100 hover:bg-red-200 text-red-800 px-3 py-1 rounded transition-colors font-medium ml-2"
+                                      >
+                                        Use this name
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )}
                         </div>
                         <div className="space-y-3">
-                            <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Select language</label>
-                            <select className="w-full p-4 border border-gray-200 rounded-lg text-sm font-medium bg-white outline-none focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/10 transition-all" value={formData.language} onChange={(e) => setFormData({...formData, language: e.target.value})}>
+                            <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">Select language</label>
+                            <select 
+                              disabled={isEditing}
+                              className={`w-full p-4 border border-gray-200 rounded-lg text-sm font-medium outline-none focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all ${isEditing ? 'bg-gray-100 cursor-not-allowed opacity-75' : 'bg-white'}`} 
+                              value={formData.language} 
+                              onChange={(e) => setFormData({...formData, language: e.target.value})}
+                            >
                                 <option>English (US)</option>
                                 <option>Hindi</option>
                             </select>
                         </div>
                     </div>
                 </div>
-                )}
                 {formData.category !== 'Authentication' && (
                 <div className="bg-white rounded-xl border border-gray-200 p-6 md:p-8 shadow-sm mt-5">
                     <div className="mb-8 border-b border-gray-100 pb-6">
@@ -664,12 +946,13 @@ const Templates = () => {
                             <p className="text-xs text-gray-500">Add a title or choose which type of media you&apos;ll use for this header.</p>
                         </div>
                         <select 
-                            className="w-full p-4 border border-gray-200 rounded-lg text-sm font-medium outline-none bg-white focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/10 transition-all" 
+                            className="w-full p-4 border border-gray-200 rounded-lg text-sm font-medium outline-none bg-white focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all" 
                             value={formData.headerType} 
                             onChange={(e) => {
                               setFormData({...formData, headerType: e.target.value});
                               // Clear previous media when header type changes
                               setHeaderMedia(null);
+                              setUploadedMediaUrl(null);
                               if (headerFileRef.current) {
                                 headerFileRef.current.value = '';
                               }
@@ -719,7 +1002,25 @@ const Templates = () => {
                                     )}
                                     <div className="flex-1 min-w-0">
                                       <p className="text-sm font-semibold text-gray-800 truncate">{headerMedia.name}</p>
-                                      <p className="text-xs text-gray-500">{(headerMedia.file.size / 1024 / 1024).toFixed(2)} MB</p>
+                                      {headerMedia.file && (
+                                        <p className="text-xs text-gray-500">{(headerMedia.file.size / 1024 / 1024).toFixed(2)} MB</p>
+                                      )}
+                                      {isUploadingMedia ? (
+                                        <div className="flex items-center gap-1.5 mt-1">
+                                          <svg className="animate-spin h-3 w-3 text-[#10B981]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                                          </svg>
+                                          <span className="text-xs text-[#10B981] font-medium">Uploading to server…</span>
+                                        </div>
+                                      ) : (uploadedMediaUrl || headerMedia.hostedUrl) ? (
+                                        <div className="mt-1">
+                                          <span className="inline-flex items-center gap-1 text-xs bg-green-50 text-green-700 border border-green-200 rounded px-2 py-0.5 font-medium">
+                                            ✓ Hosted
+                                          </span>
+                                          <p className="text-xs text-gray-400 truncate mt-0.5 max-w-xs">{uploadedMediaUrl || headerMedia.hostedUrl}</p>
+                                        </div>
+                                      ) : null}
                                     </div>
                                   </div>
                                   <button 
@@ -796,6 +1097,27 @@ const Templates = () => {
                         </div>
                     </div>
 
+                    {/* FOOTER SECTION */}
+                    <div className="mt-8 border-t border-gray-50 pt-6">
+                        <div className="flex flex-col gap-1 mb-3">
+                            <h3 className="text-sm md:text-base font-bold text-gray-800">Footer <span className="text-gray-400 font-normal text-sm ml-1">(Optional)</span></h3>
+                            <p className="text-xs text-gray-500">Add a short line of text to the bottom of your message.</p>
+                        </div>
+                        <div className="relative">
+                            <input 
+                                type="text" 
+                                value={formData.footerText} 
+                                onChange={(e) => setFormData({...formData, footerText: e.target.value})} 
+                                placeholder="Enter footer text..."
+                                maxLength={60}
+                                className="w-full p-4 border border-gray-200 rounded-lg text-sm font-medium outline-none bg-white focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all" 
+                            />
+                            <div className="flex justify-end mt-1">
+                                <span className="text-[10px] font-medium text-gray-400">{formData.footerText?.length || 0}/60</span>
+                            </div>
+                        </div>
+                    </div>
+
                     {bodyVariables.length > 0 && (
                       <div className="mt-5 rounded-xl border border-gray-200 bg-white p-5 md:p-6 shadow-sm">
                         <h4 className="text-sm md:text-base font-bold text-gray-800">Samples for body content</h4>
@@ -813,7 +1135,7 @@ const Templates = () => {
                                 value={bodySamples[variableId] || ''}
                                 onChange={(e) => handleBodySampleChange(variableId, e.target.value)}
                                 placeholder={`Enter content for {{${variableId}}}`}
-                                className="flex-1 p-3 border border-gray-200 rounded-lg text-sm font-medium bg-white outline-none focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/10 transition-all"
+                                className="flex-1 p-3 border border-gray-200 rounded-lg text-sm font-medium bg-white outline-none focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all"
                               />
                             </div>
                           ))}
@@ -913,16 +1235,16 @@ const Templates = () => {
                 </div>
                 )}
                 <div className="flex flex-col sm:flex-row justify-between items-center gap-6 pt-6">
-                    <button onClick={() => setView('setup')} className="text-gray-500 font-semibold text-sm hover:text-gray-800 transition-colors px-4 py-2 order-2 sm:order-1">Previous Step</button>
+                    <button onClick={() => setView('setup')} className="text-gray-500 font-semibold text-sm hover:text-gray-800 transition-colors px-4 py-2 order-2 sm:order-1">← Previous Step</button>
 
                     <button onClick={handleSubmit} disabled={isSubmitting} className="w-full sm:w-auto bg-[#10B981] text-white px-10 md:px-14 py-3 md:py-4 rounded-lg font-semibold text-sm shadow-sm hover:bg-[#059669] transition-all order-1 sm:order-2 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                       {isSubmitting ? (
                         <>
                           <RotateCw size={16} className="animate-spin" />
-                          Submitting...
+                          {isEditing ? 'Saving...' : 'Submitting...'}
                         </>
                       ) : (
-                        'Submit Template'
+                        isEditing ? 'Save Changes' : 'Submit Template'
                       )}
                     </button>
                 </div>
@@ -953,6 +1275,7 @@ const Templates = () => {
                 offer={formData.offerTitle} 
                 isLimited={templateType === 'LIMITED_TIME_OFFER'}
                 buttons={formData.category === 'Authentication' ? [] : buttons} 
+                isSetupView={view === 'setup'}
               />
             </div>
         </div>
@@ -961,91 +1284,129 @@ const Templates = () => {
   );
 };
 
-const MobilePreview = ({ name, body, footer, showImage = false, offer = "", isLimited = false, buttons = [], headerMedia = null, headerType = 'None' }) => (
-  <div className="relative w-[300px] h-[580px] bg-[#0F172A] rounded-[3.5rem] border-[12px] border-[#1e293b] shadow-[0_50px_100px_rgba(0,0,0,0.15)] overflow-hidden font-sans">
-    <div className="h-full bg-[#E5DDD5] pt-10">
-      <div className="bg-[#075E54] p-5 flex items-center gap-3">
-        <div className="w-9 h-9 bg-white/20 rounded-full border border-white/10" />
-        <div className="text-white">
-          <p className="text-sm font-bold leading-none">WhatsApp Business</p>
-          <p className="text-[10px] opacity-60 font-semibold uppercase mt-1">online</p>
+const MobilePreview = ({ name, body, footer, showImage = false, offer = "", isLimited = false, buttons = [], headerMedia = null, headerType = 'None', isSetupView = false }) => {
+  if (isSetupView) {
+    return (
+      <div className="relative w-[320px] h-[640px] bg-white rounded-[3rem] border-[14px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
+        {/* Notch */}
+        <div className="absolute top-0 w-36 h-[28px] bg-[#1e293b] rounded-b-[20px] z-20 flex justify-center">
+           <div className="w-14 h-1.5 bg-white/20 rounded-full mt-2"></div>
+        </div>
+        
+        {/* Screen Background */}
+        <div className="w-full h-full bg-[#FAFAFA] pt-14 pb-6 px-4 overflow-y-auto custom-scrollbar flex flex-col">
+           {/* Message Bubble Card */}
+           <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden mt-2 flex flex-col w-full">
+              {/* Image banner */}
+              <div className="w-full bg-[#1A8B88] h-36 flex items-end justify-center overflow-hidden">
+                <svg width="220" height="130" viewBox="0 0 220 130" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M80 130C80 90 95 70 110 70C125 70 140 90 140 130" fill="#4B9CB3"/>
+                  <rect x="98" y="25" width="24" height="45" rx="12" fill="#FFD7B5"/>
+                  <path d="M85 40C85 20 100 10 110 10C120 10 135 20 135 40L135 55L85 55L85 40Z" fill="#1e293b"/>
+                  <circle cx="110" cy="45" r="5" fill="#1e293b"/>
+                  <rect x="70" y="90" width="80" height="40" rx="3" fill="#E2E8F0"/>
+                  <rect x="80" y="45" width="60" height="20" rx="2" fill="#4A5568"/>
+                </svg>
+              </div>
+              
+              <div className="p-4 flex flex-col">
+                 <p className="text-[13px] text-gray-800 font-medium leading-relaxed mb-4">
+                   Hey there! Check out our fresh groceries now!
+                 </p>
+                 <p className="text-[13px] text-gray-800 font-medium leading-relaxed mb-1">
+                   Use code <span className="font-bold">HEALTH</span> to get additional 10% off on your entire purchase.
+                 </p>
+                 <div className="flex justify-end mt-1">
+                    <span className="text-[10px] text-gray-400 font-semibold">11:59</span>
+                 </div>
+              </div>
+              
+              <div className="border-t border-gray-100 w-full flex">
+                 <button className="w-full py-3 flex items-center justify-center gap-2 text-blue-500 font-semibold text-[14px] hover:bg-gray-50 transition-colors">
+                    <ExternalLink size={16}/> Shop now
+                 </button>
+              </div>
+              <div className="border-t border-gray-100 w-full flex">
+                 <button className="w-full py-3 flex items-center justify-center gap-2 text-blue-500 font-semibold text-[14px] hover:bg-gray-50 transition-colors">
+                    <Copy size={16}/> Copy code
+                 </button>
+              </div>
+           </div>
         </div>
       </div>
-      <div className="p-4 overflow-y-auto max-h-[460px]">
-        <div className="bg-white rounded-[1.25rem] rounded-tl-none shadow-lg overflow-hidden border border-gray-200/50">
-          {showImage && (
-            <>
-              {headerMedia ? (
-                <div className="relative bg-gray-900 flex items-center justify-center overflow-hidden">
-                  {headerMedia.type === 'image' && (
-                    <img src={headerMedia.preview} alt="header" className="w-full h-40 object-cover"/>
-                  )}
-                  {headerMedia.type === 'video' && (
-                    <video src={headerMedia.preview} className="w-full h-40 object-cover" controls={false}/>
-                  )}
-                  {headerMedia.type === 'document' && (
-                    <div className="w-full h-40 bg-red-50 flex items-center justify-center flex-col gap-2">
-                      <div className="text-4xl font-bold text-red-600">{headerMedia.name.split('.').pop().toUpperCase()}</div>
-                      <p className="text-xs text-gray-600">{headerMedia.name}</p>
-                    </div>
-                  )}
-                  {offer && <div className="absolute top-2 right-2 md:top-3 md:right-3 bg-[#10B981] text-white text-xs font-bold px-2 md:px-3 py-1 md:py-1.5 rounded-lg shadow-md">{offer}</div>}
-                </div>
-              ) : (
-                <div className="h-32 md:h-36 bg-gray-50 flex flex-col items-center justify-center text-gray-300 gap-1 border-b border-dashed relative">
-                  {offer && <div className="absolute top-2 right-2 md:top-3 md:right-3 bg-[#10B981] text-white text-xs font-bold px-2 md:px-3 py-1 md:py-1.5 rounded-lg shadow-md">{offer}</div>}
-                  {headerType === 'Image' && (
-                    <>
-                      <ImageIcon size={32} className="opacity-20"/>
-                      <span className="text-xs font-bold uppercase opacity-30">Image Preview</span>
-                    </>
-                  )}
-                  {headerType === 'Video' && (
-                    <>
-                      <div className="text-3xl opacity-20">▶️</div>
-                      <span className="text-xs font-bold uppercase opacity-30">Video Preview</span>
-                    </>
-                  )}
-                  {headerType === 'Document' && (
-                    <>
-                      <div className="text-3xl opacity-20">📄</div>
-                      <span className="text-xs font-bold uppercase opacity-30">Document Preview</span>
-                    </>
-                  )}
-                  {(headerType === 'None' || headerType === 'Text') && (
-                    <>
-                      <ImageIcon size={32} className="opacity-20"/>
-                      <span className="text-xs font-bold uppercase opacity-30">Media Header</span>
-                    </>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-          <div className="p-4 md:p-5">
-            <p className="text-xs text-[#10B981] font-bold mb-2 uppercase tracking-wide">[{name || 'TEMPLATE_NAME'}]</p>
-            <p className="text-sm md:text-base text-gray-700 font-medium leading-relaxed mb-3 whitespace-pre-line">{body}</p>
-            
-            {isLimited && (
-                <div className="mt-4 p-3 bg-red-50 rounded-xl border border-red-100 flex items-center justify-between">
-                    <span className="text-xs font-bold text-red-500">Offer expires in:</span>
-                    <span className="text-xs font-bold text-red-600 bg-white px-2 py-1 rounded-md shadow-sm">23:59:59</span>
-                </div>
-            )}
+    );
+  }
 
-            {footer && <p className="text-xs text-gray-400 mt-3 pt-3 border-t border-gray-100 font-medium italic">{footer}</p>}
-          </div>
-          {buttons.length > 0 && buttons.map(btn => (
-            <div key={btn.id} className="bg-gray-50 p-2 border-t border-gray-100">
-               <button className="text-sm text-blue-500 font-bold flex items-center justify-center gap-2 w-full py-2.5 md:py-3 bg-white rounded-xl shadow-sm border border-gray-100">
-                  <ExternalLink size={14}/> {btn.text}
-               </button>
+  // Dynamic preview for content phase
+  return (
+    <div className="relative w-[320px] h-[640px] bg-white rounded-[3rem] border-[14px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
+      {/* Notch */}
+      <div className="absolute top-0 w-36 h-[28px] bg-[#1e293b] rounded-b-[20px] z-20 flex justify-center">
+         <div className="w-14 h-1.5 bg-white/20 rounded-full mt-2"></div>
+      </div>
+      
+      {/* Screen Background */}
+      <div className="w-full h-full bg-[#FAFAFA] pt-14 pb-6 px-4 overflow-y-auto custom-scrollbar flex flex-col">
+         {/* Message Bubble Card */}
+         <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden mt-2 flex flex-col w-full">
+            {showImage && (
+              <div className="w-full relative overflow-hidden bg-gray-50">
+                {headerMedia ? (
+                  <>
+                    {headerMedia.type === 'image' && (
+                      <img src={headerMedia.preview} alt="header" className="w-full h-36 object-cover"/>
+                    )}
+                    {headerMedia.type === 'video' && (
+                      <video src={headerMedia.preview} className="w-full h-36 object-cover" controls={false}/>
+                    )}
+                    {headerMedia.type === 'document' && (
+                      <div className="w-full h-36 bg-red-50 flex items-center justify-center flex-col gap-2">
+                        <div className="text-3xl font-bold text-red-600">{headerMedia.name.split('.').pop().toUpperCase()}</div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="w-full h-36 bg-gray-100 flex items-center justify-center text-gray-400">
+                    {headerType === 'Image' ? <ImageIcon size={28}/> : headerType === 'Video' ? <span className="text-2xl">▶️</span> : headerType === 'Document' ? <span className="text-2xl">📄</span> : <ImageIcon size={28}/>}
+                  </div>
+                )}
+              </div>
+            )}
+            
+            <div className="p-4 flex flex-col">
+               {name && <p className="text-[11px] text-[#10B981] font-bold mb-2 uppercase tracking-wide">[{name}]</p>}
+               <div className="text-[13px] text-gray-800 font-medium leading-relaxed whitespace-pre-line" dangerouslySetInnerHTML={{ __html: formatWhatsAppMarkdown(body) }}></div>
+               
+               {isLimited && (
+                  <div className="mt-3 p-2 bg-red-50 rounded-lg border border-red-100 flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-red-500">Offer expires in:</span>
+                      <span className="text-[11px] font-bold text-red-600 bg-white px-1.5 py-0.5 rounded shadow-sm">23:59:59</span>
+                  </div>
+               )}
+
+               {footer && <p className="text-[12px] text-gray-400 mt-3 font-medium">{footer}</p>}
+
+               <div className="flex justify-end mt-2">
+                  <span className="text-[10px] text-gray-400 font-semibold">11:59</span>
+               </div>
             </div>
-          ))}
-        </div>
+            
+            {buttons && buttons.length > 0 && (
+               <div className="flex flex-col border-t border-gray-100 w-full">
+                  {buttons.map((btn) => (
+                     <div key={btn.id} className="w-full py-3 flex items-center justify-center gap-2 border-b border-gray-100 last:border-b-0">
+                        <span className="text-blue-500 font-semibold text-[14px] flex items-center gap-2 hover:opacity-80 transition-opacity">
+                          {btn.type === 'Visit Website' || btn.type === 'Visit website' ? <ExternalLink size={16} className="text-blue-500"/> : btn.text.toLowerCase().includes('copy') ? <Copy size={16} className="text-blue-500"/> : null} 
+                          {btn.text}
+                        </span>
+                     </div>
+                  ))}
+               </div>
+            )}
+         </div>
       </div>
     </div>
-  </div>
-);
+  );
+};
 
-export default Templates;
+export default CreateTemplate;

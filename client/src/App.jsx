@@ -9,7 +9,6 @@ import "react-toastify/dist/ReactToastify.css";
 // --- IMPORTS FOR NEW UI ---
 import Loading from "./components/Loading";
 import ErrorBoundary from "./components/ui/ErrorBoundary";
-
 import MainHeading from "./components/header/MainHeading";
 import MainSidebar from "./components/mainsidebar/MainSidebar";
 import ProtectedRoute from "./components/ProtectedRoute";
@@ -25,8 +24,13 @@ const NotificationPage = lazy(() => import("./pages/Notification/NotificationPag
 const Chat = lazy(() => import(/* webpackPrefetch: true */ "./pages/chat/chat"));
 const Campaign = lazy(() => import("./pages/campaign/campaign"));
 const CreateCampaign = lazy(() => import("./pages/campaign/CreateCampaign"));
+const CampaignLaunchSuccess = lazy(() => import("./pages/campaign/CampaignLaunchSuccess"));
 const Automation = lazy(() => import("./pages/automation/automation"));
 const Analytic = lazy(() => import("./pages/analytic/analytic"));
+const ConversationAnalytics = lazy(() => import("./pages/analytic/ConversationAnalytics"));
+const MessagesAnalytics = lazy(() => import("./pages/analytic/MessagesAnalytics"));
+const TemplateAnalytics = lazy(() => import("./pages/analytic/TemplateAnalytics"));
+const CampaignAnalytics = lazy(() => import("./pages/analytic/CampaignAnalytics"));
 
 // --- LAZY LOADED PLAN & PRICING PAGES ---
 const UpgradePlan = lazy(() => import("./pages/PlanPricing/UpgradePlan"));
@@ -70,6 +74,7 @@ const Inventory = lazy(() => import("./pages/commerce/Inventory"));
 const UserProfile = lazy(() => import("./pages/profile/UserProfile"));
 const BusinessProfile = lazy(() => import("./pages/profile/BusinessProfile"));
 const ActivePlans = lazy(() => import("./pages/profile/ActivePlans"));
+const ChangePassword = lazy(() => import("./pages/profile/ChangePassword"));
 
 // --- LAZY LOADED AUTH PAGES ---
 const Login = lazy(() => import("./pages/Auth/Login"));
@@ -123,23 +128,26 @@ Placeholder.propTypes = {
 const AppLayout = memo(() => {
   const location = useLocation();
   
-  // Collapse sidebar by default on UpgradePlan page
+  // Collapse sidebar by default on specific pages
   const isPricingPage = location.pathname === "/admin/plan/upgrade";
-  const [isSidebarOpen, setIsSidebarOpen] = useState(!isPricingPage);
+  const isChangePasswordPage = location.pathname === "/admin/profile/change-password";
+  const [isSidebarOpen, setIsSidebarOpen] = useState(!(isPricingPage || isChangePasswordPage));
 
-  // Collapse sidebar when navigating to pricing page
+  // Collapse sidebar when navigating to those pages
   useEffect(() => {
-    if (isPricingPage) {
+    if (isPricingPage || isChangePasswordPage) {
       setIsSidebarOpen(false);
     }
-  }, [isPricingPage]);
+  }, [isPricingPage, isChangePasswordPage]);
 
   const isDashboard = location.pathname === "/" || location.pathname === "/admin/dashboard";
   return (
     <div className="flex h-screen w-screen bg-[#faf9f7] font-['Urbanist'] overflow-hidden">
       
       {/* 1. Sidebar now stretches full height as the first child of the flex-row */}
-      <MainSidebar isOpen={isSidebarOpen} setIsOpen={setIsSidebarOpen} />
+      {!isChangePasswordPage && (
+        <MainSidebar isOpen={isSidebarOpen} setIsOpen={setIsSidebarOpen} />
+      )}
 
       {/* 2. Main content container (Navbar + Page Content) */}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
@@ -153,9 +161,11 @@ const AppLayout = memo(() => {
 
         {/* 4. Page Content area */}
         <div className="flex-1 overflow-y-auto bg-[#f8fafc] relative w-full">
-          <Suspense fallback={<PageLoader />}>
-            <Outlet />
-          </Suspense>
+          <ErrorBoundary>
+            <Suspense fallback={<PageLoader />}>
+              <Outlet />
+            </Suspense>
+          </ErrorBoundary>
         </div>
       </div>
     </div>
@@ -248,6 +258,7 @@ function App() {
           <Route path="/admin/campaign" element={<Campaign />} />
           <Route path="/admin/campaigns" element={<Campaign />} />
           <Route path="/admin/campaign/create" element={<CreateCampaign />} />
+          <Route path="/admin/campaign-success" element={<CampaignLaunchSuccess />} />
           <Route
             path="/admin/campaigns/bulk"
             element={<Placeholder title="Bulk Send" />}
@@ -259,18 +270,25 @@ function App() {
           {/* 8. Automation */}
           <Route path="/admin/automation" element={<Automation />} />
           {/* 9. Analytics */}
-          <Route path="/admin/analytic" element={<Analytic />} />
+          <Route
+            path="/admin/analytic/campaign"
+            element={<CampaignAnalytics />}
+          />
+          <Route
+            path="/admin/analytic"
+            element={<Analytic />}
+          />
           <Route
             path="/admin/analytic/conversation"
-            element={<Placeholder title="Conversation Analytics" />}
+            element={<ConversationAnalytics />}
           />
           <Route
             path="/admin/analytic/messages"
-            element={<Placeholder title="Message Analytics" />}
+            element={<MessagesAnalytics />}
           />
           <Route
             path="/admin/analytic/template"
-            element={<Placeholder title="Template Analytics" />}
+            element={<TemplateAnalytics />}
           />
           <Route
             path="/admin/reports"
@@ -321,6 +339,7 @@ function App() {
           <Route path="/admin/account/plan" element={<ActivePlans />} />
           <Route path="/admin/profile/info" element={<UserProfile />} />
           <Route path="/admin/profile/business" element={<BusinessProfile />} />
+          <Route path="/admin/profile/change-password" element={<ChangePassword />} />
 
           {/* 14. Help & Support Wrapper Route */}
           <Route path="/admin/help" element={<HelpLayout />}>

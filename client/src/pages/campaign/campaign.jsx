@@ -1,7 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useContext, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import CampaignApi from '../../services/CampaignApi';
+import { fetchWhatsAppTemplates, mergeTemplates } from '../../services/TemplateApi';
 import { toast } from 'react-toastify';
+import io from 'socket.io-client';
+import { userContext } from '../../context/Context';
 import {
   MagnifyingGlassIcon,
   PlusIcon,
@@ -45,34 +48,57 @@ const formatDate = (dateStr) =>
     hour: '2-digit', minute: '2-digit', hour12: true,
   });
 
-const mapCampaign = (camp) => ({
-  id: camp._id,
-  title: camp.name,
-  message: camp.messageTemplate || '—',
-  status: mapStatus(camp.status),
-  progress: mapProgress(camp),
-  createdBy: camp.user?.name || 'User',
-  initials: (camp.user?.name || camp.name || 'U').substring(0, 2).toUpperCase(),
-  sentOn: formatDate(camp.createdAt),
-  stats: {
-    total: (camp.stats?.sent || 0) + (camp.stats?.failed || 0),
-    sent: camp.stats?.sent || 0,
-    delivered: camp.stats?.delivered || 0,
-    read: camp.stats?.read || 0,
-    failed: camp.stats?.failed || 0,
-  },
-});
+const truncateText = (value, maxLength = 120) => {
+  const text = String(value || '');
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength).trimEnd()}...`;
+};
+
+const SOCKET_URL =
+  import.meta.env.VITE_SOCKET_URL ||
+  (import.meta.env.VITE_API_URL
+    ? String(import.meta.env.VITE_API_URL).replace(/\/api\/?$/, '')
+    : 'http://localhost:5000');
+
+const mapCampaign = (camp, templatePreviewMap = {}) => {
+  const rawTemplateValue = String(camp.messageTemplate || '—').trim();
+  const resolvedTemplate =
+    templatePreviewMap[rawTemplateValue] ||
+    templatePreviewMap[rawTemplateValue.toLowerCase()] ||
+    rawTemplateValue;
+
+  return {
+    id: camp._id,
+    title: camp.name,
+    message: resolvedTemplate || '—',
+    templateName: rawTemplateValue,
+    status: mapStatus(camp.status),
+    progress: mapProgress(camp),
+    createdBy: camp.user?.name || 'User',
+    initials: (camp.user?.name || camp.name || 'U').substring(0, 2).toUpperCase(),
+    sentOn: formatDate(camp.createdAt),
+    stats: {
+      total: (camp.stats?.sent || 0) + (camp.stats?.failed || 0),
+      sent: camp.stats?.sent || 0,
+      delivered: camp.stats?.delivered || 0,
+      read: camp.stats?.read || 0,
+      failed: camp.stats?.failed || 0,
+    },
+  };
+};
 
 /* ═══════════════════════════════════════════════════════════════ */
 
 const CampaignDashboard = () => {
   const navigate = useNavigate();
+  const { user } = useContext(userContext);
+  const socketRef = useRef(null);
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
   /* modal state */
-  const [analyticsTarget, setAnalyticsTarget] = useState(null);
+  const [analyticsId, setAnalyticsId] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [duplicatedId, setDuplicatedId] = useState(null);
 
@@ -81,30 +107,119 @@ const CampaignDashboard = () => {
   const [filterStatus, setFilterStatus] = useState('All');
   const [filterTemplate, setFilterTemplate] = useState('All');
   const [templateOptions, setTemplateOptions] = useState([]);
+  const [templatePreviewMap, setTemplatePreviewMap] = useState({});
 
-  useEffect(() => { 
-    fetchCampaigns();
-  }, []);
+  // Real-time updates with Socket.io
+  useEffect(() => {
+    if (!user?._id && !user?.id) return;
 
-  const fetchCampaigns = async () => {
+    const userId = user._id || user.id;
+    socketRef.current = io(SOCKET_URL, { withCredentials: true });
+
+    socketRef.current.on('connect', () => {
+      socketRef.current.emit('join', userId);
+    });
+
+    socketRef.current.on('campaign_stats_updated', (data) => {
+      const { campaignId, stats, status } = data;
+      console.log('📈 Campaign stats updated:', data);
+      
+      setCampaigns((prev) => 
+        prev.map((c) => {
+          if (String(c.id) === String(campaignId)) {
+            return {
+              ...c,
+              stats: {
+                total: (stats.sent || 0) + (stats.failed || 0),
+                sent: stats.sent || 0,
+                delivered: stats.delivered || 0,
+                read: stats.read || 0,
+                failed: stats.failed || 0,
+              },
+              status: mapStatus(status),
+              progress: mapProgress({ ...c, status, stats })
+            };
+          }
+          return c;
+        })
+      );
+    });
+
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+    };
+  }, [user]);
+
+  // Helper to fetch and format templates
+  const getTemplatesMap = async () => {
     try {
-      setLoading(true);
+      const whatsappTemplates = await fetchWhatsAppTemplates();
+      const approvedTemplates = whatsappTemplates.approvedTemplates || whatsappTemplates.data?.approvedTemplates || [];
+      const formatted = mergeTemplates(approvedTemplates, []);
+
+      return formatted.reduce((acc, template) => {
+        if (template?.name) {
+          acc[template.name] = template.bodyText || template.name;
+          acc[String(template.name).toLowerCase()] = template.bodyText || template.name;
+        }
+        return acc;
+      }, {});
+    } catch (error) {
+      console.error('Error loading templates map:', error);
+      return {};
+    }
+  };
+
+  const fetchCampaigns = useCallback(async (showLoading = true, customTemplateMap = null) => {
+    try {
+      if (showLoading) setLoading(true);
       const res = await CampaignApi.getCampaigns();
       if (res.success) {
-        const mapped = res.data.map(mapCampaign);
+        const tMap = customTemplateMap || templatePreviewMap;
+        const mapped = res.data.map((camp) => mapCampaign(camp, tMap));
         setCampaigns(mapped);
         
-        // Extract unique templates from campaigns
-        const uniqueTemplates = [...new Set(mapped.map(c => c.message))].filter(t => t !== '—');
+        const uniqueTemplates = [...new Set(mapped.map(c => c.templateName))].filter(t => t !== '—');
         setTemplateOptions(uniqueTemplates);
+      } else {
+        toast.error(res.message || 'Failed to fetch campaigns');
       }
     } catch (error) {
       console.error('Error fetching campaigns:', error);
       toast.error('Failed to fetch campaigns');
     } finally {
-      setLoading(false);
+      if (showLoading) setLoading(false);
     }
-  };
+  }, [templatePreviewMap]);
+
+  // Initial load: Fetch both in parallel
+  useEffect(() => {
+    const init = async () => {
+      setLoading(true);
+      try {
+        const tMap = await getTemplatesMap();
+        setTemplatePreviewMap(tMap);
+        // Pass tMap directly to fetchCampaigns to avoid waiting for state update
+        await fetchCampaigns(false, tMap);
+      } catch (error) {
+        console.error('Initial load error:', error);
+      } finally {
+        setLoading(false);
+      }
+    };
+    init();
+  }, []); // Only once on mount
+
+  // Background refresh
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      fetchCampaigns(false);
+    }, 15000);
+
+    return () => clearInterval(intervalId);
+  }, [fetchCampaigns]);
 
   /* ── Actions ── */
   const handleDuplicate = async (camp) => {
@@ -119,6 +234,8 @@ const CampaignDashboard = () => {
         setDuplicatedId(res.data._id);
         setTimeout(() => setDuplicatedId(null), 2000);
         fetchCampaigns();
+      } else {
+        toast.error(res.message || 'Failed to duplicate campaign');
       }
     } catch {
       toast.error('Failed to duplicate campaign');
@@ -131,6 +248,8 @@ const CampaignDashboard = () => {
       if (res.success) {
         toast.success('Campaign deleted');
         setCampaigns((prev) => prev.filter((c) => c.id !== deleteTarget.id));
+      } else {
+        toast.error(res.message || 'Failed to delete campaign');
       }
     } catch {
       toast.error('Failed to delete campaign');
@@ -142,9 +261,9 @@ const CampaignDashboard = () => {
   /* ── Derived ── */
   const filtered = campaigns.filter(cur => {
     const matchesSearch = cur.title.toLowerCase().includes(search.toLowerCase()) || 
-                          cur.message.toLowerCase().includes(search.toLowerCase());
+                          cur.templateName.toLowerCase().includes(search.toLowerCase());
     const matchesStatus = filterStatus === 'All' || cur.status === filterStatus;
-    const matchesTemplate = filterTemplate === 'All' || cur.message === filterTemplate;
+    const matchesTemplate = filterTemplate === 'All' || cur.templateName === filterTemplate;
     return matchesSearch && matchesStatus && matchesTemplate;
   });
 
@@ -256,16 +375,16 @@ const CampaignDashboard = () => {
 
         {/* Table */}
         <div className="w-full overflow-x-auto">
-          <table className="w-full text-left">
+          <table className="w-full text-left table-fixed">
             <thead>
               <tr className="border-b border-gray-100 bg-gray-50/60">
-                <th className="px-6 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-12">#</th>
-                <th className="px-4 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400">Campaign Title</th>
-                <th className="px-4 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400">Template</th>
-                <th className="px-4 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400">Status</th>
-                <th className="px-4 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400">Sent On</th>
-                <th className="px-4 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400">Created By</th>
-                <th className="px-6 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 text-right">Actions</th>
+                <th className="px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-12 whitespace-nowrap">#</th>
+                <th className="px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-[20%] whitespace-nowrap">Campaign Title</th>
+                <th className="px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-[18%] whitespace-nowrap">Template</th>
+                <th className="px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-[14%] whitespace-nowrap">Status</th>
+                <th className="px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-[16%] whitespace-nowrap">Sent On</th>
+                <th className="px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-[18%] whitespace-nowrap">Created By</th>
+                <th className="px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-400 w-24 text-right whitespace-nowrap">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-50">
@@ -299,8 +418,8 @@ const CampaignDashboard = () => {
                     key={camp.id}
                     className={`group transition-colors ${duplicatedId === camp.id ? 'bg-emerald-50/60' : 'hover:bg-slate-50/60'}`}
                   >
-                    <td className="px-6 py-4 text-sm font-semibold text-slate-300">{index + 1}</td>
-                    <td className="px-4 py-4">
+                    <td className="px-5 py-4 text-sm font-semibold text-slate-300 align-middle">{index + 1}</td>
+                    <td className="px-5 py-4 align-middle">
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-semibold text-slate-800">{camp.title}</span>
                         {duplicatedId === camp.id && (
@@ -310,18 +429,21 @@ const CampaignDashboard = () => {
                         )}
                       </div>
                     </td>
-                    <td className="px-4 py-4">
-                      <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2.5 py-1 rounded-lg">
-                        {camp.message}
+                    <td className="px-5 py-4 align-middle">
+                      <span
+                        className="inline-flex max-w-[240px] rounded-lg border border-emerald-100 bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 truncate align-middle"
+                        title={camp.templateName}
+                      >
+                        {truncateText(camp.templateName, 48)}
                       </span>
                     </td>
-                    <td className="px-4 py-4">
+                    <td className="px-5 py-4 align-middle">
                       <StatusBadge status={camp.status} progress={camp.progress} />
                     </td>
-                    <td className="px-4 py-4">
+                    <td className="px-5 py-4 align-middle">
                       <span className="text-xs text-slate-500 font-medium">{camp.sentOn}</span>
                     </td>
-                    <td className="px-4 py-4">
+                    <td className="px-5 py-4 align-middle">
                       <div className="flex items-center gap-2.5">
                         <div className="w-7 h-7 rounded-full bg-gradient-to-br from-teal-400 to-emerald-500 flex items-center justify-center shrink-0">
                           <span className="text-[10px] font-bold text-white">{camp.initials}</span>
@@ -329,13 +451,13 @@ const CampaignDashboard = () => {
                         <span className="text-sm font-semibold text-slate-700">{camp.createdBy}</span>
                       </div>
                     </td>
-                    <td className="px-6 py-4">
+                    <td className="px-5 py-4 align-middle">
                       <div className="flex justify-end items-center gap-1">
                         <ActionBtn
                           icon={<ChartBarIcon className="w-4 h-4" />}
                           hoverColor="hover:text-emerald-500 hover:bg-emerald-50"
                           title="Analytics"
-                          onClick={() => setAnalyticsTarget(camp)}
+                          onClick={() => setAnalyticsId(camp.id)}
                         />
                         <ActionBtn
                           icon={<DocumentDuplicateIcon className="w-4 h-4" />}
@@ -369,10 +491,11 @@ const CampaignDashboard = () => {
       </div>
 
       {/* ── Analytics Modal ── */}
-      {analyticsTarget && (
+      
+      {analyticsId && (
         <AnalyticsModal
-          campaign={analyticsTarget}
-          onClose={() => setAnalyticsTarget(null)}
+          campaign={campaigns.find(c => c.id === analyticsId)}
+          onClose={() => setAnalyticsId(null)}
         />
       )}
 
@@ -436,7 +559,7 @@ const AnalyticsModal = ({ campaign, onClose }) => {
             <ClockIcon className="w-3.5 h-3.5 text-slate-400" /> {campaign.sentOn}
           </span>
           <span className="flex items-center gap-1.5 truncate max-w-[160px]">
-            <DocumentDuplicateIcon className="w-3.5 h-3.5 text-slate-400 shrink-0" /> {campaign.message}
+            <DocumentDuplicateIcon className="w-3.5 h-3.5 text-slate-400 shrink-0" /> {campaign.templateName}
           </span>
           <StatusBadge status={campaign.status} progress={campaign.progress} />
         </div>

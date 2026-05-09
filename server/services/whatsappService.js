@@ -632,61 +632,57 @@ class WhatsAppService {
       const value = changes?.value;
 
       if (!value) {
-
         return { success: false, error: 'Invalid webhook data' };
       }
 
-      // Log webhook metadata
-
+      const results = [];
 
       // Handle incoming messages
-      if (value.messages) {
-        const message = value.messages[0];
-        const contact = value.contacts?.[0];
-
-
-
-        return {
-          success: true,
-          type: 'message',
-          data: {
-            messageId: message.id,
-            from: message.from,
-            timestamp: message.timestamp,
-            messageType: message.type,
-            contact: {
-              name: contact?.profile?.name || 'Unknown',
-              phone: message.from
-            },
-            message: this.extractMessageContent(message)
-          }
-        };
+      if (Array.isArray(value.messages)) {
+        value.messages.forEach(message => {
+          const contact = value.contacts?.find(c => c.wa_id === message.from);
+          results.push({
+            success: true,
+            type: 'message',
+            data: {
+              messageId: message.id,
+              from: message.from,
+              timestamp: message.timestamp,
+              messageType: message.type,
+              contact: {
+                name: contact?.profile?.name || 'Unknown',
+                phone: message.from
+              },
+              message: this.extractMessageContent(message)
+            }
+          });
+        });
       }
 
       // Handle message status updates (delivered, read, etc.)
-      if (value.statuses) {
-        const status = value.statuses[0];
-        
-
-        
-        return {
-          success: true,
-          type: 'status',
-          data: {
-            messageId: status.id,
-            status: status.status,
-            timestamp: status.timestamp,
-            recipientId: status.recipient_id,
-            errors: status.errors
-          }
-        };
+      if (Array.isArray(value.statuses)) {
+        value.statuses.forEach(status => {
+          results.push({
+            success: true,
+            type: 'status',
+            data: {
+              messageId: status.id,
+              status: status.status,
+              timestamp: status.timestamp,
+              recipientId: status.recipient_id,
+              errors: status.errors
+            }
+          });
+        });
       }
 
+      if (results.length > 0) {
+        return { success: true, results };
+      }
 
       return { success: false, error: 'Unknown webhook type' };
     } catch (error) {
       console.error('❌ Webhook Processing Error:', error.message);
-      console.error('Stack:', error.stack);
       return {
         success: false,
         error: error.message
@@ -880,6 +876,18 @@ class WhatsAppService {
         };
       }
 
+      if (bodyComponent.text.length > 1024) {
+        return {
+          success: false,
+          error: {
+            message: "The Body (or Content) field can't have more than 1,024 characters.",
+            code: 100,
+            errorSubcode: 2388040,
+            title: 'Character limit exceeded'
+          }
+        };
+      }
+
       const placeholderMatches = Array.from(bodyComponent.text.matchAll(/\{\{\s*([^}]+?)\s*\}\}/g));
       const placeholderRawValues = placeholderMatches.map((match) => (match[1] || '').trim());
       const hasInvalidPlaceholderFormat = placeholderRawValues.some((value) => !/^\d+$/.test(value));
@@ -1005,24 +1013,28 @@ class WhatsAppService {
         const isTemplateLanguageAlreadyExists = errorSubcode === 2388024;
 
         if (isTemplateLanguageAlreadyExists) {
-          const suggestedName = generateSuggestedTemplateName(name);
-          console.warn(`⚠️ Template language already exists for "${name}". Retrying with "${suggestedName}"`);
-          try {
-            response = await makeTemplateRequest(suggestedName);
-            return {
-              success: true,
-              data: response.data,
-              templateName: suggestedName,
-              usedFallbackName: true,
+          return {
+            success: false,
+            error: {
+              message: `A template with the name "${name}" already exists. Please use a different name or edit the existing template.`,
+              code: error.response?.data?.error?.code,
+              errorSubcode: isTemplateLanguageAlreadyExists,
+              title: 'Template Already Exists',
               originalTemplateName: name
-            };
-          } catch (renameRetryError) {
-            console.error('❌ Retry with suggested name failed:', renameRetryError.response?.data || renameRetryError.message);
-            throw renameRetryError;
-          }
+            }
+          };
         }
 
         if (!isTemplateLanguageBeingDeleted && !isCategoryChangeBlockedByDeletion && hasMediaHeader) {
+          // Only drop the HEADER for WhatsApp API validation errors (4xx responses).
+          // Network-level errors (ENOTFOUND, ECONNREFUSED, timeout) must propagate immediately
+          // so the client sees the real problem instead of a misleading INVALID_FORMAT rejection.
+          const isWhatsAppApiError = !!error.response; // has HTTP response → WhatsApp returned an error
+          if (!isWhatsAppApiError) {
+            console.error('❌ Network error reaching Facebook Graph API. Not retrying without HEADER.');
+            throw error;
+          }
+
           const componentsWithoutHeader = preparedComponents.filter(
             (component) => String(component?.type || '').toUpperCase() !== 'HEADER'
           );

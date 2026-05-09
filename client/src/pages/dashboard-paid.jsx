@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useState, useContext, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import dayjs from "dayjs";
+import { getDaysRemaining, getSubscriptionProgress } from "../utils/subscription";
 
 import {
    ArrowPathIcon,
@@ -15,22 +16,51 @@ import {
    LightBulbIcon,
 } from "@heroicons/react/24/outline";
 import { CheckCircleIcon } from "@heroicons/react/24/solid";
+import { userContext } from "../context/Context";
 
 function Dashboard() {
    const navigate = useNavigate();
    const [isSyncing, setIsSyncing] = useState(false);
+   const { user } = useContext(userContext);
+
+   const formatAmount = (val) => {
+      if (val === null || val === undefined || val === "") return "0.00";
+      const num = Number(val);
+      if (Number.isNaN(num)) return "0.00";
+      return num.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+   };
+   const isFreePlan = !user?.subscriptionPlan || user.subscriptionPlan.toLowerCase() === "free";
+   
+   // Dynamic calculation for days remaining
+   let daysRemaining = 0;
+   let nextBillingCycleStr = "N/A";
+   if (user?.subscriptionEndDate) {
+      const endDate = new Date(user.subscriptionEndDate);
+      daysRemaining = getDaysRemaining(endDate);
+      nextBillingCycleStr = endDate.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+   }
+
+   // Message Limit Tier Logic
+   const getMessageTier = () => {
+      if (user?.messageLimitTier) return user.messageLimitTier;
+      const plan = user?.subscriptionPlan?.toLowerCase() || "free";
+      if (plan === "free") return "1,000";
+      if (plan === "basic") return "10,000";
+      if (plan === "professional") return "50,000";
+      return "100,000";
+   };
 
    // --- DATE STATE ---
    const [selectedDate, setSelectedDate] = useState(dayjs());
    const [dateString, setDateString] = useState(dayjs().format("YYYY-MM-DD"));
 
    const [performanceData, setPerformanceData] = useState({
-      chats: 217,
-      unread: 31,
-      open: 71,
+      chats: 0,
+      unread: 0,
+      open: 0,
       failed: 0,
-      free: 13,
-      agents: 4
+      free: 0,
+      agents: user?.agents?.length || 1
    });
 
    const handleDateChange = (date) => {
@@ -45,16 +75,32 @@ function Dashboard() {
             open: Math.floor(Math.random() * 100),
             failed: Math.floor(Math.random() * 5),
             free: Math.floor(Math.random() * 20),
-            agents: 4
+            agents: user?.agents?.length || 1
          });
          setIsSyncing(false);
       }, 800);
    };
 
-   const handleSyncData = () => {
+   const handleSyncData = useCallback(() => {
       setIsSyncing(true);
-      setTimeout(() => { setIsSyncing(false); }, 2000);
-   };
+      // In a real app, this would fetch from an API
+      setTimeout(() => { 
+         setPerformanceData({
+            chats: 217,
+            unread: 31,
+            open: 71,
+            failed: 0,
+            free: 13,
+            agents: user?.agents?.length || 1
+         });
+         setIsSyncing(false); 
+      }, 1500);
+   }, [user?.agents?.length]);
+
+   // Simulate loading real performance data
+   useEffect(() => {
+      handleSyncData();
+   }, [handleSyncData]);
 
    return (
       <div className="p-4 md:p-6 lg:p-8 max-w-[1400px] mx-auto flex flex-col gap-6 h-full font-['Urbanist']">
@@ -71,10 +117,10 @@ function Dashboard() {
                   </div>
                   <div>
                      <h2 className="text-xl font-bold text-slate-900 flex flex-wrap items-center gap-2">
-                        Admission Anytime
+                        {user?.businessName || "Admission Anytime"}
                         <span className="text-[10px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded uppercase font-bold tracking-wider border border-slate-200 whitespace-nowrap">Official API</span>
                      </h2>
-                     <p className="text-sm text-slate-500 font-medium">+91 1202611111</p>
+                     <p className="text-sm text-slate-500 font-medium">{user?.phoneNumber || "+91 1202611111"}</p>
                   </div>
                </div>
 
@@ -94,18 +140,18 @@ function Dashboard() {
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 pt-6 border-t border-gray-100">
                <div>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Message Limit Tier</p>
-                  <p className="text-xl font-bold text-slate-800">10,000 <span className="text-sm font-medium text-slate-400">/ day</span></p>
+                  <p className="text-xl font-bold text-slate-800">{getMessageTier()} <span className="text-sm font-medium text-slate-400">/ day</span></p>
                </div>
                <div>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Quality Score</p>
                   <p className="text-xl font-bold text-emerald-500 flex items-center gap-2">
-                     High <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+                     {user?.qualityScore || "High"} <span className={`w-2.5 h-2.5 rounded-full ${user?.qualityScore === 'Medium' ? 'bg-amber-500' : user?.qualityScore === 'Low' ? 'bg-red-500' : 'bg-emerald-500'}`}></span>
                   </p>
                </div>
                <div>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Connection Status</p>
                   <p className="text-xl font-bold text-slate-800 flex items-center gap-2">
-                     Connected <CheckCircleIcon className="w-5 h-5 text-emerald-500" />
+                     {user?.whatsappConnected !== false ? "Connected" : "Disconnected"} {user?.whatsappConnected !== false ? <CheckCircleIcon className="w-5 h-5 text-emerald-500" /> : <span className="w-2.5 h-2.5 rounded-full bg-red-500" />}
                   </p>
                </div>
             </div>
@@ -120,13 +166,13 @@ function Dashboard() {
                <div>
                   <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Available Balance</p>
                   <div className="flex flex-wrap items-baseline gap-2 mb-1">
-                     <h3 className="text-3xl font-black text-slate-900">₹618.51</h3>
+                     <h3 className="text-3xl font-black text-slate-900">₹{formatAmount(user?.credits)}</h3>
                      <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full flex items-center gap-1 whitespace-nowrap"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> Auto-recharge on</span>
                   </div>
                   <p className="text-xs text-slate-400 mt-1">Estimated 14 days of usage remaining based on current volume.</p>
                </div>
                <div className="flex flex-col sm:flex-row gap-3 mt-8">
-                  <button onClick={() => navigate('/admin/plan/billing')} className="w-full sm:flex-1 py-2.5 bg-[#1e293b] text-white text-sm font-bold rounded-lg hover:bg-slate-800 transition-colors shadow-sm text-center">Add Credit</button>
+                  <button onClick={() => navigate('/admin/plan/addons')} className="w-full sm:flex-1 py-2.5 bg-[#1e293b] text-white text-sm font-bold rounded-lg hover:bg-slate-800 transition-colors shadow-sm text-center">Add Credit</button>
                   <button onClick={() => navigate('/admin/plan/statement')} className="w-full sm:w-auto px-5 py-2.5 bg-white text-slate-700 border border-slate-200 text-sm font-bold rounded-lg hover:bg-slate-50 transition-colors text-center">Statement</button>
                </div>
             </div>
@@ -135,14 +181,33 @@ function Dashboard() {
             <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 flex flex-col justify-between h-full">
                <div className="flex flex-wrap justify-between items-start mb-4 gap-2">
                   <p className="text-xs font-bold text-slate-500 uppercase tracking-wider pt-1">Active Subscription</p>
-                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-1 rounded border border-slate-200 whitespace-nowrap">ENTERPRISE PLAN</span>
+                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-1 rounded border border-slate-200 whitespace-nowrap">{(user?.subscriptionPlan || "FREE").toUpperCase()} PLAN</span>
                </div>
                <div className="mb-6">
-                  <h3 className="text-3xl font-black text-slate-900 mb-1">76 Days <span className="text-lg font-medium text-slate-400">remaining</span></h3>
-                  <p className="text-xs text-slate-400 mb-4">Next billing cycle starts April 28, 2026.</p>
-                  <div className="h-1.5 w-full bg-slate-100 rounded-full mb-1 overflow-hidden">
-                     <div className="h-full bg-slate-800 w-[60%] rounded-full"></div>
-                  </div>
+                  {isFreePlan ? (
+                     <>
+                        <h3 className="text-3xl font-black text-slate-900 mb-1">Unlimited <span className="text-lg font-medium text-slate-400">days</span></h3>
+                        <p className="text-xs text-slate-400 mb-4">Free plan is active with basic restrictions.</p>
+                        <div className="h-1.5 w-full bg-slate-100 rounded-full mb-1 overflow-hidden">
+                           <div className="h-full bg-emerald-500 w-full rounded-full"></div>
+                        </div>
+                     </>
+                  ) : (
+                     <>
+                        <h3 className="text-3xl font-black text-slate-900 mb-1">{daysRemaining} Days <span className="text-lg font-medium text-slate-400">remaining</span></h3>
+                        <p className="text-xs text-slate-400 mb-4">Next billing cycle starts {nextBillingCycleStr}.</p>
+                        <div className="h-1.5 w-full bg-slate-100 rounded-full mb-1 overflow-hidden">
+                           <div
+                              className="h-full bg-slate-800 rounded-full transition-all duration-500"
+                              style={{ width: `${getSubscriptionProgress(daysRemaining)}%` }}
+                              aria-valuemin="0"
+                              aria-valuemax="100"
+                              aria-valuenow={Math.round(getSubscriptionProgress(daysRemaining))}
+                              role="progressbar"
+                           ></div>
+                        </div>
+                     </>
+                  )}
                </div>
                <button onClick={() => navigate('/admin/plan/overview')} className="w-full py-2.5 bg-white text-slate-700 border border-slate-200 text-sm font-bold rounded-lg hover:bg-slate-50 transition-colors">Manage Subscription</button>
             </div>
@@ -255,7 +320,7 @@ function Dashboard() {
 
          {/* 5. FOOTER */}
          <div className="mt-auto pt-10 pb-4 flex flex-col-reverse md:flex-row justify-between items-center text-xs text-slate-400 font-medium border-t border-slate-100 gap-4">
-            <p>&copy; 2024 whatsapp API Platform. All rights reserved @ MessBee.</p>
+            <p>&copy; 2026 whatsapp API Platform. All rights reserved @ MessBee.</p>
             <div className="flex gap-6">
                <a href="#" className="hover:text-slate-600 transition-colors">Privacy Policy</a>
                <a href="#" className="hover:text-slate-600 transition-colors">Terms of Service</a>

@@ -11,12 +11,23 @@ import {
 } from "@heroicons/react/24/outline";
 import { getPresenceInfo } from "../../utils/presence";
 
+const formatPhone = (phone) => {
+  if (!phone || phone === "**********") return "No Contact";
+  const digits = phone.replace(/\D/g, "");
+  if (!digits || digits === "91") return "No Contact";
+  
+  if (digits.length === 10) return `+91 ${digits}`;
+  if (digits.length === 12 && digits.startsWith("91")) return `+91 ${digits.slice(2)}`;
+  
+  return phone;
+};
+
 const UserProfilePanel = ({ data, onClose, onViewHistory, availableLabels = [], statusOptions = [], onUpdateProfile, onUpdateLabels }) => {
   
   // --- 1. STATE FOR PROFILE DATA ---
   const [profileData, setProfileData] = useState({
     name: data?.name || "",
-    phone: data?.phone || "",
+    phone: data?.phone ? data.phone.replace(/\D/g, '').slice(-10) : "",
     email: data?.email || "",
     status: data?.chatStatus || "Open",
     institute: data?.customFields?.institute || "",
@@ -29,7 +40,7 @@ const UserProfilePanel = ({ data, onClose, onViewHistory, availableLabels = [], 
     setProfileData(prev => ({
       ...prev,
       name: data?.name || "",
-      phone: data?.phone || "",
+      phone: data?.phone ? data.phone.replace(/\D/g, '').slice(-10) : "",
       email: data?.email || "",
       status: data?.chatStatus || "Open",
       institute: data?.customFields?.institute || "",
@@ -181,8 +192,10 @@ const UserProfilePanel = ({ data, onClose, onViewHistory, availableLabels = [], 
               <span className={`absolute -bottom-1 -right-1 w-5 h-5 border-[3px] border-white rounded-full ${presenceInfo.isOnline ? 'bg-[#22C55E]' : 'bg-slate-300'}`}></span>
           </div>
           
-          <h2 className="text-lg font-extrabold text-slate-900 text-center">{profileData.name}</h2>
-          <p className="text-xs text-slate-500 font-medium mb-1">{profileData.phone}</p>
+          <div className="flex items-center justify-center gap-2 mb-1">
+            <h2 className="text-lg font-extrabold text-slate-900 text-center">{profileData.name}</h2>
+          </div>
+          <p className="text-xs text-slate-500 font-medium mb-1">{formatPhone(profileData.phone || data?.whatsappId)}</p>
           <p className="text-[11px] text-slate-500 font-medium mb-2">{presenceInfo.label}</p>
           {profileData.email && (
             <div className="flex items-center gap-1.5 text-xs text-slate-500 font-medium mb-4">
@@ -319,11 +332,15 @@ const UserProfilePanel = ({ data, onClose, onViewHistory, availableLabels = [], 
 
       {/* FIXED FOOTER BUTTONS */}
       <div className="shrink-0 w-full bg-white border-t border-slate-100 p-6 flex flex-col gap-3 z-10">
-         <button 
-            onClick={() => { setEditForm(profileData); setIsEditModalOpen(true); }}
-            className="w-full py-3.5 bg-white border border-slate-200 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-50 hover:border-slate-300 transition-colors shadow-sm"
+          <button 
+             onClick={() => { 
+               const displayPhone = profileData.phone ? profileData.phone.replace(/\D/g, '').slice(-10) : "";
+               setEditForm({ ...profileData, phone: displayPhone }); 
+               setIsEditModalOpen(true); 
+             }}
+             className="w-full py-3.5 bg-white border border-slate-200 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-50 hover:border-slate-300 transition-colors shadow-sm"
          >
-            Edit Profile
+             Edit Profile
          </button>
          <button onClick={onViewHistory} className="w-full py-3.5 bg-[#0f172a] text-white text-xs font-bold rounded-xl hover:bg-black transition-colors shadow-md">
             View Full History
@@ -355,7 +372,18 @@ const UserProfilePanel = ({ data, onClose, onViewHistory, availableLabels = [], 
                     </div>
                     <div>
                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block">WhatsApp Number</label>
-                       <input type="text" name="phone" value={editForm.phone} onChange={handleEditChange} className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-800 focus:border-[#22C55E] outline-none transition-shadow"/>
+                       <input 
+                         type="text" 
+                         name="phone" 
+                         value={editForm.phone} 
+                         onChange={(e) => {
+                           const val = e.target.value.replace(/\D/g, '').slice(0, 10);
+                           setEditForm({ ...editForm, phone: val });
+                         }} 
+                         placeholder="**********"
+                         maxLength={10}
+                         className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-800 focus:border-[#22C55E] outline-none transition-shadow"
+                       />
                     </div>
                  </div>
 
@@ -389,7 +417,7 @@ const UserProfilePanel = ({ data, onClose, onViewHistory, availableLabels = [], 
                               borderColor: label.color + '30'
                            }}>{label.name} <XMarkIcon className="w-3 h-3 cursor-pointer opacity-70 hover:opacity-100" onClick={(e) => { e.stopPropagation(); handleToggleLabel(label.name); }}/></span>
                         ))}
-                        {currentLabels.length === 0 && <p className="text-xs text-slate-400 px-2 italic">Select labels...</p>}
+                        {currentLabels.length === 0 && <p className="text-xs text-slate-400 px-2 italic">Add labels...</p>}
                         {currentLabels.length > 0 && <span className="w-6 h-6 flex items-center justify-center bg-slate-50 text-slate-400 rounded-full hover:bg-slate-100"><PlusIcon className="w-3.5 h-3.5"/></span>}
                     </div>
 

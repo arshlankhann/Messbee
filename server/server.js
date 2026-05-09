@@ -47,7 +47,7 @@ const corsOptions = {
     ].filter(Boolean);
 
     // Allow any subdomain or explicitly allowed origins
-    if (allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+    if (allowedOrigins.includes(origin) || origin.startsWith('http://localhost:') || origin.endsWith('.vercel.app')) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
@@ -79,7 +79,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// ✅ Fix: Static folder setup using path.join
+// Static file serving — always mount the local uploads folder so dev works out of the box.
+// In production, the web server (nginx/apache) serves files from UPLOAD_PATH via DOCUMENT_GET_URL.
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ================== SWAGGER DOCS ==================
@@ -129,6 +130,9 @@ app.use('/api/labels', require('./routes/labelRoutes'));
 app.use('/api/statuses', require('./routes/statusRoutes'));
 app.use('/api/media', require('./routes/mediaRoutes'));
 app.use('/api/settings', require('./routes/settingsRoutes'));
+app.use('/api/commerce', require('./routes/commerceRoutes'));
+app.use('/api/dev', require('./routes/devApiRoutes'));
+app.use('/api/billing', require('./routes/billingRoutes'));
 
 // ================== HEALTH CHECK ==================
 

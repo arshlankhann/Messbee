@@ -1,6 +1,8 @@
 const Contact  = require('../models/Contact');
 const mongoose = require('mongoose');
 const fs       = require('fs');
+const { normalizePhoneNumber } = require('../utils/phoneHelper');
+
 
 /* ── Built-in CSV parser — no external dependency needed ── */
 const parseCSV = (text) => {
@@ -55,20 +57,18 @@ const toClientContact = (doc) => ({
   city:         doc.city,
   country:      doc.country,
   status:       doc.status,
-  labels:       doc.labels,
+  labels:       doc.labels || [],
   initials:     doc.initials,
   color:        doc.color,
+  customFields: doc.customFields || [],
+  isVerified:   !!doc.isVerified,
   importedFrom: doc.importedFrom,
   createdAt:    doc.createdAt,
   updatedAt:    doc.updatedAt,
 });
 
-const normalizePhone = (rawPhone) => {
-  const cleaned = (rawPhone || '').toString().trim().replace(/[\s\-().]/g, '');
-  if (!cleaned) return null;
-  if (cleaned.startsWith('00')) return '+' + cleaned.slice(2);
-  return cleaned;
-};
+const normalizePhone = (rawPhone) => normalizePhoneNumber(rawPhone);
+
 
 const getSubscriberDigits = (phone) => {
   const digits = (phone || '').replace(/\D/g, '');
@@ -110,7 +110,14 @@ exports.getContacts = async (req, res, next) => {
 
     if (req.query.labels) {
       const labelArr = req.query.labels.split(',').map(l => l.trim()).filter(Boolean);
-      if (labelArr.length) filter.labels = { $in: labelArr };
+      if (labelArr.length) {
+        filter.labels = { $in: labelArr };
+        if (!labelArr.includes('_HIDDEN_CAMPAIGN_')) {
+          filter.labels.$nin = ['_HIDDEN_CAMPAIGN_'];
+        }
+      }
+    } else {
+      filter.labels = { $nin: ['_HIDDEN_CAMPAIGN_'] };
     }
 
     if (req.query.search) {
@@ -231,31 +238,34 @@ exports.updateContact = async (req, res, next) => {
     if (!isValidObjectId(req.params.id))
       return sendError(res, 400, 'Invalid contact ID format');
 
-    const allowed = ['name','whatsapp','phone','email','company','institute','address','city','country','status','labels','initials','color'];
-    const updates = {};
-    allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+    const existingContact = await Contact.findOne({ _id: req.params.id, user: req.user.id });
+    if (!existingContact) return sendError(res, 404, 'Contact not found');
 
-    if (Object.keys(updates).length === 0)
-      return sendError(res, 400, 'No valid fields provided for update');
-
-    if (updates.whatsapp !== undefined) {
-      const normalized = normalizePhone(updates.whatsapp);
-      if (!normalized) return sendError(res, 400, 'Invalid WhatsApp number');
-      if (normalized.replace(/\D/g, '').length < 10)
-        return sendError(res, 400, 'WhatsApp number must have at least 10 digits');
-      updates.whatsapp = normalized;
+    // If verified, block core identity updates
+    if (existingContact.isVerified) {
+      const coreFields = ['name', 'whatsapp', 'phone', 'email'];
+      const isEditingCore = coreFields.some(f => req.body[f] !== undefined && req.body[f] !== existingContact[f]);
+      if (isEditingCore) {
+        return sendError(res, 403, 'This contact is verified and locked. Core details cannot be changed.');
+      }
     }
 
-    if (updates.name && !updates.initials)
-      updates.initials = updates.name.trim().substring(0, 2).toUpperCase();
+    const allowed = ['name','whatsapp','phone','email','company','institute','address','city','country','status','labels','initials','color', 'isVerified', 'customFields'];
+    allowed.forEach(k => {
+      if (req.body[k] !== undefined) existingContact[k] = req.body[k];
+    });
 
-    const contact = await Contact.findOneAndUpdate(
-      { _id: req.params.id, user: req.user.id },
-      updates,
-      { new: true, runValidators: true }
-    );
-    if (!contact) return sendError(res, 404, 'Contact not found');
+    if (req.body.whatsapp !== undefined) {
+      const normalized = normalizePhone(req.body.whatsapp);
+      if (!normalized) return sendError(res, 400, 'Invalid WhatsApp number');
+      existingContact.whatsapp = normalized;
+    }
 
+    if (req.body.name && !req.body.initials && !existingContact.isVerified) {
+      existingContact.initials = req.body.name.trim().substring(0, 2).toUpperCase();
+    }
+
+    const contact = await existingContact.save();
     return res.json({ success: true, data: toClientContact(contact) });
   } catch (err) {
     if (err.name === 'ValidationError') {
@@ -298,6 +308,59 @@ exports.bulkDelete = async (req, res, next) => {
 
     const result = await Contact.deleteMany({ _id: { $in: ids }, user: req.user.id });
     return res.json({ success: true, deleted: result.deletedCount });
+  } catch (err) { next(err); }
+};
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   PUT /api/contacts/bulk-status
+───────────────────────────────────────────────────────────────────────────── */
+exports.bulkUpdateStatus = async (req, res, next) => {
+  try {
+    const { ids, status } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0)
+      return sendError(res, 400, 'ids must be a non-empty array');
+    if (!status) return sendError(res, 400, 'status is required');
+
+    const result = await Contact.updateMany(
+      { _id: { $in: ids }, user: req.user.id },
+      { $set: { status } }
+    );
+    return res.json({ success: true, updated: result.modifiedCount });
+  } catch (err) { next(err); }
+};
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   PUT /api/contacts/bulk-labels
+───────────────────────────────────────────────────────────────────────────── */
+exports.bulkAddLabels = async (req, res, next) => {
+  try {
+    const { ids, labels } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0)
+      return sendError(res, 400, 'ids must be a non-empty array');
+    if (!Array.isArray(labels) || labels.length === 0)
+      return sendError(res, 400, 'labels must be a non-empty array');
+
+    const result = await Contact.updateMany(
+      { _id: { $in: ids }, user: req.user.id },
+      { $addToSet: { labels: { $each: labels } } }
+    );
+    return res.json({ success: true, updated: result.modifiedCount });
+  } catch (err) { next(err); }
+};
+
+exports.bulkRemoveLabels = async (req, res, next) => {
+  try {
+    const { ids, labels } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0)
+      return sendError(res, 400, 'ids must be a non-empty array');
+    if (!Array.isArray(labels) || labels.length === 0)
+      return sendError(res, 400, 'labels must be a non-empty array');
+
+    const result = await Contact.updateMany(
+      { _id: { $in: ids }, user: req.user.id },
+      { $pull: { labels: { $in: labels } } }
+    );
+    return res.json({ success: true, updated: result.modifiedCount });
   } catch (err) { next(err); }
 };
 
@@ -444,6 +507,12 @@ exports.importContacts = async (req, res, next) => {
       const labels = rawLabels
         ? rawLabels.split(',').map(l => l.trim()).filter(Boolean)
         : [];
+
+      if (req.body.saveToCrm === 'false') {
+        if (!labels.includes('_HIDDEN_CAMPAIGN_')) {
+          labels.push('_HIDDEN_CAMPAIGN_');
+        }
+      }
 
       // ── Validation ─────────────────────────────────────────────────────────────
       if (!name) {
