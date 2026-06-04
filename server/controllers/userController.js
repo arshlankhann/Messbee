@@ -1,5 +1,9 @@
 const User = require('../models/User');
+const CustomField = require('../models/CustomField');
+const QuickReply = require('../models/QuickReply');
+const { PLAN_LIMITS } = require('../utils/planLimits');
 const crypto = require('crypto');
+const emailService = require('../services/emailService');
 
 // @desc    Get user profile
 // @route   GET /api/users/profile
@@ -11,6 +15,41 @@ exports.getProfile = async (req, res, next) => {
     res.status(200).json({
       success: true,
       data: user
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get account limits and usage
+// @route   GET /api/users/account-limits
+// @access  Private
+exports.getAccountLimits = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const userPlan = (user.subscriptionPlan || 'free').toLowerCase();
+    const limits = PLAN_LIMITS[userPlan] || PLAN_LIMITS.free;
+
+    const customFieldsCount = await CustomField.countDocuments({ userId: req.user.id });
+    const quickRepliesCount = await QuickReply.countDocuments({ user: req.user.id });
+    
+    // Assuming single-tenant or global users for now based on existing getUsers logic
+    const teamMembersCount = await User.countDocuments(); 
+
+    res.status(200).json({
+      success: true,
+      data: {
+        whatsappApiNumber: { 
+          used: user.whatsappConnected !== false ? 1 : 0, 
+          limit: limits.features?.multipleWhatsAppNumbers ? 5 : 1 // arbitrary limit for multiple
+        },
+        customFields: { used: customFieldsCount, limit: limits.customFields },
+        quickReplies: { used: quickRepliesCount, limit: limits.quickReplies },
+        teamMembers: { used: teamMembersCount, limit: limits.agents },
+        storage: { used: 45, limit: 100, isPercent: true } // mock percent for now
+      }
     });
   } catch (error) {
     next(error);
@@ -59,13 +98,25 @@ exports.createUser = async (req, res, next) => {
       role: finalRole,
       password,
       isActive: true,
-      isEmailVerified: false
+      isEmailVerified: true // verify immediately so they can just login
     });
+
+    // Send invitation email
+    try {
+      await emailService.sendTeamInviteEmail({
+        email: user.email,
+        name: user.name,
+        password: password,
+        role: finalRole
+      });
+    } catch (emailErr) {
+      console.error('Failed to send invite email:', emailErr);
+    }
 
     res.status(201).json({
       success: true,
       data: user,
-      message: 'User created successfully'
+      message: 'User created successfully and invitation sent'
     });
   } catch (error) {
     next(error);
@@ -115,14 +166,23 @@ exports.updateUser = async (req, res, next) => {
 // @access  Private (Admin only ideally)
 exports.deleteUser = async (req, res, next) => {
   try {
-    const user = await User.findByIdAndDelete(req.params.id);
-    
+    // Prevent self-deletion
+    if (req.user && req.user.id === req.params.id) {
+      return res.status(400).json({ success: false, message: 'You cannot delete your own account' });
+    }
+
+    const user = await User.findById(req.params.id);
+
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    // Hard delete — removes the document entirely from MongoDB
+    await user.deleteOne();
+
     res.status(200).json({
       success: true,
+      message: 'User deleted successfully',
       data: {}
     });
   } catch (error) {
