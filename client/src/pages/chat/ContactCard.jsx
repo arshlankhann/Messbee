@@ -629,11 +629,36 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
           chatStatus === "blocked" ||
           String(c.contactStatus || "").toLowerCase() === "blocked");
 
+      // ── "Active" tab: WhatsApp chats must have a live 24h session window.
+      // Non-WhatsApp chats are included as long as their status is open/active.
+      const isWhatsApp = String(c.source || "").toLowerCase() === "whatsapp";
+      const hasLiveWhatsAppSession = (() => {
+        if (!isWhatsApp) return false;
+        const WINDOW_MS = 24 * 60 * 60 * 1000;
+        const now = Date.now();
+
+        // 1. Prefer explicit lastInboundAt from the server
+        if (c.lastInboundAt) {
+          const ts = new Date(c.lastInboundAt).getTime();
+          if (!Number.isNaN(ts) && now - ts < WINDOW_MS) return true;
+        }
+
+        // 2. Server-provided boolean flag
+        if (c.canSendFreeText === true) return true;
+        if (c.canSendFreeText === false) return false;
+
+        return false;
+      })();
+
       const matchesTab =
         normalizedActiveTab === "all chats" ||
         normalizedActiveTab === "all" ||
         (normalizedActiveTab === "unread" && unreadCount > 0) ||
-        (normalizedActiveTab === "active" && ["open", "opened", "active"].includes(chatStatus)) ||
+        (normalizedActiveTab === "active" && (
+          isWhatsApp
+            ? hasLiveWhatsAppSession               // WhatsApp: must have live session
+            : ["open", "opened", "active"].includes(chatStatus) // other channels: status-based
+        )) ||
         (normalizedActiveTab === "resolved" && ["resolved", "closed"].includes(chatStatus)) ||
         (normalizedActiveTab === "mine" && !!c.isMine);
 
@@ -1124,9 +1149,12 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
     });
 
     if (duplicate) {
-      setCreateError(
-        `This number already exists as "${duplicate.name || duplicate.phone || fullPhone}". Open the existing chat instead.`
-      );
+      // Navigate directly to the existing chat and close the modal
+      onChatSelect(duplicate._id || duplicate.id);
+      setIsNewChatModalOpen(false);
+      setNewChatName("");
+      setNewChatPhone("");
+      setCreateError("");
       return;
     }
     // ─────────────────────────────────────────────────────────────────────────
@@ -1145,10 +1173,32 @@ const ContactCard = ({ chats, activeChatId, onChatSelect, activeTab, setActiveTa
       setNewChatPhone("");
       setCreateError("");
     } else {
-      // Normalise server-side duplicate messages to a friendly string
+      // Check if the server is reporting a duplicate — if so, navigate to that chat
       const errMsg = result.error || "Failed to create chat. Please try again.";
       const isDuplicateErr =
         /already exists/i.test(errMsg) || /duplicate/i.test(errMsg);
+
+      if (isDuplicateErr) {
+        // Try to find the existing chat by phone
+        const serverDuplicate = normalizedChats.find((c) => {
+          const chatPhone = String(c.phone || c.phoneNumber || "").replace(/\D/g, "");
+          return (
+            chatPhone === fullPhone ||
+            chatPhone === newChatPhone ||
+            chatPhone.endsWith(newChatPhone)
+          );
+        });
+        if (serverDuplicate) {
+          onChatSelect(serverDuplicate._id || serverDuplicate.id);
+          setIsNewChatModalOpen(false);
+          setNewChatName("");
+          setNewChatPhone("");
+          setCreateError("");
+          setIsCreating(false);
+          return;
+        }
+      }
+
       setCreateError(
         isDuplicateErr
           ? `A chat with this number already exists. Please check your chat list.`
