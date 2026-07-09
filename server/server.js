@@ -16,6 +16,10 @@ dotenv.config();
 // Connect to database
 connectDB();
 
+// Initialize automation delay queue worker
+const { startDelayQueueWorker } = require('./queues/delayQueue');
+startDelayQueueWorker();
+
 const app = express();
 
 // Only create HTTP server and Socket.IO in non-serverless environment
@@ -42,7 +46,6 @@ const corsOptions = {
     if (!origin) return callback(null, true);
 
     const allowedOrigins = [
-      'http://localhost:5173',
       process.env.CLIENT_URL ? process.env.CLIENT_URL.trim() : null
     ].filter(Boolean);
 
@@ -130,6 +133,7 @@ app.use('/api/labels', require('./routes/labelRoutes'));
 app.use('/api/statuses', require('./routes/statusRoutes'));
 app.use('/api/media', require('./routes/mediaRoutes'));
 app.use('/api/settings', require('./routes/settingsRoutes'));
+app.use('/api/tenant-settings', require('./routes/tenantSettingsRoutes'));
 app.use('/api/commerce', require('./routes/commerceRoutes'));
 app.use('/api/dev', require('./routes/devApiRoutes'));
 app.use('/api/billing', require('./routes/billingRoutes'));
