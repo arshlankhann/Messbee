@@ -10,6 +10,7 @@ const { hasActiveCustomerWindow } = require('../utils/conversationWindow');
 const Template = require('../models/Template');
 const { logAPICall, getRecentLogs } = require('../utils/apiLogger');
 const { createAndEmitNotification } = require('../services/notificationService');
+const automationService = require('../services/automationService');
 
 /**
  * WhatsApp Webhook Controller
@@ -42,6 +43,95 @@ exports.testConnection = async (req, res, next) => {
       success: false,
       message: 'WhatsApp API configuration error',
       error: error.message
+    });
+  }
+};
+
+// @desc    Connect via OAuth Token
+// @route   POST /api/whatsapp/connect-oauth
+// @access  Private
+exports.connectOAuthToken = async (req, res, next) => {
+  try {
+    const { code } = req.body;
+    if (!code) {
+      return res.status(400).json({ success: false, message: 'OAuth code is required' });
+    }
+
+    const axios = require('axios');
+    
+    // 1. Exchange code for access token
+    const tokenUrl = `https://graph.facebook.com/v20.0/oauth/access_token?client_id=${process.env.WHATSAPP_APP_ID}&client_secret=${process.env.WHATSAPP_APP_SECRET}&code=${code}`;
+    let accessToken;
+    try {
+      const tokenRes = await axios.get(tokenUrl);
+      accessToken = tokenRes.data.access_token;
+    } catch (err) {
+      console.error("Token exchange failed:", err.response?.data || err.message);
+      return res.status(400).json({ success: false, message: 'Failed to exchange OAuth code' });
+    }
+    
+    // 2. Fetch user info to verify token
+    const userRes = await axios.get(`https://graph.facebook.com/v20.0/me?access_token=${accessToken}`);
+    
+    if (!userRes.data || !userRes.data.id) {
+      return res.status(400).json({ success: false, message: 'Invalid Meta access token' });
+    }
+    
+    let wabaId = null;
+    try {
+        // Attempt to auto-fetch the first WhatsApp Business Account ID associated with the user's businesses
+        const bizRes = await axios.get(`https://graph.facebook.com/v20.0/me/businesses?access_token=${accessToken}`);
+        if (bizRes.data && bizRes.data.data && bizRes.data.data.length > 0) {
+            const bizId = bizRes.data.data[0].id;
+            const wabaRes = await axios.get(`https://graph.facebook.com/v20.0/${bizId}/owned_whatsapp_business_accounts?access_token=${accessToken}`);
+            if (wabaRes.data && wabaRes.data.data && wabaRes.data.data.length > 0) {
+                wabaId = wabaRes.data.data[0].id;
+            } else {
+               // Also check client_whatsapp_business_accounts
+               const clientWabaRes = await axios.get(`https://graph.facebook.com/v20.0/${bizId}/client_whatsapp_business_accounts?access_token=${accessToken}`);
+               if (clientWabaRes.data && clientWabaRes.data.data && clientWabaRes.data.data.length > 0) {
+                  wabaId = clientWabaRes.data.data[0].id;
+               }
+            }
+        }
+    } catch (e) {
+        console.error("Could not auto-fetch WABA ID", e.response?.data || e.message);
+    }
+
+    const Setting = require('../models/Setting');
+    
+    // Save token and WABA ID to settings
+    let setting = await Setting.findOne({ key: 'whatsapp_config' });
+    if (!setting) {
+        setting = new Setting({ key: 'whatsapp_config', value: {} });
+    }
+    
+    setting.value = {
+        ...setting.value,
+        accessToken: accessToken,
+        businessAccountId: wabaId || setting.value.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID
+    };
+    
+    await setting.save();
+    
+    // Update service config in memory
+    const whatsappService = require('../services/whatsappService');
+    whatsappService.accessToken = accessToken;
+    if (wabaId) whatsappService.businessAccountId = wabaId;
+
+    res.status(200).json({
+      success: true,
+      message: 'WhatsApp account connected successfully',
+      wabaId: wabaId,
+      metaUserId: userRes.data.id
+    });
+
+  } catch (error) {
+    console.error('OAuth Connection Error:', error.response?.data || error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to connect WhatsApp account via OAuth',
+      error: error.response?.data?.error?.message || error.message
     });
   }
 };
@@ -209,6 +299,9 @@ exports.handleWebhook = async (req, res) => {
 
     const webhookData = req.body;
     
+    // Log incoming webhook for debugging
+    console.log("📥 Received Webhook from Meta:", JSON.stringify(webhookData, null, 2));
+    
     // Acknowledge immediately so WhatsApp does not retry while we process.
     res.sendStatus(200);
 
@@ -260,7 +353,22 @@ exports.handleWebhook = async (req, res) => {
  */
 async function handleIncomingMessage(data) {
   try {
-    const { from, contact, message, messageId, messageType, timestamp } = data;
+    const { from, contact, message, messageId, messageType, timestamp, phoneNumberId } = data;
+
+    // Resolve Channel ID
+    let resolvedChannelId = null;
+    if (phoneNumberId) {
+      const Channel = require('../models/Channel');
+      const channelRecord = await Channel.findOne({ activeWhatsappPhoneNumberId: phoneNumberId });
+      if (channelRecord) {
+        resolvedChannelId = channelRecord._id.toString();
+      }
+    }
+
+    if (!resolvedChannelId) {
+      console.warn(`[Webhook] Ignored message for unknown phoneNumberId: ${phoneNumberId}`);
+      return;
+    }
 
     // Normalize the phone number
     const normalizedFrom = normalizePhoneNumber(from);
@@ -522,6 +630,18 @@ async function handleIncomingMessage(data) {
     // Mark message as read on WhatsApp (optional - you may want to do this manually)
     // await whatsappService.markMessageAsRead(messageId);
 
+    // 🚀 Trigger Automation Engine for all types of messages
+    await automationService.processAutomationTrigger(
+      'message',
+      {
+        message: messageText || lastMsgText, // Send text or media caption/fallback
+        contactPhone: normalizedFrom,
+        messageId: newMessage._id,
+        messageType: messageType,
+        mediaUrl: mediaUrl
+      },
+      resolvedChannelId // MUST pass channelId, not userId!
+    );
 
   } catch (error) {
     console.error('❌ Error handling incoming message:', error);
