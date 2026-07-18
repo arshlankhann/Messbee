@@ -44,14 +44,7 @@ const ChatSkeletonLoader = () => (
    </div>
 );
 
-// --- MOCK DATA ---
-const QUICK_REPLIES_MOCK = [
-   "Yes, please!",
-   "Can you share more details?",
-   "I'll check and revert shortly.",
-   "Thanks, I received it.",
-   "Not right now, thanks."
-];
+
 
 const MOCK_MEDIA = [
    { id: 1, name: "Marketing_Banner_01.jpg", size: "1.2 MB", date: "Oct 24", fullDate: "Oct 24, 2023 at 10:45 AM", type: "image", url: "https://images.unsplash.com/photo-1600880292203-757bb62b4baf?auto=format&fit=crop&w=400&q=80", res: "1920×1080" },
@@ -485,6 +478,46 @@ const Conversion = ({
       return false;
    }, [data?.source, data?.canSendFreeText, data?.lastInboundAt, data?.messages]);
 
+   const dynamicSuggestions = useMemo(() => {
+      const lastThemMsg = [...(data?.messages || [])].reverse().find(m => m.sender === 'them');
+      if (!lastThemMsg || !lastThemMsg.text) {
+         return [
+            "Hello, how can I help you?",
+            "Can you share more details?",
+            "I'll check and revert shortly.",
+            "Thanks, I received it."
+         ];
+      }
+      const txt = lastThemMsg.text.toLowerCase();
+      
+      const intents = [];
+      if (txt.includes("price") || txt.includes("cost") || txt.includes("fee") || txt.includes("plan") || txt.includes("how much")) {
+         intents.push("Here is our pricing plan.", "Could you specify your needs?", "We have custom plans available.");
+      }
+      if (txt.includes("help") || txt.includes("support") || txt.includes("issue") || txt.includes("problem") || txt.includes("error") || txt.includes("not working")) {
+         intents.push("How can I assist you today?", "I can help with that.", "Please provide a screenshot or more details.");
+      }
+      if (txt.includes("hello") || txt.includes("hi ") || txt.includes("hey") || txt.includes("good morning")) {
+         intents.push("Hello! How can I help you?", "Hi there!", "Greetings! What can I do for you today?");
+      }
+      if (txt.includes("thank") || txt.includes("thx") || txt.includes("appreciate")) {
+         intents.push("You're welcome!", "Anytime!", "Glad I could help.", "Let me know if you need anything else.");
+      }
+      if (txt.includes("appointment") || txt.includes("schedule") || txt.includes("book") || txt.includes("time") || txt.includes("meet")) {
+         intents.push("When would you like to schedule?", "Let me check our availability.", "What time works best for you?");
+      }
+      if (txt.includes("refund") || txt.includes("cancel") || txt.includes("return")) {
+         intents.push("I can help you with the cancellation.", "Could you provide your order number?", "Let me look into this refund for you.");
+      }
+      
+      if (intents.length === 0) {
+         return ["I see. Tell me more.", "Could you clarify that?", "I'll look into this right away.", "Please give me a moment.", "Yes, I understand."];
+      }
+      
+      // Return up to 5 unique suggestions based on the matched intents
+      return Array.from(new Set(intents)).slice(0, 5);
+   }, [data?.messages]);
+
    const isTemplateOnlyMode = data?.source === 'whatsapp' && !canSendFreeText;
 
    const sessionExpiryMs = useMemo(() => {
@@ -603,10 +636,40 @@ const Conversion = ({
       return availableLabels.filter(l => data.labels.includes(l.name));
    }, [data.labels, availableLabels]);
 
-   // Limit Quick Replies to top 3 as requested
+   // Limit Quick Replies to top 5 contextually relevant
    const displayQuickReplies = useMemo(() => {
-      return quickReplies.slice(0, 3);
-   }, [quickReplies]);
+      if (!quickReplies || quickReplies.length === 0) return [];
+      const lastThemMsg = [...(data?.messages || [])].reverse().find(m => m.sender === 'them');
+      
+      if (!lastThemMsg || !lastThemMsg.text) return quickReplies.slice(0, 5);
+      
+      const txt = lastThemMsg.text.toLowerCase();
+      // Basic word tokenization (minimum 3 characters)
+      const words = txt.split(/[\s,.-]+/).filter(w => w.length > 2);
+      
+      let sorted = [...quickReplies].map(reply => {
+         const replyTxt = (reply.content + " " + reply.shortcut).toLowerCase();
+         let score = 0;
+         
+         // Increase score for each word match
+         words.forEach(word => {
+            if (replyTxt.includes(word)) score += 1;
+         });
+         
+         // Boost score for specific strong intents
+         if ((txt.includes("price") || txt.includes("cost") || txt.includes("plan")) && replyTxt.includes("price")) score += 3;
+         if ((txt.includes("help") || txt.includes("support") || txt.includes("issue")) && (replyTxt.includes("help") || replyTxt.includes("support"))) score += 3;
+         if ((txt.includes("hi") || txt.includes("hello")) && (replyTxt.includes("hi") || replyTxt.includes("hello"))) score += 2;
+         if ((txt.includes("thank")) && (replyTxt.includes("welcome") || replyTxt.includes("glad"))) score += 3;
+         
+         return { ...reply, _score: score };
+      });
+      
+      // Sort by score descending
+      sorted.sort((a, b) => b._score - a._score);
+      
+      return sorted.slice(0, 5);
+   }, [quickReplies, data?.messages]);
 
    // Only approved templates can be used in chat send flow.
    const approvedTemplates = useMemo(() => {
@@ -1163,7 +1226,7 @@ const selectedTemplate = useMemo(() => {
 
             {!isTemplateOnlyMode && (
             <div className="flex gap-1.5 overflow-x-auto hide-scrollbar pb-2 px-1 mb-1">
-               {QUICK_REPLIES_MOCK.map((reply, idx) => (
+               {dynamicSuggestions.map((reply, idx) => (
                   <button key={idx} type="button" onClick={() => onSendMessage(reply)} className="px-3 py-1 bg-slate-50 border border-slate-200 hover:bg-slate-100 text-[11px] font-bold rounded-full whitespace-nowrap transition-colors shadow-sm shrink-0">
                      {reply}
                   </button>

@@ -60,7 +60,7 @@ exports.connectOAuthToken = async (req, res, next) => {
     const axios = require('axios');
     
     // 1. Exchange code for access token
-    const tokenUrl = `https://graph.facebook.com/v20.0/oauth/access_token?client_id=${process.env.WHATSAPP_APP_ID}&client_secret=${process.env.WHATSAPP_APP_SECRET}&code=${code}`;
+    const tokenUrl = `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/oauth/access_token?client_id=${process.env.WHATSAPP_APP_ID}&client_secret=${process.env.WHATSAPP_APP_SECRET}&code=${code}`;
     let accessToken;
     try {
       const tokenRes = await axios.get(tokenUrl);
@@ -71,7 +71,7 @@ exports.connectOAuthToken = async (req, res, next) => {
     }
     
     // 2. Fetch user info to verify token
-    const userRes = await axios.get(`https://graph.facebook.com/v20.0/me?access_token=${accessToken}`);
+    const userRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/me?access_token=${accessToken}`);
     
     if (!userRes.data || !userRes.data.id) {
       return res.status(400).json({ success: false, message: 'Invalid Meta access token' });
@@ -80,15 +80,15 @@ exports.connectOAuthToken = async (req, res, next) => {
     let wabaId = null;
     try {
         // Attempt to auto-fetch the first WhatsApp Business Account ID associated with the user's businesses
-        const bizRes = await axios.get(`https://graph.facebook.com/v20.0/me/businesses?access_token=${accessToken}`);
+        const bizRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/me/businesses?access_token=${accessToken}`);
         if (bizRes.data && bizRes.data.data && bizRes.data.data.length > 0) {
             const bizId = bizRes.data.data[0].id;
-            const wabaRes = await axios.get(`https://graph.facebook.com/v20.0/${bizId}/owned_whatsapp_business_accounts?access_token=${accessToken}`);
+            const wabaRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${bizId}/owned_whatsapp_business_accounts?access_token=${accessToken}`);
             if (wabaRes.data && wabaRes.data.data && wabaRes.data.data.length > 0) {
                 wabaId = wabaRes.data.data[0].id;
             } else {
                // Also check client_whatsapp_business_accounts
-               const clientWabaRes = await axios.get(`https://graph.facebook.com/v20.0/${bizId}/client_whatsapp_business_accounts?access_token=${accessToken}`);
+               const clientWabaRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${bizId}/client_whatsapp_business_accounts?access_token=${accessToken}`);
                if (clientWabaRes.data && clientWabaRes.data.data && clientWabaRes.data.data.length > 0) {
                   wabaId = clientWabaRes.data.data[0].id;
                }
@@ -874,6 +874,13 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
     // Update chat metadata
     chat.lastMsg = text;
     chat.lastMsgTime = time;
+    // Auto-assign ownership to the sending user if unassigned
+    if (!chat.user && req.user?.id) {
+      chat.user = req.user.id;
+    }
+    if (chat.teamMember === 'Unassigned' && req.user?.name) {
+      chat.teamMember = req.user.name;
+    }
     await chat.save();
 
     // Emit to socket
@@ -1029,10 +1036,11 @@ exports.sendTemplateMessage = async (req, res, next) => {
           status: 'active',
           chatStatus: 'open',
           avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}&background=random`,
-          teamMember: 'Unassigned',
+          teamMember: req.user?.name || req.user?.id || 'Unassigned',
           whatsappId: recipientPhone,
           source: 'whatsapp',
-          lastActivity: new Date()
+          lastActivity: new Date(),
+          user: req.user?.id || null
         });
       }
     }
@@ -1136,6 +1144,13 @@ exports.sendTemplateMessage = async (req, res, next) => {
     chat.lastMsg = `Template: ${templateName}`;
     chat.lastMsgTime = time;
     chat.lastActivity = new Date();
+    // Ensure the sending user is the owner if no owner is set
+    if (!chat.user && req.user?.id) {
+      chat.user = req.user.id;
+    }
+    if (chat.teamMember === 'Unassigned' && req.user?.name) {
+      chat.teamMember = req.user.name;
+    }
     await chat.save();
 
     try {
@@ -1220,10 +1235,11 @@ exports.getTemplates = async (req, res, next) => {
         return {
           ...t,
           components: mergedComponents,
-          // Persist our local status if API status is missing
-          status: t.status || localTemplate.status 
+          // Persist our local status if API status is missing, but force DELETED if soft-deleted locally
+          status: localTemplate.status === 'DELETED' ? 'DELETED' : (t.status || localTemplate.status)
         };
-      });
+      })
+      .filter(t => t.status !== 'DELETED');
 
     const approvedTemplates = filteredTemplates.filter((template) => template.status === 'APPROVED');
     const nonApprovedTemplates = filteredTemplates.filter((template) => template.status !== 'APPROVED');
@@ -1442,12 +1458,16 @@ exports.deleteTemplate = async (req, res, next) => {
       });
     }
 
-    // Remove from local DB regardless (hard delete from Meta or soft delete)
+    // Soft delete from local DB so it doesn't show up in getTemplates
     try {
-      await Template.findOneAndDelete({ name: templateName, user: req.user.id });
-      console.log('✅ [Controller] Template removed from local DB:', templateName);
+      await Template.findOneAndUpdate(
+        { name: templateName, user: req.user.id },
+        { status: 'DELETED', name: templateName, user: req.user.id },
+        { new: true, upsert: true }
+      );
+      console.log('✅ [Controller] Template soft-deleted from local DB:', templateName);
     } catch (dbError) {
-      console.warn('⚠️ [Controller] Could not remove template from local DB:', dbError.message);
+      console.warn('⚠️ [Controller] Could not soft-delete template from local DB:', dbError.message);
     }
 
     if (isMetaPermissionError) {
