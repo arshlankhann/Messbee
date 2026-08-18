@@ -11,17 +11,30 @@ const ConnectWhatsAppModal = ({ isOpen, onClose }) => {
   const [error, setError] = useState("");
   const [isFbInitialized, setIsFbInitialized] = useState(false);
 
-  // Load Facebook SDK on mount (must be before any early returns)
+  // Load Facebook SDK on mount
   useEffect(() => {
-    // If it's already loaded and initialized from a previous modal open
-    if (window.FB && window.FB.login) {
-      setIsFbInitialized(true);
-      return;
+    // The FB SDK might already be initialized by the Login page using a DIFFERENT App ID.
+    // Facebook SDK does not support changing the App ID dynamically.
+    // To ensure Embedded Signup uses the correct App ID, we must forcefully remove the old SDK and re-inject it.
+    if (window.FB) {
+      delete window.FB;
+    }
+    const existingScript = document.getElementById('facebook-jssdk');
+    if (existingScript) {
+      existingScript.remove();
+    }
+    
+    // Also remove the fb root element if it exists to ensure a clean slate
+    const fbRoot = document.getElementById('fb-root');
+    if (fbRoot) {
+      fbRoot.remove();
     }
 
-    window.fbAsyncInit = function () {
+    const appId = import.meta.env.VITE_META_APP_ID || "1401700501230008"; // WhatsApp Embedded Signup App ID
+
+    const initFB = () => {
       window.FB.init({
-        appId: import.meta.env.VITE_META_APP_ID || "YOUR_META_APP_ID", // Add this to your .env
+        appId: appId,
         cookie: true,
         xfbml: true,
         version: "v20.0", // Use the latest stable version
@@ -29,15 +42,22 @@ const ConnectWhatsAppModal = ({ isOpen, onClose }) => {
       setIsFbInitialized(true);
     };
 
-    (function (d, s, id) {
-      var js,
-        fjs = d.getElementsByTagName(s)[0];
-      if (d.getElementById(id)) return;
-      js = d.createElement(s);
-      js.id = id;
-      js.src = "https://connect.facebook.net/en_US/sdk.js";
-      fjs.parentNode.insertBefore(js, fjs);
-    })(document, "script", "facebook-jssdk");
+    // If FB SDK is already loaded (e.g., from the Login page), FORCE re-initialization with WhatsApp App ID
+    if (window.FB && window.FB.init) {
+      initFB();
+    } else {
+      window.fbAsyncInit = initFB;
+
+      (function (d, s, id) {
+        var js,
+          fjs = d.getElementsByTagName(s)[0];
+        if (d.getElementById(id)) return;
+        js = d.createElement(s);
+        js.id = id;
+        js.src = "https://connect.facebook.net/en_US/sdk.js";
+        fjs.parentNode.insertBefore(js, fjs);
+      })(document, "script", "facebook-jssdk");
+    }
   }, []);
 
   if (!isOpen) return null;
@@ -70,12 +90,11 @@ const ConnectWhatsAppModal = ({ isOpen, onClose }) => {
     const sessionInfoListener = (event) => {
       if (event.origin !== "https://www.facebook.com" && event.origin !== "https://web.facebook.com") {
         return;
-      }
+      }  
       try {
         const data = JSON.parse(event.data);
         if (data.type === "WA_EMBEDDED_SIGNUP" && data.event === "FINISH") {
-          const { phone_number_id, waba_id } = data.data;
-          window.lastMetaSessionInfo = { phone_number_id, waba_id };
+          window.lastMetaSessionInfo = data;
           console.log("Captured Meta Session Info:", window.lastMetaSessionInfo);
         }
       } catch (error) {
@@ -100,10 +119,9 @@ const ConnectWhatsAppModal = ({ isOpen, onClose }) => {
               window.removeEventListener("message", sessionInfoListener);
               window.lastMetaSessionInfo = null;
 
-              api.post('/whatsapp/connect-oauth', { 
+              api.post('/whatsapp/embedded-signup-callback', { 
                 code,
-                wabaId: sessionInfo.waba_id,
-                phoneNumberId: sessionInfo.phone_number_id
+                eventData: sessionInfo
               })
                 .then((res) => {
                   if (res.data?.success) {
@@ -137,7 +155,8 @@ const ConnectWhatsAppModal = ({ isOpen, onClose }) => {
         extras: {
           feature: "whatsapp_embedded_signup",
           version: 2,
-          sessionInfoVersion: 2
+          sessionInfoVersion: "2",
+          setup: {}
         },
         scope: scopes.join(",")
       }
