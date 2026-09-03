@@ -1,8 +1,10 @@
-const whatsappService = require('../services/whatsappService');
+const { WhatsAppService } = require('../services/whatsappService');
+const whatsappService = require('../services/whatsappService'); // Legacy singleton
 const Chat = require('../models/Chat');
 const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Campaign = require('../models/Campaign');
+const Channel = require('../models/Channel');
 
 const { getIO } = require('../config/socket');
 const { normalizePhoneNumber } = require('../utils/phoneHelper');
@@ -11,6 +13,83 @@ const Template = require('../models/Template');
 const { logAPICall, getRecentLogs } = require('../utils/apiLogger');
 const { createAndEmitNotification } = require('../services/notificationService');
 const automationService = require('../services/automationService');
+
+// --- MULTI-TENANT & HYBRID SERVICE HELPER ---
+const getTenantWhatsAppService = async (tenantId) => {
+  let accessToken = null;
+  let phoneNumberId = null;
+  let businessAccountId = null;
+
+  // 1. Try Channel (Multi-tenant DB record)
+  if (tenantId) {
+    try {
+      const channel = await Channel.findOne({ 
+        tenantId, 
+        activeWhatsappPhoneNumberId: { $exists: true, $ne: null } 
+      }).select('+metaAccessToken');
+
+      if (channel && channel.metaAccessToken && channel.activeWhatsappPhoneNumberId) {
+        accessToken = channel.metaAccessToken;
+        phoneNumberId = channel.activeWhatsappPhoneNumberId;
+        businessAccountId = channel.metadata?.wabaId;
+      }
+    } catch (e) {
+      console.warn("Channel lookup warning in getTenantWhatsAppService:", e.message);
+    }
+  }
+
+  // 2. Try User model configuration (user.whatsappConfig)
+  if (!accessToken && tenantId) {
+    try {
+      const User = require('../models/User');
+      const user = await User.findById(tenantId);
+      if (user && user.whatsappConfig && user.whatsappConfig.accessToken) {
+        accessToken = user.whatsappConfig.accessToken;
+        phoneNumberId = user.whatsappConfig.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+        businessAccountId = user.whatsappConfig.wabaId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
+      }
+    } catch (e) {
+      console.warn("User lookup warning in getTenantWhatsAppService:", e.message);
+    }
+  }
+
+  // 3. Try Setting model (key: 'whatsapp_config')
+  if (!accessToken) {
+    try {
+      const Setting = require('../models/Setting');
+      const setting = await Setting.findOne({ key: 'whatsapp_config' });
+      if (setting && setting.value && (setting.value.accessToken || setting.value.phoneNumberId)) {
+        accessToken = setting.value.accessToken || process.env.WHATSAPP_ACCESS_TOKEN;
+        phoneNumberId = setting.value.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+        businessAccountId = setting.value.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
+      }
+    } catch (e) {
+      console.warn("Setting lookup warning in getTenantWhatsAppService:", e.message);
+    }
+  }
+
+  // 4. Try Global .env Fallback
+  if (!accessToken) {
+    accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+    phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+    businessAccountId = process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
+  }
+
+  if (!accessToken || !phoneNumberId) {
+    return null;
+  }
+
+  const service = new WhatsAppService();
+  service.accessToken = accessToken;
+  service.phoneNumberId = phoneNumberId;
+  service.businessAccountId = businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
+  service.baseURL = `https://graph.facebook.com/${service.apiVersion || 'v20.0'}/${service.phoneNumberId}`;
+  
+  // Override syncConfig to prevent it from resetting tokens to global .env/Setting
+  service.syncConfig = async () => {}; 
+  service.validateConfig = () => true; 
+  return service;
+};
 
 /**
  * WhatsApp Webhook Controller
@@ -22,20 +101,21 @@ const automationService = require('../services/automationService');
 // @access  Private
 exports.testConnection = async (req, res, next) => {
   try {
-    // Sync configuration from database first
-    await whatsappService.syncConfig();
-
-    // Validate configuration
-    whatsappService.validateConfig();
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
     
+    if (!tenantWhatsAppService) {
+      return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account. Please connect WhatsApp first.' });
+    }
+
     res.status(200).json({
       success: true,
       message: 'WhatsApp API configuration is valid',
       config: {
-        phoneNumberId: whatsappService.phoneNumberId,
-        hasAccessToken: !!whatsappService.accessToken,
-        businessAccountId: whatsappService.businessAccountId,
-        apiVersion: whatsappService.apiVersion
+        phoneNumberId: tenantWhatsAppService.phoneNumberId,
+        hasAccessToken: !!tenantWhatsAppService.accessToken,
+        businessAccountId: tenantWhatsAppService.businessAccountId,
+        apiVersion: tenantWhatsAppService.apiVersion || 'v20.0'
       }
     });
   } catch (error) {
@@ -89,6 +169,20 @@ exports.connectOAuthToken = async (req, res, next) => {
     let wabaId = clientWabaId || null;
     let phoneNumberId = clientPhoneNumberId || null;
     
+    // Strict Verification: If client provided a wabaId, verify it actually belongs to this access token
+    if (wabaId) {
+      try {
+        const verifyRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${wabaId}?access_token=${accessToken}`);
+        if (!verifyRes.data || verifyRes.data.id !== wabaId) {
+          console.warn(`Spoofing attempt detected or invalid wabaId: ${wabaId}`);
+          wabaId = null; // Fallback to auto-fetch
+        }
+      } catch (e) {
+        console.warn(`Failed to verify wabaId ${wabaId}:`, e.response?.data || e.message);
+        wabaId = null; // Fallback to auto-fetch
+      }
+    }
+
     if (!wabaId) {
       try {
           // Attempt to auto-fetch the first WhatsApp Business Account ID associated with the user's businesses
@@ -142,7 +236,35 @@ exports.connectOAuthToken = async (req, res, next) => {
       }
     }
     
-    // Update service config in memory
+    // Sync to Channel for automation engine (Multi-Tenant)
+    if (req.user && (phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID)) {
+      const Channel = require('../models/Channel');
+      const tenantId = req.user.tenantId || req.user._id;
+      const finalPhoneNumberId = phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+      
+      try {
+        const User = require('../models/User');
+        const userRec = await User.findById(req.user._id);
+        let channelName = userRec?.businessName || userRec?.company || 'WhatsApp Business';
+        
+        await Channel.findOneAndUpdate(
+          { tenantId },
+          {
+            tenantId,
+            activeWhatsappPhoneNumberId: finalPhoneNumberId,
+            metaAccessToken: accessToken,
+            'metadata.name': channelName,
+            'metadata.wabaId': wabaId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID,
+            'metadata.status': 'CONNECTED'
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      } catch (err) {
+        console.error("Failed to sync Channel:", err.message);
+      }
+    }
+    
+    // Update service config in memory (Legacy Single-Tenant)
     const whatsappService = require('../services/whatsappService');
     whatsappService.accessToken = accessToken;
     if (wabaId) whatsappService.businessAccountId = wabaId;
@@ -229,6 +351,20 @@ exports.embeddedSignupCallback = async (req, res, next) => {
     let wabaId = clientWabaId || null;
     let phoneNumberId = clientPhoneNumberId || null;
     
+    // Strict Verification: If client provided a wabaId, verify it actually belongs to this access token
+    if (wabaId) {
+      try {
+        const verifyRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${wabaId}?access_token=${accessToken}`);
+        if (!verifyRes.data || verifyRes.data.id !== wabaId) {
+          console.warn(`Spoofing attempt detected or invalid wabaId in embedded signup: ${wabaId}`);
+          wabaId = null; // Fallback to auto-fetch
+        }
+      } catch (e) {
+        console.warn(`Failed to verify wabaId ${wabaId} in embedded signup:`, e.response?.data || e.message);
+        wabaId = null; // Fallback to auto-fetch
+      }
+    }
+
     if (!wabaId) {
       try {
           const bizRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/me/businesses?access_token=${accessToken}`);
@@ -278,7 +414,35 @@ exports.embeddedSignupCallback = async (req, res, next) => {
       }
     }
     
-    // Update service config in memory
+    // Sync to Channel for automation engine (Multi-Tenant)
+    if (req.user && (phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID)) {
+      const Channel = require('../models/Channel');
+      const tenantId = req.user.tenantId || req.user._id;
+      const finalPhoneNumberId = phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+      
+      try {
+        const User = require('../models/User');
+        const userRec = await User.findById(req.user._id);
+        let channelName = userRec?.businessName || userRec?.company || 'WhatsApp Business';
+        
+        await Channel.findOneAndUpdate(
+          { tenantId },
+          {
+            tenantId,
+            activeWhatsappPhoneNumberId: finalPhoneNumberId,
+            metaAccessToken: accessToken,
+            'metadata.name': channelName,
+            'metadata.wabaId': wabaId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID,
+            'metadata.status': 'CONNECTED'
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      } catch (err) {
+        console.error("Failed to sync Channel:", err.message);
+      }
+    }
+    
+    // Update service config in memory (Legacy Single-Tenant)
     const whatsappService = require('../services/whatsappService');
     whatsappService.accessToken = accessToken;
     if (wabaId) whatsappService.businessAccountId = wabaId;
@@ -313,6 +477,23 @@ exports.connectManual = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'WABA ID and Access Token are required' });
     }
 
+    const axios = require('axios');
+    
+    // Verify token and WABA ID using Facebook Graph API
+    try {
+      const verifyRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${wabaId}?access_token=${accessToken}`);
+      if (!verifyRes.data || verifyRes.data.id !== wabaId) {
+        return res.status(400).json({ success: false, message: 'Invalid WABA ID or Access Token' });
+      }
+    } catch (err) {
+      console.error("Token verification failed:", err.response?.data || err.message);
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid WABA ID or Access Token. Please check your credentials.',
+        details: err.response?.data
+      });
+    }
+
     const Setting = require('../models/Setting');
     
     // Save token and WABA ID to settings
@@ -344,7 +525,35 @@ exports.connectManual = async (req, res, next) => {
       }
     }
     
-    // Update service config in memory
+    // Sync to Channel for automation engine (Multi-Tenant)
+    if (req.user && (phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID)) {
+      const Channel = require('../models/Channel');
+      const tenantId = req.user.tenantId || req.user._id;
+      const finalPhoneNumberId = phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+      
+      try {
+        const User = require('../models/User');
+        const userRec = await User.findById(req.user._id);
+        let channelName = userRec?.businessName || userRec?.company || 'WhatsApp Business';
+        
+        await Channel.findOneAndUpdate(
+          { tenantId },
+          {
+            tenantId,
+            activeWhatsappPhoneNumberId: finalPhoneNumberId,
+            metaAccessToken: accessToken,
+            'metadata.name': channelName,
+            'metadata.wabaId': wabaId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID,
+            'metadata.status': 'CONNECTED'
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      } catch (err) {
+        console.error("Failed to sync Channel:", err.message);
+      }
+    }
+    
+    // Update service config in memory (Legacy Single-Tenant)
     const whatsappService = require('../services/whatsappService');
     whatsappService.accessToken = accessToken;
     whatsappService.businessAccountId = wabaId;
@@ -372,6 +581,10 @@ exports.connectManual = async (req, res, next) => {
 // @access  Private
 exports.registerNumber = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     const { pin } = req.body;
     if (!pin) {
       return res.status(400).json({
@@ -381,7 +594,7 @@ exports.registerNumber = async (req, res, next) => {
     }
 
     // Await the WhatsApp service registration
-    const response = await whatsappService.register(pin);
+    const response = await tenantWhatsAppService.register(pin);
 
     if (response.success) {
       res.status(200).json({
@@ -410,8 +623,12 @@ exports.registerNumber = async (req, res, next) => {
 // @access  Private
 exports.deregisterNumber = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     // Await the WhatsApp service deregistration
-    const response = await whatsappService.deregister();
+    const response = await tenantWhatsAppService.deregister();
 
     if (response.success) {
       res.status(200).json({
@@ -1004,6 +1221,13 @@ async function handleStatusUpdate(data) {
 // @access  Private (add auth middleware)
 exports.sendWhatsAppMessage = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    
+    if (!tenantWhatsAppService) {
+      return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+    }
+
     const { chatId, text, to } = req.body;
 
     // Log the incoming request
@@ -1068,7 +1292,7 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
     }
 
     // Send via WhatsApp API
-    const result = await whatsappService.sendTextMessage(chat.phone, text);
+    const result = await tenantWhatsAppService.sendTextMessage(chat.phone, text);
 
     if (!result.success) {
       logAPICall({
@@ -1167,6 +1391,13 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
 // @access  Private
 exports.sendTemplateMessage = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    
+    if (!tenantWhatsAppService) {
+      return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+    }
+
     const {
       chatId,
       to,
@@ -1322,7 +1553,7 @@ exports.sendTemplateMessage = async (req, res, next) => {
       }
     }
 
-    const result = await whatsappService.sendTemplateMessage(
+    const result = await tenantWhatsAppService.sendTemplateMessage(
       recipientPhone,
       templateName,
       languageCode,
@@ -1437,15 +1668,43 @@ exports.sendTemplateMessage = async (req, res, next) => {
 // @access  Private
 exports.getTemplates = async (req, res, next) => {
   try {
-
+    const tenantId = req.user?.tenantId || req.user?._id;
+    console.log('[DEBUG] getTemplates called. tenantId=', tenantId, 'userId=', req.user?._id);
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    console.log('[DEBUG] getTenantWhatsAppService result:', !!tenantWhatsAppService);
     
-    const data = await whatsappService.getTemplates();
-    const allTemplates = Array.isArray(data?.data) ? data.data : [];
+    if (!tenantWhatsAppService) {
+      console.log('[DEBUG] Sending 403 because tenantWhatsAppService is null');
+      return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+    }
     
+    let data = { data: [] };
+    try {
+      console.log('[DEBUG] Calling tenantWhatsAppService.getTemplates()');
+      data = await tenantWhatsAppService.getTemplates();
+      console.log('[DEBUG] getTemplates success, items:', data?.data?.length);
+    } catch (err) {
+      console.warn('⚠️ Meta API returned Error in getTemplates (falling back to local DB):', err.response?.status, err.response?.data?.error?.message || err.message);
+      // Don't crash or return 401 — fall back to local MongoDB templates
+      data = { data: [] };
+    }
 
+    let allTemplates = Array.isArray(data?.data) ? data.data : [];
     
     // Get templates owned by this user from our DB
     const userTemplates = await Template.find({ user: req.user.id });
+    
+    // If Meta API returned 0 or failed, use local templates
+    if (allTemplates.length === 0 && userTemplates.length > 0) {
+      allTemplates = userTemplates.map(t => ({
+        id: t.whatsappTemplateId || t._id,
+        name: t.name,
+        category: t.category,
+        language: t.language,
+        status: t.status || 'APPROVED',
+        components: t.components || []
+      }));
+    }
     const userTemplatesMap = {};
     userTemplates.forEach(t => {
       userTemplatesMap[String(t.name).trim()] = t;
@@ -1527,6 +1786,10 @@ exports.getTemplates = async (req, res, next) => {
 // @access  Private
 exports.createTemplate = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     const { name, category, language, components } = req.body;
 
     if (!name) {
@@ -1536,7 +1799,7 @@ exports.createTemplate = async (req, res, next) => {
       });
     }
 
-    const result = await whatsappService.createTemplate({
+    const result = await tenantWhatsAppService.createTemplate({
       name,
       category: category || 'MARKETING',
       language: language || 'en_US',
@@ -1561,7 +1824,7 @@ exports.createTemplate = async (req, res, next) => {
 
     // Save template ownership to our DB
     const templateName = result.templateName || name;
-    await Template.create({
+    const createdLocal = await Template.create({
       name: templateName,
       whatsappTemplateId: result.data?.id,
       category: category || 'MARKETING',
@@ -1570,6 +1833,12 @@ exports.createTemplate = async (req, res, next) => {
       user: req.user.id,
       status: 'PENDING'
     });
+
+    try {
+      const { getIO } = require('../config/socket');
+      const io = getIO();
+      if (io) io.emit('template_created', { tenantId, template: createdLocal });
+    } catch (_) {}
 
     res.status(201).json({
       success: true,
@@ -1589,9 +1858,13 @@ exports.createTemplate = async (req, res, next) => {
 // @access  Private
 exports.getTemplateDetails = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     const { templateId } = req.params;
 
-    const result = await whatsappService.getTemplateDetails(templateId);
+    const result = await tenantWhatsAppService.getTemplateDetails(templateId);
 
     if (!result.success) {
       return res.status(404).json({
@@ -1615,6 +1888,10 @@ exports.getTemplateDetails = async (req, res, next) => {
 // @access  Private
 exports.testSendTemplate = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     const { phoneNumber, templateName, languageCode, testData } = req.body;
 
     if (!phoneNumber || !templateName) {
@@ -1624,7 +1901,7 @@ exports.testSendTemplate = async (req, res, next) => {
       });
     }
 
-    const result = await whatsappService.testSendTemplate(
+    const result = await tenantWhatsAppService.testSendTemplate(
       phoneNumber,
       templateName,
       languageCode || 'en_US',
@@ -1650,12 +1927,14 @@ exports.testSendTemplate = async (req, res, next) => {
 };
 
 // @desc    Delete a template
+// @desc    Delete template
 // @route   DELETE /api/whatsapp/templates/:templateId
 // @access  Private
 exports.deleteTemplate = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
     const { templateId } = req.params;
-    const { templateName } = req.body;
+    let { templateName } = req.body || {};
 
     if (!templateId) {
       return res.status(400).json({
@@ -1664,60 +1943,65 @@ exports.deleteTemplate = async (req, res, next) => {
       });
     }
 
+    // Look up templateName if missing
     if (!templateName) {
-      return res.status(400).json({
-        success: false,
-        message: 'Template name is required to delete a template'
-      });
+      try {
+        const isMongoId = /^[0-9a-fA-F]{24}$/.test(templateId);
+        const query = isMongoId ? { _id: templateId } : { whatsappTemplateId: templateId };
+        const localDoc = await Template.findOne(query);
+        if (localDoc) {
+          templateName = localDoc.name;
+        }
+      } catch (_) {}
     }
 
-    console.log('🗑️ [Controller] Attempting to delete template:', { templateId, templateName });
-    const result = await whatsappService.deleteTemplate(templateId, templateName);
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    let metaResult = { success: false };
 
-    // Check if this is a Meta permission error (code 100 - BSP/WABA ownership restriction)
-    // In this case we soft-delete: remove from our local DB so it disappears from the UI
-    const isMetaPermissionError =
-      !result.success &&
-      (result.error?.code === 100 ||
-        (typeof result.error?.message === 'string' &&
-          result.error.message.includes('Need permission on either WhatsApp Business Account')));
-
-    if (!result.success && !isMetaPermissionError) {
-      // A genuine failure (network error, invalid name, etc.) — surface it to the user
-      console.error('❌ [Controller] Delete failed:', result.error);
-      return res.status(400).json({
-        success: false,
-        message: 'Failed to delete template',
-        error: result.error
-      });
+    if (tenantWhatsAppService && templateName) {
+      console.log('🗑️ [Controller] Attempting to delete template from Meta:', { templateId, templateName });
+      try {
+        metaResult = await tenantWhatsAppService.deleteTemplate(templateId, templateName);
+      } catch (err) {
+        console.warn('⚠️ [Controller] Meta delete warning:', err.message);
+      }
     }
 
-    // Soft delete from local DB so it doesn't show up in getTemplates
+    // Always delete or soft-delete from local DB
     try {
-      await Template.findOneAndUpdate(
-        { name: templateName, user: req.user.id },
-        { status: 'DELETED', name: templateName, user: req.user.id },
-        { new: true, upsert: true }
-      );
-      console.log('✅ [Controller] Template soft-deleted from local DB:', templateName);
+      const userScope = getUserScope(req);
+      if (templateName) {
+        await Template.deleteMany({
+          name: templateName,
+          $or: [
+            { user: { $in: userScope } },
+            { tenantId: { $in: userScope } }
+          ]
+        });
+        await Template.findOneAndUpdate(
+          { name: templateName, user: req.user.id },
+          { status: 'DELETED', name: templateName, user: req.user.id },
+          { new: true, upsert: true }
+        );
+      }
+      if (/^[0-9a-fA-F]{24}$/.test(templateId)) {
+        await Template.deleteOne({ _id: templateId });
+      }
+      console.log('✅ [Controller] Template removed from local view:', templateName || templateId);
     } catch (dbError) {
-      console.warn('⚠️ [Controller] Could not soft-delete template from local DB:', dbError.message);
+      console.warn('⚠️ [Controller] Local DB delete warning:', dbError.message);
     }
 
-    if (isMetaPermissionError) {
-      console.warn('⚠️ [Controller] Meta API rejected delete (permission), but template removed from local view.');
-      return res.status(200).json({
-        success: true,
-        message: 'Template removed from your account. Note: It may still appear in WhatsApp Manager due to BSP permission restrictions — you can delete it directly from Meta Business Manager.',
-        softDeleted: true
-      });
-    }
+    try {
+      const { getIO } = require('../config/socket');
+      const io = getIO();
+      if (io) io.emit('template_deleted', { tenantId, templateId, templateName });
+    } catch (_) {}
 
-    console.log('✅ [Controller] Template deleted successfully from WhatsApp + local DB:', templateName);
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: 'Template deleted successfully',
-      data: result.data
+      data: metaResult?.data || null
     });
   } catch (error) {
     console.error('❌ [Controller] Delete template error:', error.message);
@@ -1731,10 +2015,14 @@ exports.deleteTemplate = async (req, res, next) => {
 // @access  Private
 exports.updateTemplate = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     const { templateId } = req.params;
     const updateData = req.body;
 
-    const result = await whatsappService.updateTemplate(templateId, updateData);
+    const result = await tenantWhatsAppService.updateTemplate(templateId, updateData);
 
     if (!result.success) {
       return res.status(400).json({
@@ -1759,6 +2047,10 @@ exports.updateTemplate = async (req, res, next) => {
 // @access  Private
 exports.uploadTemplateMedia = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     if (!req.file) {
       return res.status(400).json({
         success: false,
@@ -1792,7 +2084,7 @@ exports.uploadTemplateMedia = async (req, res, next) => {
     }
 
     // Upload directly to Meta's servers to get a handle (no public URL needed)
-    const metaUploadResult = await whatsappService.uploadMediaForTemplateHandle(
+    const metaUploadResult = await tenantWhatsAppService.uploadMediaForTemplateHandle(
       filePathToUpload,
       mimeTypeToUpload
     );
@@ -1828,6 +2120,10 @@ exports.uploadTemplateMedia = async (req, res, next) => {
 // @access  Private
 exports.uploadTemplateMediaByUrl = async (req, res, next) => {
   try {
+    const tenantId = req.user?.tenantId || req.user?._id;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+
     const { url } = req.body;
     if (!url) {
       return res.status(400).json({
@@ -1902,7 +2198,7 @@ exports.uploadTemplateMediaByUrl = async (req, res, next) => {
     }
 
     // 2. Upload to Meta's servers to get a handle
-    const metaUploadResult = await whatsappService.uploadMediaForTemplateHandle(
+    const metaUploadResult = await tenantWhatsAppService.uploadMediaForTemplateHandle(
       filePathToUpload,
       mimeTypeToUpload
     );

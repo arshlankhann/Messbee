@@ -1,6 +1,6 @@
 /* eslint-disable react/no-unescaped-entities */
 import { useState, useEffect } from 'react';
-import { Eye, ChevronDown, Check, ChevronLeft, Video, Phone, Image as ImageIcon, CheckCheck, Smile, Paperclip, Send, Loader2 } from 'lucide-react';
+import { Eye, ChevronDown, Check, ChevronLeft, Video, Phone, Image as ImageIcon, CheckCheck, Smile, Paperclip, Send, Loader2, Layers } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { fetchWhatsAppTemplates, mergeTemplates } from '../../services/TemplateApi';
 
@@ -83,7 +83,12 @@ const TemplatesGallery = () => {
           {/* Header */}
           <div className="flex flex-wrap items-center justify-between px-4 md:px-10 py-8 bg-[#F8FAFC]">
             <div className="mb-4 lg:mb-0">
-              <h2 className="text-[28px] font-bold text-[#1E293B] tracking-tight">Template Gallery</h2>
+              <div className="flex items-center gap-3 mb-1">
+                <div className="w-10 h-10 bg-emerald-50 border border-emerald-100 rounded-xl flex items-center justify-center">
+                  <Layers className="w-5 h-5 text-emerald-600" />
+                </div>
+                <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Template Gallery</h2>
+              </div>
               <p className="text-[13px] text-gray-500 mt-1 font-medium">Choose a template to start your campaign</p>
             </div>
 
@@ -200,7 +205,7 @@ const MobilePreview = ({ name, body, headerType, headerMediaUrl = '', footerText
   const previewName = name || 'Business Update';
 
   return (
-  <div className="relative w-full max-w-[240px] sm:max-w-[276px] aspect-[240/470] sm:aspect-[276/520] mx-auto bg-gradient-to-b from-[#0b1118] via-[#111b24] to-[#0b1118] rounded-[2.25rem] sm:rounded-[2.75rem] border-[7px] sm:border-[9px] border-[#0a0f14] shadow-[0_28px_48px_-16px_rgba(0,0,0,0.45)] overflow-hidden font-sans flex flex-col">
+  <div className="relative w-full max-w-[215px] sm:max-w-[245px] aspect-[245/500] mx-auto bg-gradient-to-b from-[#0b1118] via-[#111b24] to-[#0b1118] rounded-[2.25rem] sm:rounded-[2.75rem] border-[7px] sm:border-[9px] border-[#0a0f14] shadow-[0_28px_48px_-16px_rgba(0,0,0,0.45)] overflow-hidden font-sans flex flex-col">
     <div className="absolute inset-x-0 top-0 h-6 sm:h-7 bg-gradient-to-b from-black/40 to-transparent z-20 pointer-events-none" />
     <div className="absolute top-1.5 left-1/2 -translate-x-1/2 w-20 sm:w-24 h-4.5 sm:h-5 bg-black rounded-full z-30 border border-white/10" />
     <div className="h-full bg-[#e7ddd1] pt-7 sm:pt-8 relative flex flex-col">
