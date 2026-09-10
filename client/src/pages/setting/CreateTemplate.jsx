@@ -448,6 +448,28 @@ const CreateTemplate = () => {
           { type: 'FOOTER', code_expiration_minutes: Number(authExpirationMinutes) || 10 },
           { type: 'BUTTONS', buttons: [{ type: 'OTP', otp_type: 'COPY_CODE' }] }
         ];
+
+        const originalName = typeof templateData?.name === 'string' ? templateData.name : '';
+
+        // If editing existing Authentication template, update it instead of creating
+        if (isEditing && templateData?.id) {
+          console.log(`Updating existing Authentication template: ${originalName} (ID: ${templateData.id})`);
+          await updateWhatsAppTemplate(templateData.id, {
+            components: authComponents
+          });
+          const successMessage = 'Template updated successfully! Meta may take a moment to reflect the changes.';
+          navigate('/admin/templates/list', {
+            replace: true,
+            state: {
+              showSuccessToast: true,
+              toastMessage: successMessage,
+              isEditing: true,
+              templateName: originalName || waNameAuth
+            }
+          });
+          return;
+        }
+
         const authPayload = {
           name: waNameAuth,
           category: 'AUTHENTICATION',
@@ -455,15 +477,25 @@ const CreateTemplate = () => {
           components: authComponents
         };
         await createWhatsAppTemplate(authPayload);
+        const successMessage = 'Authentication OTP template created successfully!';
         navigate('/admin/templates/list', {
-          state: { showSuccessToast: true, toastMessage: 'Authentication OTP template created successfully!' }
+          replace: true,
+          state: {
+            showSuccessToast: true,
+            toastMessage: successMessage,
+            isEditing: false,
+            templateName: waNameAuth
+          }
         });
       } catch (error) {
+        const waError = error?.response?.data?.error || {};
+        const nestedWaError = waError?.error || {};
         const errMsg =
-          error?.response?.data?.error?.message ||
+          nestedWaError?.message ||
+          waError?.message ||
           error?.response?.data?.message ||
           error?.message ||
-          'Failed to create Authentication template. Please try again.';
+          (isEditing ? 'Failed to update Authentication template. Please try again.' : 'Failed to create Authentication template. Please try again.');
         toast.error(errMsg);
       } finally {
         setIsSubmitting(false);
@@ -738,18 +770,11 @@ const CreateTemplate = () => {
       
       const submitTemplate = async (payload) => {
         if (isEditing && templateData?.id) {
-          // Check if template is approved - WhatsApp doesn't allow editing approved templates
-          if (templateData?.status?.toUpperCase() === 'APPROVED') {
-            throw new Error(
-              'This template has been approved by Meta and cannot be edited. '
-              + 'To make changes, please duplicate this template to create a new version. '
-              + 'Once the new template is approved, you can use it for sending messages.'
-            );
-          }
           console.log(`Updating existing template: ${originalName} (ID: ${templateData.id})`);
-          return await updateWhatsAppTemplate(templateData.id, { 
-            components: payload.components,
-            category: payload.category
+          // Meta's API only accepts 'components' on update — sending 'category' causes "Invalid parameter"
+          // Note: editing an APPROVED template will revert it to PENDING for Meta re-review
+          return await updateWhatsAppTemplate(templateData.id, {
+            components: payload.components
           });
         }
         
@@ -823,12 +848,17 @@ const CreateTemplate = () => {
       }
       
       // Template saved/updated successfully
-      const successMessage = isEditing ? "Template updated successfully!" : "Template submitted successfully to WhatsApp!";
-      navigate('/admin/templates/list', { 
-        state: { 
-          showSuccessToast: true, 
-          toastMessage: successMessage 
-        } 
+      const successMessage = isEditing
+        ? 'Template updated successfully! Meta may take a moment to reflect the changes.'
+        : 'Template submitted to WhatsApp! Awaiting Meta\'s review.';
+      navigate('/admin/templates/list', {
+        replace: true,
+        state: {
+          showSuccessToast: true,
+          toastMessage: successMessage,
+          isEditing: Boolean(isEditing),
+          templateName: originalName || waName
+        }
       });
 
     } catch (error) {
@@ -853,19 +883,10 @@ const CreateTemplate = () => {
         error?.message ||
         "Failed to create template on WhatsApp. Please try again.";
       
-      // Handle specific user-facing errors (like approved template edit attempts)
+      // Handle specific user-facing errors
       if (!error?.response && (error?.code === 'ENOTFOUND' || error?.message?.includes('ENOTFOUND') || error?.message?.includes('getaddrinfo'))) {
         // Network error — server can't reach graph.facebook.com
         errorMessage = 'Cannot reach WhatsApp servers. Please check that the server has a working internet connection and try again.';
-        toast.error(errorMessage);
-      } else if (error?.message?.includes('This template has been approved by Meta')) {
-        errorMessage = 'Approved Template - Cannot Edit\n\n' +
-          'WhatsApp does not allow editing templates that have been approved by Meta. ' +
-          'To make changes:\n\n' +
-          '1. Duplicate this template to create a new version\n' +
-          '2. Make your changes in the new template\n' +
-          '3. Submit for Meta approval\n' +
-          '4. Once approved, use the new template for sending messages';
         toast.error(errorMessage);
       } else if (errorSubcode === 2388023) {
         errorMessage = `WhatsApp is currently deleting this template language variant. During this 30-day lock period, you cannot add English (US) back to the same name. Please use a new name now.`;
@@ -898,6 +919,9 @@ const CreateTemplate = () => {
             errorDetails.toLowerCase().includes('newline') || 
             errorDetails.toLowerCase().includes('consecutive')) {
           toast.error(errorDetails);
+        } else {
+          // If it's another formatting error, still show it!
+          toast.error(errorDetails || errorMessage || "Template format is invalid.");
         }
       } else {
         toast.error(errorMessage);
@@ -1773,14 +1797,14 @@ const CreateTemplate = () => {
 const MobilePreview = ({ name, body, footer, showImage = false, isLimited = false, isCatalog = false, isMpm = false, catalogButtonText = "", mpmButtonText = "", buttons = [], headerMedia = null, headerType = 'None', isSetupView = false }) => {
   if (isSetupView) {
     return (
-      <div className="relative w-[320px] h-[640px] bg-white rounded-[3rem] border-[14px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
+      <div className="relative w-[285px] h-[585px] bg-white rounded-[2.5rem] border-[12px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
         {/* Notch */}
-        <div className="absolute top-0 w-36 h-[28px] bg-[#1e293b] rounded-b-[20px] z-20 flex justify-center">
-           <div className="w-14 h-1.5 bg-white/20 rounded-full mt-2"></div>
+        <div className="absolute top-0 w-32 h-[24px] bg-[#1e293b] rounded-b-[18px] z-20 flex justify-center">
+           <div className="w-12 h-1.5 bg-white/20 rounded-full mt-1.5"></div>
         </div>
         
         {/* Screen Background */}
-        <div className="w-full h-full bg-[#e5ddd5] pt-14 pb-6 px-4 overflow-y-auto custom-scrollbar flex flex-col">
+        <div className="w-full h-full bg-[#e5ddd5] pt-12 pb-6 px-3.5 overflow-y-auto custom-scrollbar flex flex-col">
            {/* Message Bubble Card */}
            <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden mt-2 flex flex-col w-full shrink-0">
               
@@ -1821,14 +1845,14 @@ const MobilePreview = ({ name, body, footer, showImage = false, isLimited = fals
 
   // Dynamic preview for content phase
   return (
-    <div className="relative w-[320px] h-[640px] bg-white rounded-[3rem] border-[14px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
+    <div className="relative w-[285px] h-[585px] bg-white rounded-[2.5rem] border-[12px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
       {/* Notch */}
-      <div className="absolute top-0 w-36 h-[28px] bg-[#1e293b] rounded-b-[20px] z-20 flex justify-center">
-         <div className="w-14 h-1.5 bg-white/20 rounded-full mt-2"></div>
+      <div className="absolute top-0 w-32 h-[24px] bg-[#1e293b] rounded-b-[18px] z-20 flex justify-center">
+         <div className="w-12 h-1.5 bg-white/20 rounded-full mt-1.5"></div>
       </div>
       
       {/* Screen Background */}
-      <div className="w-full h-full bg-[#e5ddd5] pt-14 pb-6 px-4 overflow-y-auto custom-scrollbar flex flex-col">
+      <div className="w-full h-full bg-[#e5ddd5] pt-12 pb-6 px-3.5 overflow-y-auto custom-scrollbar flex flex-col">
          {/* Message Bubble Card */}
          <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden mt-2 flex flex-col w-full shrink-0">
             {showImage && (

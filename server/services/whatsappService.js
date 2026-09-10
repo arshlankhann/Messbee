@@ -10,18 +10,27 @@ const Setting = require('../models/Setting');
  * Handles all interactions with WhatsApp Cloud API
  */
 class WhatsAppService {
-  constructor() {
-    this.apiVersion = process.env.WHATSAPP_API_VERSION || 'v20.0';
-    this.phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-    this.accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
-    this.businessAccountId = (this.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID);
-    this.baseURL = `https://graph.facebook.com/${this.apiVersion}/${this.phoneNumberId}`;
-    
-    // Initial sync from DB
-    this.syncConfig();
-
-    // Log configuration on initialization
-
+  constructor(options = {}) {
+    if (options.tenantSpecific) {
+      this.apiVersion = options.apiVersion || process.env.WHATSAPP_API_VERSION || 'v20.0';
+      this.phoneNumberId = options.phoneNumberId;
+      this.accessToken = options.accessToken;
+      this.businessAccountId = options.businessAccountId;
+      this.baseURL = `https://graph.facebook.com/${this.apiVersion}/${this.phoneNumberId}`;
+      this.isTenantSpecific = true;
+      // Do not sync config for tenant-specific instances
+      this.syncConfig = async () => {}; 
+      this.validateConfig = () => true;
+    } else {
+      this.apiVersion = process.env.WHATSAPP_API_VERSION || 'v20.0';
+      this.phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+      this.accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+      this.businessAccountId = (this.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID);
+      this.baseURL = `https://graph.facebook.com/${this.apiVersion}/${this.phoneNumberId}`;
+      
+      // Initial sync from DB
+      this.syncConfig();
+    }
   }
 
   /**
@@ -41,6 +50,7 @@ class WhatsAppService {
         let setting = await Setting.findOne({ key: 'whatsapp_config' });
         
         if (!setting || !setting.value) {
+          // No DB config yet — seed from .env and save
           setting = setting || new Setting({ key: 'whatsapp_config', value: {} });
           setting.value = {
             apiVersion: process.env.WHATSAPP_API_VERSION,
@@ -51,6 +61,7 @@ class WhatsAppService {
           await setting.save();
         }
         
+        // ✅ DB values take priority — only fall back to .env if DB value is missing/empty
         this.apiVersion = setting.value.apiVersion || process.env.WHATSAPP_API_VERSION;
         this.phoneNumberId = setting.value.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
         this.accessToken = setting.value.accessToken || process.env.WHATSAPP_ACCESS_TOKEN;
@@ -61,7 +72,7 @@ class WhatsAppService {
         console.error('❌ Error syncing WhatsApp config from DB:', error.message);
       }
     }
-  
+
   /**
    * Validate configuration
    */
@@ -80,26 +91,10 @@ class WhatsAppService {
   /**
    * Normalize template language code used by Graph API.
    */
-  normalizeTemplateLanguage(languageCode = 'en_US') {
-    if (!languageCode) return 'en_US';
+  normalizeTemplateLanguage(languageCode = 'en') {
+    if (!languageCode) return 'en';
 
-    const normalized = String(languageCode).trim();
-    const map = {
-      en: 'en_US',
-      hi: 'hi_IN',
-      es: 'es_ES',
-      pt: 'pt_BR',
-      fr: 'fr_FR',
-      de: 'de_DE',
-      ar: 'ar_AR',
-      it: 'it_IT',
-      ja: 'ja_JP',
-      zh: 'zh_CN',
-      ko: 'ko_KR',
-      ru: 'ru_RU'
-    };
-
-    return map[normalized] || normalized;
+    return String(languageCode).trim();
   }
 
   /**
@@ -940,9 +935,35 @@ class WhatsAppService {
         return {
           contacts: message.contacts
         };
+      case 'interactive': {
+        const interactive = message.interactive;
+        if (interactive?.button_reply) {
+          return {
+            text: interactive.button_reply.id || interactive.button_reply.title,
+            buttonId: interactive.button_reply.id,
+            buttonTitle: interactive.button_reply.title
+          };
+        }
+        if (interactive?.list_reply) {
+          return {
+            text: interactive.list_reply.id || interactive.list_reply.title,
+            listId: interactive.list_reply.id,
+            listTitle: interactive.list_reply.title
+          };
+        }
+        return { text: 'Interactive selection' };
+      }
+      case 'button': {
+        const btn = message.button;
+        return {
+          text: btn?.payload || btn?.text || 'Button reply',
+          buttonPayload: btn?.payload,
+          buttonText: btn?.text
+        };
+      }
       default:
         return {
-          text: 'Unsupported message type'
+          text: message[message.type]?.body || message[message.type]?.text || 'Unsupported message type'
         };
     }
   }
@@ -967,7 +988,7 @@ class WhatsAppService {
 
       
       const response = await axios.get(
-        `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${(this.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID)}/message_templates`,
+        `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${this.businessAccountId}/message_templates`,
         {
           params: {
             fields: 'id,name,status,category,language,created_timestamp,rejected_reason,quality_score,components'
@@ -1006,7 +1027,6 @@ class WhatsAppService {
         components = []
       } = templateData;
 
-      const preparedComponents = components.map((component) => ({ ...component }));
       const sanitizeComponents = (inputComponents = []) =>
         inputComponents
           .map((component) => ({ ...component }))
@@ -1029,6 +1049,8 @@ class WhatsAppService {
             }
             return true;
           });
+
+      const preparedComponents = sanitizeComponents(components);
 
 
 
@@ -1186,7 +1208,8 @@ class WhatsAppService {
         name: templateName,
         category,
         language,
-        components: payloadComponents
+        components: payloadComponents,
+        allow_category_change: true
       });
 
       const generateSuggestedTemplateName = (baseName) => {
@@ -1204,9 +1227,12 @@ class WhatsAppService {
         try {
 
           
+          const payload = createTemplatePayload(templateName);
+          console.log('\n🚀 [Service] Sending Template Payload to Meta:\n', JSON.stringify(payload, null, 2));
+          
           const response = await axios.post(
-            `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${(this.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID)}/message_templates`,
-            createTemplatePayload(templateName),
+            `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${this.businessAccountId}/message_templates`,
+            payload,
             {
               headers: {
                 'Authorization': `Bearer ${this.accessToken}`,
@@ -1253,7 +1279,7 @@ class WhatsAppService {
 
       try {
         response = await axios.post(
-          `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${(this.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID)}/message_templates`,
+          `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${this.businessAccountId}/message_templates`,
           payload,
           {
             headers: {
@@ -1274,7 +1300,7 @@ class WhatsAppService {
             error: {
               message: `A template with the name "${name}" already exists. Please use a different name or edit the existing template.`,
               code: error.response?.data?.error?.code,
-              errorSubcode: isTemplateLanguageAlreadyExists,
+              errorSubcode: 2388024,
               title: 'Template Already Exists',
               originalTemplateName: name
             }
@@ -1305,16 +1331,15 @@ class WhatsAppService {
           console.warn('⚠️  Could not fetch rejected reason for created template:', detailsError.message);
         }
 
+        // Even though it's rejected, the template WAS successfully created on Meta.
+        // We return success: true so the frontend navigates and saves it locally.
         return {
-          success: false,
-          error: {
-            message: `Template was created but immediately rejected by WhatsApp (${rejectedReason}).`,
-            rejectedReason,
-            templateId: response.data?.id,
-            templateName: createdName,
-            usedFallbackName,
-            originalTemplateName: name
-          }
+          success: true,
+          data: response.data,
+          templateName: createdName,
+          usedFallbackName,
+          originalTemplateName: name,
+          warning: `Template was created but immediately rejected by WhatsApp (${rejectedReason}).`
         };
       }
 
@@ -1461,8 +1486,37 @@ class WhatsAppService {
       await this.syncConfig();
 
       // Correct endpoint: DELETE /{WABA-ID}/message_templates?name={template_name}
+      const apiVersion = this.apiVersion || process.env.WHATSAPP_API_VERSION || 'v20.0';
+      let wabaId = this.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
+
+      if (!wabaId && this.phoneNumberId) {
+        try {
+          const phoneRes = await axios.get(
+            `https://graph.facebook.com/${apiVersion}/${this.phoneNumberId}?fields=whatsapp_business_account`,
+            { headers: { 'Authorization': `Bearer ${this.accessToken}` } }
+          );
+          wabaId = phoneRes.data?.whatsapp_business_account?.id;
+          if (wabaId) {
+            this.businessAccountId = wabaId;
+          }
+        } catch (phoneErr) {
+          console.warn('⚠️ [Service] Could not resolve WABA ID from phone number:', phoneErr.message);
+        }
+      }
+
+      if (!wabaId) {
+        throw new Error('WhatsApp Business Account ID (WABA ID) is required to delete a template');
+      }
+
+      console.log('🗑️ [Service] Deleting template from WhatsApp:', {
+        templateId,
+        templateName,
+        wabaId,
+        apiVersion
+      });
+
       const response = await axios.delete(
-        `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${(this.businessAccountId || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID)}/message_templates`,
+        `https://graph.facebook.com/${apiVersion}/${wabaId}/message_templates`,
         {
           params: {
             name: templateName

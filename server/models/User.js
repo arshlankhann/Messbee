@@ -76,6 +76,49 @@ const UserSchema = new mongoose.Schema({
   country: {
     type: String
   },
+  address: {
+    type: String
+  },
+  zipcode: {
+    type: String
+  },
+  currency: {
+    type: String,
+    default: 'INR'
+  },
+  businessDescription: {
+    type: String
+  },
+  billingName: {
+    type: String
+  },
+  billingAddress: {
+    type: String
+  },
+  billingCountry: {
+    type: String
+  },
+  billingState: {
+    type: String
+  },
+  billingCity: {
+    type: String
+  },
+  billingZipcode: {
+    type: String
+  },
+  mobileNumber: {
+    type: String
+  },
+  emailId: {
+    type: String
+  },
+  taxType: {
+    type: String
+  },
+  billingTaxId: {
+    type: String
+  },
   gst: {
     type: String
   },
@@ -109,7 +152,7 @@ const UserSchema = new mongoose.Schema({
   },
   subscriptionPlan: {
     type: String,
-    enum: ['free', 'basic', 'professional', 'premium', 'enterprise', 'custom'],
+    enum: ['free', 'basic', 'growth', 'professional', 'corporate', 'enterprise', 'premium', 'custom'],
     default: 'free'
   },
   planName: {
@@ -121,7 +164,8 @@ const UserSchema = new mongoose.Schema({
     default: 0
   },
   subscriptionEndDate: {
-    type: Date
+    type: Date,
+    default: () => new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
   },
   timezone: {
     type: String,

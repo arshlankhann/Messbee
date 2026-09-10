@@ -65,16 +65,22 @@ const Context = (props) => {
           setIsLoggedIn(false);
         }
       } catch (error) {
-        // API call failed (401/network error) - user not authenticated
-        // Check if account is pending approval (403 with pendingApproval)
-        if (error?.response?.status === 403 && error?.response?.data?.pendingApproval) {
-          console.log("Account pending admin approval — logging out");
+        // Only clear auth data on definitive auth failures (401 or 403 pending approval)
+        const isAuthFailure = error?.response?.status === 401 ||
+          (error?.response?.status === 403 && error?.response?.data?.pendingApproval);
+
+        if (isAuthFailure) {
+          if (error?.response?.status === 403 && error?.response?.data?.pendingApproval) {
+            console.log("Account pending admin approval — logging out");
+          } else {
+            console.log("No active session");
+          }
+          clearAuthData();
+          setUser(null);
+          setIsLoggedIn(false);
         } else {
-          console.log("No active session");
+          console.warn("Session verification encountered non-auth error:", error?.message);
         }
-        clearAuthData();
-        setUser(null);
-        setIsLoggedIn(false);
       } finally {
         setAuthChecked(true);
       }
@@ -99,8 +105,15 @@ const Context = (props) => {
 
   // Update user data
   const updateUser = (userData) => {
-    setUser(userData);
-    localStorage.setItem("user", JSON.stringify(userData));
+    setUser(prev => {
+      const merged = { ...prev, ...userData };
+      // Ensure tenantWhatsAppConnected is preserved if not explicitly present in update response
+      if (prev?.tenantWhatsAppConnected !== undefined && merged.tenantWhatsAppConnected === undefined) {
+        merged.tenantWhatsAppConnected = prev.tenantWhatsAppConnected;
+      }
+      localStorage.setItem("user", JSON.stringify(merged));
+      return merged;
+    });
   };
 
   // Re-fetch latest user data from server (call after actions like plan upgrade)

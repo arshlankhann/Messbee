@@ -2,7 +2,7 @@ const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Campaign = require('../models/Campaign');
 const Chat = require('../models/Chat');
-const whatsappService = require('./whatsappService');
+const { getTenantWhatsAppService } = require('../controllers/whatsappController');
 const { normalizePhoneNumber } = require('../utils/phoneHelper');
 const { getIO } = require('../config/socket');
 
@@ -14,7 +14,7 @@ const resolveContactPhone = (contact) => {
   return normalizePhoneNumber(rawPhone);
 };
 
-const buildTemplateComponents = (template, contact, campaign) => {
+const buildTemplateComponents = (template, contact, campaign, tenantWhatsAppService) => {
   const components = [];
 
   const templateComponents = Array.isArray(template?.components) ? template.components : [];
@@ -51,7 +51,7 @@ const buildTemplateComponents = (template, contact, campaign) => {
   }
 
   // Add Body Component
-  const bodyParamCount = whatsappService.getBodyTemplateParamCount(template);
+  const bodyParamCount = tenantWhatsAppService.getBodyTemplateParamCount(template);
   if (bodyParamCount > 0) {
     const fallbackValue = contact?.name || campaign?.name || 'there';
     components.push({
@@ -74,6 +74,7 @@ const findOrCreateChatForContact = async (contact) => {
   }
 
   let chat = await Chat.findOne({
+    user: contact.user,
     $or: [{ phone: normalizedPhone }, { whatsappId: normalizedPhone }]
   });
 
@@ -90,7 +91,8 @@ const findOrCreateChatForContact = async (contact) => {
       unread: 0,
       lastMsg: '',
       lastMsgTime: '',
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      user: contact.user
     });
   }
 
@@ -107,6 +109,11 @@ exports.sendMessageToContact = async (userId, contactId, messageData) => {
     if (!contact) {
       throw new Error('Contact not found');
     }
+    
+    const tenantWhatsAppService = await getTenantWhatsAppService(userId);
+    if (!tenantWhatsAppService) {
+      throw new Error('WhatsApp is not connected for this account.');
+    }
 
     const { chat, normalizedPhone } = await findOrCreateChatForContact(contact);
     const text = messageData?.content || '';
@@ -118,7 +125,7 @@ exports.sendMessageToContact = async (userId, contactId, messageData) => {
     let error;
 
     if (messageType === 'text' && text.trim()) {
-      const result = await whatsappService.sendTextMessage(normalizedPhone, text);
+      const result = await tenantWhatsAppService.sendTextMessage(normalizedPhone, text);
       if (result.success) {
         whatsappMessageId = result.messageId;
       } else {
@@ -161,6 +168,11 @@ exports.sendBulkMessages = async (userId, campaignId, contacts, messageTemplate)
     if (!campaign) {
       throw new Error('Campaign not found');
     }
+    
+    const tenantWhatsAppService = await getTenantWhatsAppService(userId);
+    if (!tenantWhatsAppService) {
+      throw new Error('WhatsApp is not connected for this account.');
+    }
 
     const messages = [];
     let sentCount = 0;
@@ -172,16 +184,34 @@ exports.sendBulkMessages = async (userId, campaignId, contacts, messageTemplate)
       throw new Error('Campaign template name is required');
     }
 
+    let metaTemplateName = templateName;
+    try {
+      const Template = require('../models/Template');
+      const dbTpl = await Template.findOne({
+        $or: [
+          { user: campaign.user },
+          { tenantId: campaign.tenantId || campaign.user }
+        ],
+        $or: [
+          { name: templateName },
+          { whatsappTemplateName: templateName }
+        ]
+      });
+      if (dbTpl && dbTpl.whatsappTemplateName) {
+        metaTemplateName = dbTpl.whatsappTemplateName;
+      }
+    } catch (_) {}
+
     for (const contact of contacts) {
       try {
         const { chat, normalizedPhone } = await findOrCreateChatForContact(contact);
-        const template = await whatsappService.findTemplate(templateName, templateLanguage);
-        const components = buildTemplateComponents(template, contact, campaign);
+        const template = await tenantWhatsAppService.findTemplate(metaTemplateName, templateLanguage);
+        const components = buildTemplateComponents(template, contact, campaign, tenantWhatsAppService);
         const msgTime = formatMessageTime();
 
-        const sendResult = await whatsappService.sendTemplateMessage(
+        const sendResult = await tenantWhatsAppService.sendTemplateMessage(
           normalizedPhone,
-          templateName,
+          metaTemplateName,
           templateLanguage,
           components
         );

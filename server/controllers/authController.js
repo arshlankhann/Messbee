@@ -12,19 +12,21 @@ const crypto = require('crypto');
 const setTokenCookies = (res, accessToken, refreshToken) => {
   const isProduction = process.env.NODE_ENV === 'production';
   
-  // Access Token Cookie (24 hours)
-  res.cookie('accessToken', accessToken, {
+  const cookieOptions = {
     httpOnly: true,
-    secure: true, // Always true for cross-origin cookies
-    sameSite: 'none', // Required for cross-origin requests
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
     maxAge: 24 * 60 * 60 * 1000 // 24 hours
-  });
+  };
+
+  if (process.env.COOKIE_DOMAIN) {
+    cookieOptions.domain = process.env.COOKIE_DOMAIN;
+  }
+
+  res.cookie('accessToken', accessToken, cookieOptions);
   
-  // Refresh Token Cookie (7 days)
   res.cookie('refreshToken', refreshToken, {
-    httpOnly: true,
-    secure: true, // Always true for cross-origin cookies
-    sameSite: 'none', // Required for cross-origin requests
+    ...cookieOptions,
     maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
   });
 };
@@ -33,19 +35,20 @@ const setTokenCookies = (res, accessToken, refreshToken) => {
  * Clear JWT cookies
  */
 const clearTokenCookies = (res) => {
-  res.cookie('accessToken', '', {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const cookieOptions = {
     httpOnly: true,
-    secure: true,
-    sameSite: 'none',
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
     expires: new Date(0)
-  });
-  
-  res.cookie('refreshToken', '', {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    expires: new Date(0)
-  });
+  };
+
+  if (process.env.COOKIE_DOMAIN) {
+    cookieOptions.domain = process.env.COOKIE_DOMAIN;
+  }
+
+  res.cookie('accessToken', '', cookieOptions);
+  res.cookie('refreshToken', '', cookieOptions);
 };
 
 // ==================== SIGNUP FLOW ====================
@@ -395,6 +398,9 @@ exports.verifyLoginOTP = async (req, res, next) => {
     user.refreshToken = refreshToken;
     await user.save();
 
+    // Set tokens as HTTP-only cookies
+    setTokenCookies(res, accessToken, refreshToken);
+
         // Calculate WhatsApp connection status on login
         let tenantWhatsAppConnected = false;
         let whatsappConfig = user.whatsappConfig;
@@ -420,7 +426,15 @@ exports.verifyLoginOTP = async (req, res, next) => {
             accessToken,
             refreshToken
           },
+          accessToken,
+          refreshToken,
           data: {
+            tokens: {
+              accessToken,
+              refreshToken
+            },
+            accessToken,
+            refreshToken,
             user: {
               id: user._id,
               name: user.name,
@@ -430,6 +444,8 @@ exports.verifyLoginOTP = async (req, res, next) => {
               phone: user.phone,
               company: user.company,
               subscriptionPlan: user.subscriptionPlan,
+              credits: user.credits,
+              subscriptionEndDate: user.subscriptionEndDate,
               lastLogin: user.lastLogin,
               whatsappConfig: whatsappConfig,
               tenantWhatsAppConnected: tenantWhatsAppConnected
@@ -525,14 +541,27 @@ exports.login = async (req, res, next) => {
         accessToken,
         refreshToken
       },
+      accessToken,
+      refreshToken,
       data: {
+        tokens: {
+          accessToken,
+          refreshToken
+        },
+        accessToken,
+        refreshToken,
         user: {
           id: user._id,
           name: user.name,
           email: user.email,
           role: user.role,
           avatar: user.avatar,
-          subscriptionPlan: user.subscriptionPlan, credits: user.credits, subscriptionEndDate: user.subscriptionEndDate,
+          phone: user.phone,
+          company: user.company,
+          subscriptionPlan: user.subscriptionPlan,
+          credits: user.credits,
+          subscriptionEndDate: user.subscriptionEndDate,
+          lastLogin: user.lastLogin,
           whatsappConfig: whatsappConfig,
           tenantWhatsAppConnected: tenantWhatsAppConnected
         }
@@ -604,6 +633,16 @@ exports.refreshToken = async (req, res, next) => {
       success: true,
       message: 'Token refreshed successfully',
       tokens: {
+        accessToken: newAccessToken,
+        refreshToken: newRefreshToken
+      },
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
+      data: {
+        tokens: {
+          accessToken: newAccessToken,
+          refreshToken: newRefreshToken
+        },
         accessToken: newAccessToken,
         refreshToken: newRefreshToken
       }
@@ -890,10 +929,27 @@ exports.getMe = async (req, res, next) => {
 
       console.log(`[DEBUG getMe] User: ${user.email}, Role: ${user.role}, tenantId: ${tenantId}, channelFound: ${!!channel}, tenantWhatsAppConnected: ${user.tenantWhatsAppConnected}`);
 
+      // Ensure free plan has subscriptionEndDate (30 days from creation)
+      if ((!user.subscriptionPlan || user.subscriptionPlan.toLowerCase() === 'free') && !user.subscriptionEndDate) {
+        const computedEnd = new Date(new Date(user.createdAt || Date.now()).getTime() + 30 * 24 * 60 * 60 * 1000);
+        await User.findByIdAndUpdate(user._id, { subscriptionEndDate: computedEnd });
+        user.subscriptionEndDate = computedEnd;
+      }
+
       // Fix for Employee/Agent Lockout: Give them a mock wabaId if the Admin connected it
       if (user.tenantWhatsAppConnected) {
         if (!user.whatsappConfig) user.whatsappConfig = {};
         user.whatsappConfig.wabaId = user.whatsappConfig.wabaId || channel?.metadata?.wabaId || 'tenant-connected';
+        if (channel?.activeWhatsappPhoneNumberId && !user.whatsappConfig.phoneNumberId) {
+          user.whatsappConfig.phoneNumberId = channel.activeWhatsappPhoneNumberId;
+        }
+        // Fallback businessName and phone from channel if missing on user
+        if (!user.businessName && channel?.name && channel.name !== 'WhatsApp Business' && channel.name !== 'Default WhatsApp Channel') {
+          user.businessName = channel.name;
+        }
+        if (!user.phoneNumber && channel?.phoneNumber) {
+          user.phoneNumber = channel.phoneNumber;
+        }
       }
     }
 
@@ -1053,16 +1109,29 @@ exports.facebookLogin = async (req, res, next) => {
         accessToken: token,
         refreshToken
       },
+      accessToken: token,
+      refreshToken,
       data: {
+        tokens: {
+          accessToken: token,
+          refreshToken
+        },
+        accessToken: token,
+        refreshToken,
         user: {
           id: user._id,
           name: user.name,
           email: user.email,
           role: user.role,
           avatar: user.avatar,
+          phone: user.phone,
+          company: user.company,
+          businessName: user.businessName,
           subscriptionPlan: user.subscriptionPlan,
           credits: user.credits,
-          subscriptionEndDate: user.subscriptionEndDate
+          subscriptionEndDate: user.subscriptionEndDate,
+          lastLogin: user.lastLogin,
+          whatsappConfig: user.whatsappConfig
         }
       }
     });
@@ -1093,21 +1162,51 @@ exports.socialLogin = async (req, res, next) => {
 
     try {
       switch (login_type.toLowerCase()) {
-        case 'google':
+        case 'google': {
+          let googleData = null;
+          // 1. Try as Google ID Token (JWT)
           try {
-            response = await axios.get(`https://oauth2.googleapis.com/tokeninfo?id_token=${accessToken}`);
+            const tokenInfo = await axios.get(`https://oauth2.googleapis.com/tokeninfo?id_token=${accessToken}`);
             // Security: Verify audience matches our Client ID to prevent cross-client token forgery
-            if (process.env.GOOGLE_CLIENT_ID && response.data.aud !== process.env.GOOGLE_CLIENT_ID) {
+            if (process.env.GOOGLE_CLIENT_ID && tokenInfo.data.aud !== process.env.GOOGLE_CLIENT_ID) {
               return res.status(401).json({ success: false, message: 'Invalid Google Client ID (Audience mismatch)' });
             }
-            regdata = { id: response.data.sub, name: response.data.name, email: response.data.email, picture: response.data.picture };
-          } catch (err) {
-            response = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
-              headers: { Authorization: `Bearer ${accessToken}` }
-            });
-            regdata = { id: response.data.sub, name: response.data.name, email: response.data.email, picture: response.data.picture };
+            googleData = {
+              id: tokenInfo.data.sub,
+              name: tokenInfo.data.name,
+              email: tokenInfo.data.email,
+              picture: tokenInfo.data.picture
+            };
+          } catch (idErr) {
+            // 2. Try as Google OAuth2 Access Token
+            try {
+              const userInfo = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { Authorization: `Bearer ${accessToken}` }
+              });
+              // Verify client ID if tokeninfo is available for access token
+              if (process.env.GOOGLE_CLIENT_ID) {
+                try {
+                  const accessInfo = await axios.get(`https://oauth2.googleapis.com/tokeninfo?access_token=${accessToken}`);
+                  if (accessInfo.data.aud && accessInfo.data.aud !== process.env.GOOGLE_CLIENT_ID && accessInfo.data.azp !== process.env.GOOGLE_CLIENT_ID) {
+                    return res.status(401).json({ success: false, message: 'Invalid Google Client ID (Audience mismatch)' });
+                  }
+                } catch (audErr) {
+                  // If access_token check fails, userinfo is still validated by Google
+                }
+              }
+              googleData = {
+                id: userInfo.data.sub,
+                name: userInfo.data.name,
+                email: userInfo.data.email,
+                picture: userInfo.data.picture
+              };
+            } catch (accessErr) {
+              throw accessErr;
+            }
           }
+          regdata = googleData;
           break;
+        }
         case 'facebook':
           response = await axios.get(`https://graph.facebook.com/me?fields=id,name,email,picture&access_token=${accessToken}`);
           regdata = { id: response.data.id, name: response.data.name, email: response.data.email, picture: response.data.picture?.data?.url };
@@ -1120,24 +1219,27 @@ exports.socialLogin = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid social token' });
     }
 
-    if (!regdata.email) {
-      if (login_type.toLowerCase() === 'facebook' && regdata.id) {
+    if (!regdata || !regdata.email) {
+      if (login_type.toLowerCase() === 'facebook' && regdata?.id) {
         regdata.email = `${regdata.id}@facebook.com`;
       } else {
         return res.status(400).json({ success: false, message: 'Social account must have an email attached' });
       }
     }
 
+    const defaultName = regdata.name || (login_type.toLowerCase() === 'google' ? 'Google User' : 'Facebook User');
     const updatePayload = {
       $setOnInsert: {
-        name: regdata.name || 'Facebook User',
+        name: defaultName,
         email: regdata.email,
-        password: null, // As requested, explicitly set to null
-        authProvider: login_type,
+        password: null, // Explicitly null for social auth
+        authProvider: login_type.toLowerCase(),
         avatar: regdata.picture,
         isEmailVerified: true,
         isApproved: true, // Auto-approve social logins
-        role: 'AGENT'
+        role: 'ADMIN', // New signups are admins/owners of their workspace
+        subscriptionPlan: 'free',
+        planName: 'Standard'
       },
       $set: {}
     };
@@ -1169,12 +1271,24 @@ exports.socialLogin = async (req, res, next) => {
     // rawResult.lastErrorObject.updatedExisting tells us if a new document was inserted
     if (!result.lastErrorObject.updatedExisting) {
       isNewUser = true;
+      if (!user.tenantId) {
+        user.tenantId = user._id;
+      }
     } else {
       // Existing user checks
       if (!user.isActive) {
         return res.status(403).json({ success: false, message: 'Account is deactivated' });
       }
-      // Admin approval no longer blocks login, check removed
+      if (!user.tenantId) {
+        user.tenantId = user._id;
+      }
+      // If user had generic fallback name and Facebook/Google now provides actual name
+      if (regdata.name && (!user.name || user.name === 'Facebook User' || user.name === 'Google User' || user.name === 'User')) {
+        user.name = regdata.name;
+      }
+      if (regdata.picture && !user.avatar) {
+        user.avatar = regdata.picture;
+      }
     }
 
     // Generate tokens for login
@@ -1187,6 +1301,24 @@ exports.socialLogin = async (req, res, next) => {
 
     setTokenCookies(res, token, refreshToken);
 
+    // Calculate WhatsApp connection status on social login
+    let tenantWhatsAppConnected = false;
+    let whatsappConfig = user.whatsappConfig;
+    
+    try {
+      const Channel = require('../models/Channel');
+      const tenantId = user.tenantId || user._id;
+      const channel = await Channel.findOne({ tenantId, activeWhatsappPhoneNumberId: { $exists: true, $ne: null }, status: { $ne: 'disconnected' } });
+      tenantWhatsAppConnected = !!channel;
+
+      if (tenantWhatsAppConnected) {
+        if (!whatsappConfig) whatsappConfig = {};
+        whatsappConfig.wabaId = whatsappConfig.wabaId || channel?.metadata?.wabaId || 'tenant-connected';
+      }
+    } catch(e) {
+      console.error("Error checking WhatsApp status on social login", e);
+    }
+
     res.status(isNewUser ? 201 : 200).json({
       success: true,
       message: 'Login successful',
@@ -1195,7 +1327,15 @@ exports.socialLogin = async (req, res, next) => {
         accessToken: token,
         refreshToken
       },
+      accessToken: token,
+      refreshToken,
       data: {
+        tokens: {
+          accessToken: token,
+          refreshToken
+        },
+        accessToken: token,
+        refreshToken,
         user: {
           id: user._id,
           name: user.name,
@@ -1203,11 +1343,14 @@ exports.socialLogin = async (req, res, next) => {
           role: user.role,
           avatar: user.avatar,
           phone: user.phone,
-          schoolName: user.schoolName,
           company: user.company,
+          businessName: user.businessName,
           subscriptionPlan: user.subscriptionPlan,
           credits: user.credits,
-          subscriptionEndDate: user.subscriptionEndDate
+          subscriptionEndDate: user.subscriptionEndDate,
+          lastLogin: user.lastLogin,
+          whatsappConfig: whatsappConfig,
+          tenantWhatsAppConnected: tenantWhatsAppConnected
         }
       }
     });

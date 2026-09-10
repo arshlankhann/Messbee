@@ -12,10 +12,22 @@ const emailService = require('../services/emailService');
 exports.getProfile = async (req, res, next) => {
   try {
     const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const Channel = require('../models/Channel');
+    const tenantId = user.tenantId || user._id;
+    const channel = await Channel.findOne({ 
+      tenantId, 
+      activeWhatsappPhoneNumberId: { $exists: true, $ne: null }, 
+      status: { $ne: 'disconnected' } 
+    });
+
+    const userObj = user.toObject();
+    userObj.tenantWhatsAppConnected = !!channel;
 
     res.status(200).json({
       success: true,
-      data: user
+      data: userObj
     });
   } catch (error) {
     next(error);
@@ -70,7 +82,7 @@ exports.getAccountLimits = async (req, res, next) => {
           webhooks: { active: limits.features?.webhook || false, count: limits.features?.webhook ? 2 : 0 },
         },
         commerceHub: {
-          available: ['professional', 'enterprise'].includes(userPlan)
+          available: limits.features?.commerce || false
         }
       }
     });
@@ -123,6 +135,20 @@ exports.createUser = async (req, res, next) => {
 
     const tenantId = req.user.tenantId || req.user.id;
 
+    // Check plan limits for agents / team members
+    const adminUser = await User.findById(tenantId);
+    const userPlan = (adminUser?.subscriptionPlan || 'free').toLowerCase();
+    const agentLimit = PLAN_LIMITS[userPlan]?.agents ?? PLAN_LIMITS.free.agents;
+    const currentAgentCount = await User.countDocuments({
+      $or: [{ tenantId: tenantId }, { _id: tenantId }]
+    });
+    if (agentLimit !== -1 && currentAgentCount >= agentLimit) {
+      return res.status(403).json({
+        success: false,
+        message: `Your current plan (${userPlan}) allows up to ${agentLimit} team member${agentLimit === 1 ? '' : 's'}. Please upgrade your plan to add more team members.`
+      });
+    }
+
     const user = await User.create({
       name,
       email,
@@ -145,6 +171,12 @@ exports.createUser = async (req, res, next) => {
     } catch (emailErr) {
       console.error('Failed to send invite email:', emailErr);
     }
+
+    try {
+      const { getIO } = require('../config/socket');
+      const io = getIO();
+      if (io) io.emit('user_created', { user });
+    } catch (_) {}
 
     res.status(201).json({
       success: true,
@@ -266,7 +298,13 @@ exports.updateProfile = async (req, res, next) => {
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
     const fieldsToUpdate = {};
-    const allowed = ['name', 'email', 'phone', 'businessName', 'businessCategory', 'businessType', 'city', 'state', 'country', 'company', 'avatar', 'timezone', 'language', 'isPhoneVerified', 'credits'];
+    const allowed = [
+      'name', 'email', 'phone', 'businessName', 'businessCategory', 'businessType',
+      'city', 'state', 'country', 'address', 'zipcode', 'currency', 'businessDescription',
+      'billingName', 'billingAddress', 'billingCountry', 'billingState', 'billingCity',
+      'billingZipcode', 'mobileNumber', 'emailId', 'taxType', 'billingTaxId', 'gst',
+      'website', 'company', 'avatar', 'timezone', 'language', 'isPhoneVerified', 'credits'
+    ];
     
     allowed.forEach(key => {
       if (req.body[key] !== undefined) {
@@ -291,9 +329,20 @@ exports.updateProfile = async (req, res, next) => {
       }
     );
 
+    const Channel = require('../models/Channel');
+    const tenantId = updatedUser.tenantId || updatedUser._id;
+    const channel = await Channel.findOne({ 
+      tenantId, 
+      activeWhatsappPhoneNumberId: { $exists: true, $ne: null }, 
+      status: { $ne: 'disconnected' } 
+    });
+
+    const userObj = updatedUser.toObject();
+    userObj.tenantWhatsAppConnected = !!channel;
+
     res.status(200).json({
       success: true,
-      data: updatedUser
+      data: userObj
     });
   } catch (error) {
     next(error);
@@ -320,11 +369,22 @@ exports.uploadAvatar = async (req, res, next) => {
       { new: true }
     );
 
+    const Channel = require('../models/Channel');
+    const tenantId = user.tenantId || user._id;
+    const channel = await Channel.findOne({ 
+      tenantId, 
+      activeWhatsappPhoneNumberId: { $exists: true, $ne: null }, 
+      status: { $ne: 'disconnected' } 
+    });
+
+    const userObj = user.toObject();
+    userObj.tenantWhatsAppConnected = !!channel;
+
     res.status(200).json({
       success: true,
       data: {
         avatar: avatarUrl,
-        user
+        user: userObj
       }
     });
   } catch (error) {
@@ -337,11 +397,31 @@ exports.uploadAvatar = async (req, res, next) => {
 // @access  Private
 exports.updateSubscription = async (req, res, next) => {
   try {
-    const { subscriptionPlan, subscriptionEndDate } = req.body;
+    let { subscriptionPlan, subscriptionEndDate } = req.body;
+
+    if (!subscriptionPlan) {
+      return res.status(400).json({ success: false, message: 'subscriptionPlan is required' });
+    }
+
+    const normalizedPlan = subscriptionPlan.toLowerCase();
+
+    // Paid plan upgrades must always go through the verified payment gateway (Razorpay).
+    if (normalizedPlan !== 'free') {
+      return res.status(403).json({
+        success: false,
+        message: 'Upgrades to paid plans must be completed through secure checkout'
+      });
+    }
+
+    if (!subscriptionEndDate) {
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + 30);
+      subscriptionEndDate = futureDate;
+    }
 
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { $set: { subscriptionPlan, subscriptionEndDate } },
+      { $set: { subscriptionPlan: normalizedPlan, subscriptionEndDate } },
       { new: true, runValidators: true }
     );
 
@@ -396,6 +476,69 @@ exports.approveUser = async (req, res, next) => {
       success: true,
       message: `User ${user.name} has been approved successfully.`,
       data: user
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Submit Contact Sales / Enterprise inquiry
+// @route   POST /api/users/contact-sales
+// @access  Private
+exports.contactSales = async (req, res, next) => {
+  try {
+    const {
+      fullName,
+      email,
+      phone,
+      company,
+      companySize,
+      messageVolume,
+      agentsNeeded,
+      selectedFeatures,
+      message,
+      inquiryId
+    } = req.body;
+
+    const Notification = require('../models/Notification');
+
+    // Create notification for user/system
+    try {
+      await Notification.create({
+        userId: req.user.id,
+        type: 'lead',
+        title: `Sales Inquiry: ${company || fullName}`,
+        message: `${fullName} (${email}) requested corporate sales consultation. Company size: ${companySize || 'N/A'}, Expected Volume: ${messageVolume || 'N/A'}.`,
+        meta: [
+          { label: 'Inquiry ID', value: String(inquiryId || 'N/A') },
+          { label: 'Company', value: String(company || 'N/A') },
+          { label: 'Phone', value: String(phone || 'N/A') },
+          { label: 'Agents Needed', value: String(agentsNeeded || 'N/A') }
+        ],
+        data: {
+          fullName,
+          email,
+          phone,
+          company,
+          companySize,
+          messageVolume,
+          agentsNeeded,
+          selectedFeatures,
+          message,
+          inquiryId
+        }
+      });
+    } catch (notifErr) {
+      console.warn('Could not create notification for sales inquiry:', notifErr.message);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Inquiry received successfully. Our sales team will reach out shortly.',
+      data: {
+        inquiryId,
+        submittedAt: new Date()
+      }
     });
   } catch (error) {
     next(error);

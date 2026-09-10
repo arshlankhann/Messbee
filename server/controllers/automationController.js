@@ -1,5 +1,7 @@
 const Automation = require('../models/Automation');
 const CustomerSession = require('../models/CustomerSession');
+const User = require('../models/User');
+const { PLAN_LIMITS } = require('../utils/planLimits');
 const whatsappService = require('../services/whatsappService');
 const automationService = require('../services/automationService');
 
@@ -59,6 +61,27 @@ exports.getAutomationById = async (req, res, next) => {
 exports.createAutomation = async (req, res, next) => {
   try {
     const tenantId = req.user.tenantId || req.user._id;
+
+    // Plan limits check
+    const user = await User.findById(tenantId);
+    const userPlan = (user?.subscriptionPlan || 'free').toLowerCase();
+    const limits = PLAN_LIMITS[userPlan] || PLAN_LIMITS.free;
+
+    if (limits.chatbots !== -1) {
+      const count = await Automation.countDocuments({ tenantId });
+      if (count >= limits.chatbots) {
+        return res.status(403).json({
+          message: `Your current plan (${userPlan}) allows up to ${limits.chatbots} automation/chatbot. Please upgrade to create more.`
+        });
+      }
+    }
+
+    if (req.body.nodes && limits.chatbotNodes !== -1 && req.body.nodes.length > limits.chatbotNodes) {
+      return res.status(403).json({
+        message: `Your current plan (${userPlan}) allows up to ${limits.chatbotNodes} nodes per automation. Please upgrade your plan.`
+      });
+    }
+
     const existing = await Automation.findOne({ tenantId, name: req.body.name });
     if (existing) {
       return res.status(400).json({ message: `An automation with the name "${req.body.name}" already exists.` });
@@ -67,6 +90,13 @@ exports.createAutomation = async (req, res, next) => {
     const automationData = { ...req.body, tenantId };
     const newAutomation = new Automation(automationData);
     const savedAutomation = await newAutomation.save();
+
+    try {
+      const { getIO } = require('../config/socket');
+      const io = getIO();
+      if (io) io.emit('automation_updated', { tenantId, automation: savedAutomation });
+    } catch (_) {}
+
     res.status(201).json(savedAutomation);
   } catch (error) {
     next(error);
@@ -91,6 +121,13 @@ exports.updateAutomation = async (req, res, next) => {
     if (!updatedAutomation) {
       return res.status(404).json({ message: 'Automation not found' });
     }
+
+    try {
+      const { getIO } = require('../config/socket');
+      const io = getIO();
+      if (io) io.emit('automation_updated', { tenantId, automation: updatedAutomation });
+    } catch (_) {}
+
     res.status(200).json(updatedAutomation);
   } catch (error) {
     next(error);
@@ -104,6 +141,13 @@ exports.deleteAutomation = async (req, res, next) => {
     if (!deletedAutomation) {
       return res.status(404).json({ message: 'Automation not found' });
     }
+
+    try {
+      const { getIO } = require('../config/socket');
+      const io = getIO();
+      if (io) io.emit('automation_updated', { tenantId, deletedId: req.params.id });
+    } catch (_) {}
+
     res.status(200).json({ message: 'Automation deleted successfully' });
   } catch (error) {
     next(error);
