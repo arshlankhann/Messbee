@@ -19,6 +19,9 @@ const UserSchema = new mongoose.Schema({
   googleId: {
     type: String
   },
+  linkedinId: {
+    type: String
+  },
   email: {
     type: String,
     required: [true, 'Please add an email'],
@@ -162,6 +165,70 @@ const UserSchema = new mongoose.Schema({
   credits: {
     type: Number,
     default: 0
+  },
+  reservedCredits: {
+    type: Number,
+    default: 0
+  },
+  // WhatsApp Meta messaging limit tier (e.g., '2,000', 'TIER_2K')
+  messageLimitTier: {
+    type: String
+  },
+  // Custom WhatsApp Template / Conversation Pricing (Overrides Default Meta Rates)
+  customPricing: {
+    enabled: {
+      type: Boolean,
+      default: false
+    },
+    rates: {
+      marketing: { type: Number, default: null },
+      utility: { type: Number, default: null },
+      authentication: { type: Number, default: null },
+      service: { type: Number, default: null }
+    },
+    updatedAt: {
+      type: Date,
+      default: Date.now
+    },
+    updatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }
+  },
+  // Low balance alert tracking
+  lowBalanceThreshold: {
+    type: Number,
+    default: 200
+  },
+  lowBalanceAlertSent: {
+    type: Boolean,
+    default: false
+  },
+  // Category-wise lifetime and current month counters
+  messageUsage: {
+    marketing: {
+      sentCount: { type: Number, default: 0 },
+      deliveredCount: { type: Number, default: 0 },
+      costDeducted: { type: Number, default: 0 }
+    },
+    utility: {
+      sentCount: { type: Number, default: 0 },
+      deliveredCount: { type: Number, default: 0 },
+      costDeducted: { type: Number, default: 0 }
+    },
+    authentication: {
+      sentCount: { type: Number, default: 0 },
+      deliveredCount: { type: Number, default: 0 },
+      costDeducted: { type: Number, default: 0 }
+    },
+    service: {
+      sentCount: { type: Number, default: 0 },
+      deliveredCount: { type: Number, default: 0 },
+      costDeducted: { type: Number, default: 0 },
+      freeTierUsed: { type: Number, default: 0 }
+    },
+    totalMessages: { type: Number, default: 0 },
+    totalSpent: { type: Number, default: 0 }
   },
   subscriptionEndDate: {
     type: Date,

@@ -5,6 +5,7 @@ const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Campaign = require('../models/Campaign');
 const Channel = require('../models/Channel');
+const User = require('../models/User');
 
 const { getIO } = require('../config/socket');
 const { normalizePhoneNumber } = require('../utils/phoneHelper');
@@ -28,9 +29,9 @@ const getUserScope = (req) => {
 
 // --- MULTI-TENANT & HYBRID SERVICE HELPER ---
 const getTenantWhatsAppService = async (tenantId) => {
-  let accessToken = null;
-  let phoneNumberId = null;
-  let businessAccountId = null;
+  let accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+  let phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  let businessAccountId = process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
 
   // 1. First priority: Check DB (Channel and User models for this tenant / user)
   if (tenantId) {
@@ -80,23 +81,28 @@ const getTenantWhatsAppService = async (tenantId) => {
           }
         }
       }
+
+      // If still not found in Channel or User, check User by direct lookup
+      if (!accessToken || !phoneNumberId) {
+        const directUser = await User.findById(tenantId).select('whatsappConfig tenantId');
+        if (directUser?.whatsappConfig?.accessToken && directUser?.whatsappConfig?.phoneNumberId) {
+          accessToken = directUser.whatsappConfig.accessToken;
+          phoneNumberId = directUser.whatsappConfig.phoneNumberId;
+          businessAccountId = directUser.whatsappConfig.wabaId || null;
+        }
+      }
     } catch (e) {
       console.error('[getTenantWhatsAppService] Error fetching tenant config from DB:', e.message);
     }
   }
 
-  console.log(`[getTenantWhatsAppService] TargetTenant: ${tenantId} | Found: ${!!phoneNumberId} | PhoneNumberId: ${phoneNumberId || 'NOT_CONNECTED'}`);
+  console.log(`[getTenantWhatsAppService] TargetTenant: ${tenantId} | FoundInDB: ${!!phoneNumberId} | PhoneNumberId: ${phoneNumberId || 'NOT_CONNECTED'}`);
 
-  // If not configured in DB, fall back to environment variables (for local dev)
+  // STRICT MULTI-TENANT: Do NOT fall back to process.env under any circumstances.
+  // Each tenant/startup must only send/receive messages from their own connected WhatsApp number in the database.
   if (!accessToken || !phoneNumberId) {
-    if (process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID) {
-      accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
-      phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-      businessAccountId = process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || null;
-    } else {
-      console.warn(`[getTenantWhatsAppService] ⚠️ WhatsApp not connected for tenant ${tenantId}.`);
-      return null;
-    }
+    console.warn(`[getTenantWhatsAppService] ⚠️ WhatsApp not connected in database for tenant ${tenantId}. Rejecting request.`);
+    return null;
   }
 
   const service = new WhatsAppService({
@@ -105,7 +111,7 @@ const getTenantWhatsAppService = async (tenantId) => {
     phoneNumberId,
     businessAccountId: businessAccountId || null
   });
-  service.configSource = (accessToken === process.env.WHATSAPP_ACCESS_TOKEN) ? 'ENV_FALLBACK' : 'DB_TENANT';
+  service.configSource = 'DB_TENANT';
   
   return service;
 };
@@ -225,23 +231,6 @@ exports.connectOAuthToken = async (req, res, next) => {
       }
     }
 
-    const Setting = require('../models/Setting');
-    
-    // Save token and WABA ID to settings
-    let setting = await Setting.findOne({ key: 'whatsapp_config' });
-    if (!setting) {
-        setting = new Setting({ key: 'whatsapp_config', value: {} });
-    }
-    
-    setting.value = {
-        ...setting.value,
-        accessToken: accessToken,
-        businessAccountId: wabaId || setting.value.businessAccountId || null,
-        phoneNumberId: phoneNumberId || setting.value.phoneNumberId || null
-    };
-    
-    await setting.save();
-
     // Save mapping to User configuration details (mapped by user ID)
     if (req.user && req.user._id) {
       const User = require('../models/User');
@@ -330,12 +319,6 @@ exports.connectOAuthToken = async (req, res, next) => {
       }
     }
     
-    // Update service config in memory (Legacy Single-Tenant)
-    const whatsappService = require('../services/whatsappService');
-    whatsappService.accessToken = accessToken;
-    if (wabaId) whatsappService.businessAccountId = wabaId;
-    if (phoneNumberId) whatsappService.phoneNumberId = phoneNumberId;
-
     res.status(200).json({
       success: true,
       message: 'WhatsApp account connected successfully',
@@ -407,11 +390,39 @@ exports.embeddedSignupCallback = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Failed to exchange OAuth code' });
     }
     
-    // 3. Fetch user info to verify token
+    // 3. Fetch user info & inspect token scopes to verify required WhatsApp permissions
     const userRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/me?access_token=${accessToken}`);
     
     if (!userRes.data || !userRes.data.id) {
       return res.status(400).json({ success: false, message: 'Invalid Meta access token' });
+    }
+
+    // Inspect token debug info to verify scopes
+    try {
+      const debugRes = await axios.get(`https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/debug_token`, {
+        params: {
+          input_token: accessToken,
+          access_token: `${process.env.WHATSAPP_APP_ID}|${process.env.WHATSAPP_APP_SECRET}`
+        }
+      });
+      const tokenData = debugRes.data?.data;
+      console.log('🔍 [OAuth Scope Debug] Token info:', {
+        type: tokenData?.type,
+        application: tokenData?.application,
+        user_id: tokenData?.user_id,
+        scopes: tokenData?.scopes,
+        is_valid: tokenData?.is_valid
+      });
+
+      const grantedScopes = tokenData?.scopes || [];
+      const hasWabaMgmt = grantedScopes.includes('whatsapp_business_management');
+      const hasWabaMsg = grantedScopes.includes('whatsapp_business_messaging');
+
+      if (!hasWabaMgmt && !hasWabaMsg) {
+        console.warn('⚠️ Token lacks whatsapp_business_management / messaging scopes:', grantedScopes);
+      }
+    } catch (debugErr) {
+      console.warn('Could not inspect token debug info:', debugErr.response?.data || debugErr.message);
     }
     
     let wabaId = clientWabaId || null;
@@ -451,20 +462,39 @@ exports.embeddedSignupCallback = async (req, res, next) => {
       }
     }
 
-    // Save token and WABA ID to main config settings
-    let setting = await Setting.findOne({ key: 'whatsapp_config' });
-    if (!setting) {
-        setting = new Setting({ key: 'whatsapp_config', value: {} });
+    // Fallback: If phoneNumberId was not in eventData, query Meta for phone numbers under this WABA
+    if (!phoneNumberId && wabaId) {
+      try {
+        const phoneRes = await axios.get(
+          `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${wabaId}/phone_numbers?access_token=${accessToken}`
+        );
+        if (phoneRes.data && phoneRes.data.data && phoneRes.data.data.length > 0) {
+          phoneNumberId = phoneRes.data.data[0].id;
+          console.log(`📱 Fallback resolved phoneNumberId: ${phoneNumberId}`);
+        }
+      } catch (phoneFetchErr) {
+        console.warn("Could not auto-fetch phone number ID from WABA:", phoneFetchErr.response?.data || phoneFetchErr.message);
+      }
     }
-    
-    setting.value = {
-        ...setting.value,
-        accessToken: accessToken,
-        businessAccountId: wabaId || setting.value.businessAccountId || null,
-        phoneNumberId: phoneNumberId || setting.value.phoneNumberId || null
-    };
-    
-    await setting.save();
+
+    // Auto-subscribe Messbee App to WABA Webhooks so inbound messages & statuses are delivered
+    if (wabaId && accessToken) {
+      try {
+        await axios.post(
+          `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${wabaId}/subscribed_apps`,
+          {},
+          {
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        console.log(`✅ App subscribed to WABA ${wabaId} webhooks successfully`);
+      } catch (subErr) {
+        console.warn(`⚠️ Failed to subscribe app to WABA ${wabaId} webhooks:`, subErr.response?.data || subErr.message);
+      }
+    }
 
     // Save mapping to User configuration details (mapped by user ID)
     if (req.user && req.user._id) {
@@ -476,13 +506,17 @@ exports.embeddedSignupCallback = async (req, res, next) => {
           phoneNumberId: phoneNumberId || userRecord.whatsappConfig?.phoneNumberId,
           accessToken: accessToken
         };
+        // Auto-approve user upon successful WhatsApp connection
+        userRecord.isApproved = true;
+        userRecord.isActive = true;
         await userRecord.save();
       }
     }
     
     // Sync to Channel for automation engine (Multi-Tenant)
+    const Channel = require('../models/Channel'); // Declared here so it's in scope for auto-register too
+    let metaPhoneStatus = 'UNKNOWN';
     if (req.user && phoneNumberId) {
-      const Channel = require('../models/Channel');
       const tenantId = req.user.tenantId || req.user._id;
       const finalPhoneNumberId = phoneNumberId;
       
@@ -501,7 +535,7 @@ exports.embeddedSignupCallback = async (req, res, next) => {
             `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${finalPhoneNumberId}`,
             {
               params: {
-                fields: 'display_phone_number,verified_name,quality_rating,status',
+                fields: 'display_phone_number,verified_name,quality_rating,status,code_verification_status',
                 access_token: accessToken
               },
               timeout: 6000
@@ -514,6 +548,11 @@ exports.embeddedSignupCallback = async (req, res, next) => {
           }
           if (metaRes.data.quality_rating)       metaQuality       = metaRes.data.quality_rating;
           if (metaRes.data.status)               metaStatus        = metaRes.data.status;
+          
+          // If Meta reports status as CONNECTED or code_verification_status as VERIFIED, mark ACTIVE
+          if (metaStatus === 'CONNECTED' || metaRes.data.code_verification_status === 'VERIFIED') {
+            metaPhoneStatus = 'ACTIVE';
+          }
         } catch (metaErr) {
           console.warn('[Channel Sync] Could not fetch Meta phone details:', metaErr.message);
         }
@@ -545,7 +584,8 @@ exports.embeddedSignupCallback = async (req, res, next) => {
             'metadata.name': channelName,
             'metadata.wabaId': wabaId || null,
             'metadata.status': metaStatus,
-            'metadata.qualityRating': metaQuality
+            'metadata.qualityRating': metaQuality,
+            'metadata.phoneStatus': metaPhoneStatus === 'ACTIVE' ? 'ACTIVE' : 'PENDING'
           },
           { upsert: true, new: true, setDefaultsOnInsert: true }
         );
@@ -554,20 +594,112 @@ exports.embeddedSignupCallback = async (req, res, next) => {
       }
     }
     
-    // Update service config in memory (Legacy Single-Tenant)
-    const whatsappService = require('../services/whatsappService');
-    whatsappService.accessToken = accessToken;
-    if (wabaId) whatsappService.businessAccountId = wabaId;
-    if (phoneNumberId) whatsappService.phoneNumberId = phoneNumberId;
+    // ── AUTO-REGISTER PHONE NUMBER WITH META ─────────────────────────────────
+    // After Embedded Signup, the phone number is in "PENDING" status.
+    // We must call /register with a 6-digit PIN to activate it.
+    // Check if phone number is ALREADY ACTIVE & CONNECTED on Meta
+    let phoneRegistered = (metaPhoneStatus === 'ACTIVE');
+    let autoPin = null;
 
+    if (phoneRegistered) {
+      console.log(`✅ Phone ${phoneNumberId} is ALREADY ACTIVE & CONNECTED on Meta. Skipping register PIN step.`);
+      const channelQuery = req.user ? { tenantId: req.user.tenantId || req.user._id } : { activeWhatsappPhoneNumberId: phoneNumberId };
+      await Channel.findOneAndUpdate(
+        channelQuery,
+        {
+          $set: {
+            activeWhatsappPhoneNumberId: phoneNumberId,
+            'metadata.phoneStatus': 'ACTIVE'
+          }
+        }
+      );
+    } else if (phoneNumberId && accessToken) {
+      // Generate a cryptographically random 6-digit PIN
+      const generatePin = () => Math.floor(100000 + Math.random() * 900000).toString();
+      
+      const attemptRegister = async (pin) => {
+        try {
+          const regRes = await axios.post(
+            `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || 'v20.0'}/${phoneNumberId}/register`,
+            { messaging_product: 'whatsapp', pin },
+            {
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+              },
+              timeout: 10000
+            }
+          );
+          return regRes.data?.success === true;
+        } catch (postErr) {
+          console.warn(`⚠️ Register POST attempt failed for PIN:`, postErr.response?.data?.error?.message || postErr.message);
+          return false;
+        }
+      };
+
+      try {
+        autoPin = generatePin();
+        console.log(`🔐 Attempting to register phone ${phoneNumberId} with Meta...`);
+        phoneRegistered = await attemptRegister(autoPin);
+
+        if (!phoneRegistered) {
+          // Retry once with a fresh PIN
+          console.warn(`⚠️ First register attempt returned non-success, retrying...`);
+          autoPin = generatePin();
+          phoneRegistered = await attemptRegister(autoPin);
+        }
+
+        const channelQuery = req.user ? { tenantId: req.user.tenantId || req.user._id } : { activeWhatsappPhoneNumberId: phoneNumberId };
+
+        if (phoneRegistered) {
+          console.log(`✅ Phone ${phoneNumberId} registered successfully with Meta (PIN auto-generated).`);
+          // Store PIN + mark phone as ACTIVE — use $set to avoid replacing the whole document
+          await Channel.findOneAndUpdate(
+            channelQuery,
+            {
+              $set: {
+                activeWhatsappPhoneNumberId: phoneNumberId,
+                'metadata.phoneStatus': 'ACTIVE',
+                'metadata.registrationPin': autoPin
+              }
+            }
+          );
+        } else {
+          console.warn(`⚠️ Meta /register returned success=false for phone ${phoneNumberId}.`);
+          if (metaPhoneStatus !== 'ACTIVE') {
+            await Channel.findOneAndUpdate(
+              channelQuery,
+              { $set: { 'metadata.phoneStatus': 'PENDING' } }
+            );
+          }
+        }
+      } catch (regErr) {
+        // Non-fatal — channel is saved, but phone may need manual PIN
+        const channelQuery = req.user ? { tenantId: req.user.tenantId || req.user._id } : { activeWhatsappPhoneNumberId: phoneNumberId };
+        const regErrMsg = regErr.response?.data?.error?.message || regErr.message;
+        console.warn(`⚠️ Phone registration failed for ${phoneNumberId}: ${regErrMsg}`);
+        console.warn('Full error:', JSON.stringify(regErr.response?.data || {}, null, 2));
+        if (metaPhoneStatus !== 'ACTIVE') {
+          await Channel.findOneAndUpdate(
+            channelQuery,
+            { $set: { 'metadata.phoneStatus': 'PENDING' } }
+          );
+        }
+      }
+    }
     res.status(200).json({
       success: true,
-      message: 'WhatsApp account connected successfully via Embedded Signup Callback',
+      message: phoneRegistered
+        ? 'WhatsApp account connected and phone number activated successfully!'
+        : 'WhatsApp account connected. Phone number registration pending — please set PIN in Settings.',
       wabaId: wabaId,
       phoneNumberId: phoneNumberId,
+      phoneRegistered,
+      registrationPin: phoneRegistered ? autoPin : null, // Send back so admin can note it
       metaUserId: userRes.data.id,
       loggedEvent: true
     });
+
 
   } catch (error) {
     console.error('Embedded Signup Callback Error:', error.response?.data || error.message);
@@ -605,23 +737,6 @@ exports.connectManual = async (req, res, next) => {
         details: err.response?.data
       });
     }
-
-    const Setting = require('../models/Setting');
-    
-    // Save token and WABA ID to settings
-    let setting = await Setting.findOne({ key: 'whatsapp_config' });
-    if (!setting) {
-        setting = new Setting({ key: 'whatsapp_config', value: {} });
-    }
-    
-    setting.value = {
-        ...setting.value,
-        accessToken: accessToken,
-        businessAccountId: wabaId,
-        phoneNumberId: phoneNumberId || setting.value.phoneNumberId
-    };
-    
-    await setting.save();
 
     // Save mapping to User configuration details (mapped by user ID)
     if (req.user && req.user._id) {
@@ -712,12 +827,6 @@ exports.connectManual = async (req, res, next) => {
       }
     }
     
-    // Update service config in memory (Legacy Single-Tenant)
-    const whatsappService = require('../services/whatsappService');
-    whatsappService.accessToken = accessToken;
-    whatsappService.businessAccountId = wabaId;
-    if (phoneNumberId) whatsappService.phoneNumberId = phoneNumberId;
-
     res.status(200).json({
       success: true,
       message: 'WhatsApp account connected manually successfully',
@@ -756,6 +865,23 @@ exports.registerNumber = async (req, res, next) => {
     const response = await tenantWhatsAppService.register(pin);
 
     if (response.success) {
+      // Sync status with Channel in database
+      try {
+        const Channel = require('../models/Channel');
+        await Channel.findOneAndUpdate(
+          { tenantId },
+          {
+            $set: {
+              'metadata.phoneStatus': 'ACTIVE',
+              'metadata.registrationPin': pin
+            }
+          }
+        );
+        console.log(`✅ [registerNumber] Channel phoneStatus updated to ACTIVE for tenant: ${tenantId}`);
+      } catch (dbErr) {
+        console.warn('⚠️ Could not update Channel metadata on register:', dbErr.message);
+      }
+
       res.status(200).json({
         success: true,
         message: 'Number registered successfully',
@@ -790,6 +916,22 @@ exports.deregisterNumber = async (req, res, next) => {
     const response = await tenantWhatsAppService.deregister();
 
     if (response.success) {
+      // Sync status with Channel in database
+      try {
+        const Channel = require('../models/Channel');
+        await Channel.findOneAndUpdate(
+          { tenantId },
+          {
+            $set: {
+              'metadata.phoneStatus': 'PENDING'
+            }
+          }
+        );
+        console.log(`ℹ️ [deregisterNumber] Channel phoneStatus set to PENDING for tenant: ${tenantId}`);
+      } catch (dbErr) {
+        console.warn('⚠️ Could not update Channel metadata on deregister:', dbErr.message);
+      }
+
       res.status(200).json({
         success: true,
         message: 'Number deregistered successfully',
@@ -967,14 +1109,23 @@ async function handleIncomingMessage(data) {
     let resolvedTenantId = null;
     if (phoneNumberId) {
       const Channel = require('../models/Channel');
-      const channelRecord = await Channel.findOne({ activeWhatsappPhoneNumberId: phoneNumberId });
+      const User = require('../models/User');
+
+      let channelRecord = await Channel.findOne({ activeWhatsappPhoneNumberId: phoneNumberId });
       if (channelRecord) {
         resolvedChannelId = channelRecord._id.toString();
         resolvedTenantId = channelRecord.tenantId;
+      } else {
+        // Fallback: check User model directly
+        const userWithPhone = await User.findOne({ 'whatsappConfig.phoneNumberId': phoneNumberId });
+        if (userWithPhone) {
+          resolvedTenantId = userWithPhone.tenantId || userWithPhone._id;
+          resolvedChannelId = userWithPhone._id.toString();
+        }
       }
     }
 
-    if (!resolvedChannelId) {
+    if (!resolvedTenantId) {
       console.warn(`[Webhook] Ignored message for unknown phoneNumberId: ${phoneNumberId}`);
       return;
     }
@@ -1028,11 +1179,12 @@ async function handleIncomingMessage(data) {
         user: assignedUserId // Link strictly to the channel tenant
       });
       
-      // Emit chat_created event
+      // Emit chat_created event strictly to tenant room
       try {
         const io = getIO();
         if (io) {
-          io.emit('chat_created', chat);
+          const tenantRoom = `tenant_${assignedUserId?.toString() || resolvedTenantId?.toString()}`;
+          io.to(tenantRoom).emit('chat_created', chat);
         }
       } catch (socketError) {
       }
@@ -1086,9 +1238,8 @@ async function handleIncomingMessage(data) {
         mediaTypeStr = message.mimeType;
         
         // Optionally download and store media locally
-        if (mediaId) {
-          const mediaService = inboundTenantService || whatsappService;
-          const mediaInfo = await mediaService.getMediaUrl(mediaId);
+        if (mediaId && inboundTenantService) {
+          const mediaInfo = await inboundTenantService.getMediaUrl(mediaId);
           if (mediaInfo.success) {
             mediaUrl = mediaInfo.url;
           }
@@ -1102,9 +1253,8 @@ async function handleIncomingMessage(data) {
         mediaId = message.mediaId;
         mediaTypeStr = message.mimeType;
         
-        if (mediaId) {
-          const mediaService = inboundTenantService || whatsappService;
-          const mediaInfo = await mediaService.getMediaUrl(mediaId);
+        if (mediaId && inboundTenantService) {
+          const mediaInfo = await inboundTenantService.getMediaUrl(mediaId);
           if (mediaInfo.success) {
             mediaUrl = mediaInfo.url;
           }
@@ -1117,9 +1267,8 @@ async function handleIncomingMessage(data) {
         mediaId = message.mediaId;
         mediaTypeStr = message.mimeType;
         
-        if (mediaId) {
-          const mediaService = inboundTenantService || whatsappService;
-          const mediaInfo = await mediaService.getMediaUrl(mediaId);
+        if (mediaId && inboundTenantService) {
+          const mediaInfo = await inboundTenantService.getMediaUrl(mediaId);
           if (mediaInfo.success) {
             mediaUrl = mediaInfo.url;
           }
@@ -1134,9 +1283,8 @@ async function handleIncomingMessage(data) {
         mediaId = message.mediaId;
         mediaTypeStr = message.mimeType;
         
-        if (mediaId) {
-          const mediaService = inboundTenantService || whatsappService;
-          const mediaInfo = await mediaService.getMediaUrl(mediaId);
+        if (mediaId && inboundTenantService) {
+          const mediaInfo = await inboundTenantService.getMediaUrl(mediaId);
           if (mediaInfo.success) {
             mediaUrl = mediaInfo.url;
           }
@@ -1165,6 +1313,18 @@ async function handleIncomingMessage(data) {
         mediaId = message.mediaId;
         break;
         
+      case 'button':
+        // Quick reply button clicks from Meta templates or standard buttons
+        messageText = message?.buttonText || message?.text || message?.buttonPayload || '';
+        lastMsgText = `🔘 ${messageText || 'Button reply'}`;
+        break;
+
+      case 'interactive':
+        // Interactive button clicks or list selections
+        messageText = message?.buttonTitle || message?.buttonId || message?.listTitle || message?.listId || message?.text || '';
+        lastMsgText = `🔘 ${messageText || 'Interactive reply'}`;
+        break;
+
       default:
         messageText = '';
         lastMsgText = 'Unsupported message type';
@@ -1222,18 +1382,22 @@ async function handleIncomingMessage(data) {
       );
     }
 
-    // Emit to socket for real-time update
+    // Emit to socket for real-time update (scoped strictly to tenant room)
     try {
       const io = getIO();
       if (io) {
-        io.emit('receive_message', {
+        const tenantRoom = `tenant_${chat.user?.toString() || resolvedTenantId?.toString()}`;
+        const chatRoom = chat._id.toString();
+
+        // Emit receive_message to active chat room and to tenant room
+        io.to(chatRoom).to(tenantRoom).emit('receive_message', {
           chatId: chat._id,
           message: newMessage,
           chat: chat
         });
         
-        // Also emit chat list update
-        io.emit('chat_updated', chat);
+        // Emit chat list update strictly to this tenant
+        io.to(tenantRoom).emit('chat_updated', chat);
       }
     } catch (socketError) {
       console.error('Socket emit error:', socketError.message);
@@ -1246,12 +1410,18 @@ async function handleIncomingMessage(data) {
     await automationService.processAutomationTrigger(
       'message',
       {
-        message: messageText || lastMsgText, // Send text or media caption/fallback
+        message: messageText || lastMsgText, // Send text, button text or media caption/fallback
         contactPhone: normalizedFrom,
         messageId: newMessage._id,
         messageType: messageType,
         mediaUrl: mediaUrl,
-        isNewContact: isNewContact
+        isNewContact: isNewContact,
+        buttonText: message?.buttonText,
+        buttonPayload: message?.buttonPayload,
+        buttonTitle: message?.buttonTitle,
+        buttonId: message?.buttonId,
+        listTitle: message?.listTitle,
+        listId: message?.listId
       },
       resolvedChannelId // MUST pass channelId, not userId!
     );
@@ -1289,8 +1459,10 @@ async function handleStatusUpdate(data) {
       statusTimestamp: new Date(parseInt(timestamp) * 1000)
     };
 
-    if (newStatus === 'failed' && errorMessage) {
-      updatePayload.error = errorCode ? `[${errorCode}] ${errorMessage}` : errorMessage;
+    if (newStatus === 'failed') {
+      const fallbackMsg = errorCode ? `[${errorCode}] Message failed to deliver` : 'Message not delivered';
+      updatePayload.error = errorMessage ? (errorCode ? `[${errorCode}] ${errorMessage}` : errorMessage) : fallbackMsg;
+      if (errorCode) updatePayload.errorCode = String(errorCode);
     }
 
     const updatedMessage = await Message.findOneAndUpdate(
@@ -1298,6 +1470,26 @@ async function handleStatusUpdate(data) {
       updatePayload,
       { new: true }
     );
+
+    // 💸 Auto-Refund wallet if message failed to deliver
+    if (newStatus === 'failed' && oldStatus !== 'failed') {
+      try {
+        const walletService = require('../services/walletService');
+        const Chat = require('../models/Chat');
+        const chatDoc = await Chat.findById(message.chatId);
+        if (chatDoc?.user) {
+          await walletService.refundFailedMessage(
+            chatDoc.user,
+            message._id,
+            'SERVICE',
+            chatDoc.phone
+          );
+          console.log(`💸 Auto-refunded failed message ${messageId} to tenant ${chatDoc.user}`);
+        }
+      } catch (refundErr) {
+        console.warn('Auto-refund warning:', refundErr.message);
+      }
+    }
 
     // Check if this message belongs to a campaign and update stats
     const campaignId = updatedMessage.metadata?.campaignId || message.metadata?.campaignId;
@@ -1364,10 +1556,11 @@ async function handleStatusUpdate(data) {
       if (io) {
         io.emit('message_status_update', {
           messageId: updatedMessage._id,
+          chatId: updatedMessage.chatId,
           status: newStatus,
           whatsappMessageId: messageId,
           error: updatedMessage.error,
-          errorCode: errorCode
+          errorCode: errorCode || updatedMessage.errorCode
         });
       }
     } catch (socketError) {
@@ -1418,8 +1611,10 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
       });
     }
 
-    // Find chat
-    const chat = chatId ? await Chat.findById(chatId) : await Chat.findOne({ phone: to });
+    // Find chat strictly belonging to this tenant
+    const chat = chatId 
+      ? await Chat.findOne({ _id: chatId, user: tenantId }) 
+      : await Chat.findOne({ phone: to, user: tenantId });
 
     if (!chat) {
       logAPICall({
@@ -1428,11 +1623,11 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
         path: '/api/whatsapp/send',
         userId: req.user?.id,
         statusCode: 404,
-        errorMessage: 'Chat not found'
+        errorMessage: 'Chat not found or access denied'
       });
       return res.status(404).json({
         success: false,
-        message: 'Chat not found'
+        message: 'Chat not found or does not belong to this account'
       });
     }
 
@@ -1450,6 +1645,21 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
         success: false,
         message: '24-hour window expired — the contact must message you first, then you can reply within 24 hours. Use an approved template message to initiate.',
         errorCode: 131047
+      });
+    }
+
+    // 💳 Pre-flight WCC Wallet Balance Check
+    const walletService = require('../services/walletService');
+    const { getMessageCost } = require('../config/pricingConfig');
+    const userPricingDoc = await User.findById(tenantId).select('customPricing').lean();
+    const messageCost = getMessageCost('SERVICE', chat.phone, userPricingDoc?.customPricing);
+
+    const hasBalance = await walletService.hasSufficientCredits(tenantId, messageCost);
+    if (!hasBalance) {
+      return res.status(402).json({
+        success: false,
+        message: `Insufficient WCC Credits in wallet. Message cost: ₹${messageCost}. Please recharge your credits in Settings -> WCC Credit.`,
+        errorCode: 'INSUFFICIENT_WCC_CREDITS'
       });
     }
 
@@ -1489,6 +1699,14 @@ exports.sendWhatsAppMessage = async (req, res, next) => {
       whatsappMessageId: result.messageId,
       messageType: 'text',
       status: 'sent'
+    });
+
+    // Deduct credits & update category usage
+    await walletService.deductMessageCredits({
+      tenantId,
+      category: 'SERVICE',
+      recipientPhone: chat.phone,
+      messageId: newMessage._id
     });
 
     // Update chat metadata
@@ -1717,6 +1935,34 @@ exports.sendTemplateMessage = async (req, res, next) => {
       }
     }
 
+    // Determine category from DB template or fallback to MARKETING
+    let templateCategory = 'MARKETING';
+    try {
+      const Template = require('../models/Template');
+      const foundTemplate = await Template.findOne({
+        name: templateName,
+        $or: [{ tenantId: effectiveTenantId }, { user: effectiveTenantId }]
+      });
+      if (foundTemplate?.category) {
+        templateCategory = foundTemplate.category.toUpperCase();
+      }
+    } catch (_) {}
+
+    // Pre-flight WCC Wallet Balance Check for Template
+    const walletService = require('../services/walletService');
+    const { getMessageCost } = require('../config/pricingConfig');
+    const userPricingDoc = await User.findById(effectiveTenantId).select('customPricing').lean();
+    const templateCost = getMessageCost(templateCategory, recipientPhone, userPricingDoc?.customPricing);
+
+    const hasBalance = await walletService.hasSufficientCredits(effectiveTenantId, templateCost);
+    if (!hasBalance) {
+      return res.status(402).json({
+        success: false,
+        message: `Insufficient WCC Credits. Sending this ${templateCategory} template costs ₹${templateCost}. Please recharge in Settings -> WCC Credit.`,
+        errorCode: 'INSUFFICIENT_WCC_CREDITS'
+      });
+    }
+
     const result = await tenantWhatsAppService.sendTemplateMessage(
       recipientPhone,
       templateName,
@@ -1764,6 +2010,14 @@ exports.sendTemplateMessage = async (req, res, next) => {
         components
       },
       status: 'sent'
+    });
+
+    // Deduct credits & update category usage for template message
+    await walletService.deductMessageCredits({
+      tenantId: effectiveTenantId,
+      category: templateCategory,
+      recipientPhone,
+      messageId: newMessage._id
     });
 
     chat.phone = recipientPhone;
@@ -2262,7 +2516,10 @@ exports.deleteTemplate = async (req, res, next) => {
 
     let actualMetaName = localDoc?.whatsappTemplateName || localDoc?.name || templateName;
 
-    const tenantWhatsAppService = (await getTenantWhatsAppService(tenantId)) || whatsappService;
+    const tenantWhatsAppService = await getTenantWhatsAppService(tenantId);
+    if (!tenantWhatsAppService) {
+      return res.status(403).json({ success: false, message: 'WhatsApp is not connected for this account.' });
+    }
 
     // If templateName is still missing, lookup by templateId from WhatsApp API list
     if (!actualMetaName && tenantWhatsAppService) {
@@ -2340,7 +2597,7 @@ exports.deleteTemplate = async (req, res, next) => {
         console.log('✅ [Controller] Template permanently deleted from Meta and DB:', templateName);
       }
     } catch (dbError) {
-      console.warn('⚠️ [Controller] Local DB delete warning:', dbError.message);
+      console.error('❌ [Controller] Local DB delete FAILED:', dbError.message, dbError.code);
     }
 
     try {

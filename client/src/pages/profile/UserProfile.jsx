@@ -3,18 +3,8 @@ import { useNavigate } from "react-router-dom";
 import { ToastContainer, toast } from "react-toastify";
 import { userContext } from "../../context/Context";
 import axios from "../../context/axios";
+import { getBackendFileUrl, appendCacheBuster } from "../../utils/urlHelper";
 import "react-toastify/dist/ReactToastify.css";
-
-const getBackendFileUrl = (path) => {
-  if (!path) return null;
-  if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('blob:') || path.startsWith('data:')) {
-    return path;
-  }
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5002/api';
-  const backendRoot = apiUrl.replace(/\/api\/?$/i, '');
-  const cleanPath = path.startsWith('/') ? path : `/${path}`;
-  return `${backendRoot}${cleanPath}`;
-};
 
 const UserProfile = () => {
   const { user, updateUser } = useContext(userContext);
@@ -31,6 +21,8 @@ const UserProfile = () => {
 
   const fileInputRef = useRef(null);
   const [profileImage, setProfileImage] = useState(user?.avatar || null);
+  const [avatarKey, setAvatarKey] = useState(Date.now());
+  const [imgError, setImgError] = useState(false);
   const inputsRef = useRef([]);
   const [otp, setOtp] = useState(["", "", "", "", "", ""]);
   const [timeLeft, setTimeLeft] = useState(59);
@@ -99,6 +91,7 @@ const handleKeyDown = (e, index) => {
         phone: sanitizedPhone,
       });
       setProfileImage(user.avatar || null);
+      setImgError(false);
       setPreferences({
         timezone: user.timezone || "(GMT+05:30) India Standard Time",
         language: user.language || "English (United States)",
@@ -154,22 +147,49 @@ const handleKeyDown = (e, index) => {
   };
 
   const handleImageUpload = async (e) => {
-    const file = e.target.files[0];
-    if (file) {
-      const formData = new FormData();
-      formData.append("avatar", file);
-      try {
-        const response = await axios.post("/users/avatar", formData, {
-          headers: { "Content-Type": "multipart/form-data" },
-        });
-        if (response.data.success) {
-          updateUser(response.data.data.user);
-          setProfileImage(URL.createObjectURL(file));
-          toast.success("Profile photo updated");
-        }
-      } catch (error) {
-        toast.error("Failed to upload avatar");
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Validate size (max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error("Image size should be less than 5MB");
+      return;
+    }
+
+    // Validate type
+    if (!file.type.startsWith("image/")) {
+      toast.error("Please upload a valid image file");
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append("avatar", file);
+    try {
+      const response = await axios.post("/users/avatar", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      if (response.data && response.data.success) {
+        const returnedUser = response.data.data.user;
+        updateUser(returnedUser);
+        const newAvatar = response.data.data.avatar || returnedUser.avatar;
+        setProfileImage(newAvatar);
+        setAvatarKey(Date.now());
+        setImgError(false);
+        toast.success("Profile photo updated successfully!");
       }
+    } catch (error) {
+      console.error("Avatar upload failed:", error);
+      let errMsg = "Failed to upload avatar";
+      if (error.response?.status === 413) {
+        errMsg = error.response?.data?.message || "File size exceeds server upload limit. Please upload an image under 5MB.";
+      } else if (error.message === "Network Error" || !error.response) {
+        errMsg = "Network Error: Image might be too large or server connection dropped. Please upload an image under 5MB.";
+      } else if (error.response?.data?.message) {
+        errMsg = error.response.data.message;
+      } else if (error.message) {
+        errMsg = `Upload error: ${error.message}`;
+      }
+      toast.error(errMsg);
     }
   };
   useEffect(() => {
@@ -210,23 +230,21 @@ useEffect(() => {
         </div>
         <div className="flex flex-col md:flex-row items-center gap-8">
           <div className="relative group">
-            <div className="w-32 h-32 rounded-full border-4 border-white overflow-hidden shadow-md bg-green-500 flex items-center justify-center text-4xl font-bold text-white uppercase">
-              {profileImage ? (
+            <div className="w-32 h-32 rounded-full border-4 border-white overflow-hidden shadow-md bg-green-500 flex items-center justify-center text-4xl font-bold text-white uppercase relative">
+              {profileImage && !imgError ? (
                 <img
+                  key={avatarKey}
                   alt="Avatar"
                   className="w-full h-full object-cover"
-                  src={getBackendFileUrl(profileImage)}
-                  onError={(e) => {
-                    e.target.style.display = 'none';
-                    if (e.target.nextSibling) {
-                      e.target.nextSibling.style.display = 'flex';
-                    }
-                  }}
+                  src={profileImage.startsWith('blob:') || profileImage.startsWith('data:') ? profileImage : appendCacheBuster(getBackendFileUrl(profileImage))}
+                  onLoad={() => setImgError(false)}
+                  onError={() => setImgError(true)}
                 />
-              ) : null}
-              <div className={`w-full h-full flex items-center justify-center ${profileImage ? 'hidden' : ''}`}>
-                {user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2) : 'A'}
-              </div>
+              ) : (
+                <div className="w-full h-full flex items-center justify-center">
+                  {user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2) : 'A'}
+                </div>
+              )}
             </div>
             <button
               onClick={() => fileInputRef.current.click()}

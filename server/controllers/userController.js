@@ -303,7 +303,7 @@ exports.updateProfile = async (req, res, next) => {
       'city', 'state', 'country', 'address', 'zipcode', 'currency', 'businessDescription',
       'billingName', 'billingAddress', 'billingCountry', 'billingState', 'billingCity',
       'billingZipcode', 'mobileNumber', 'emailId', 'taxType', 'billingTaxId', 'gst',
-      'website', 'company', 'avatar', 'timezone', 'language', 'isPhoneVerified', 'credits'
+      'website', 'company', 'avatar', 'timezone', 'language', 'isPhoneVerified'
     ];
     
     allowed.forEach(key => {
@@ -361,7 +361,11 @@ exports.uploadAvatar = async (req, res, next) => {
       });
     }
 
-    const avatarUrl = `/uploads/${req.file.filename}`;
+    const { getPublicUrl } = require('../middleware/upload');
+    const isLocal = process.platform === 'win32' || process.env.NODE_ENV !== 'production';
+    const avatarUrl = (process.env.DOCUMENT_GET_URL && !isLocal)
+      ? getPublicUrl(req.file.filename) 
+      : `/uploads/${req.file.filename}`;
 
     const user = await User.findByIdAndUpdate(
       req.user.id,
@@ -500,47 +504,273 @@ exports.contactSales = async (req, res, next) => {
       inquiryId
     } = req.body;
 
-    const Notification = require('../models/Notification');
+    if (!fullName || !email || !phone || !company) {
+      return res.status(400).json({
+        success: false,
+        message: 'Full Name, Work Email, Phone/WhatsApp, and Company Name are required.'
+      });
+    }
 
-    // Create notification for user/system
+    const SalesInquiry = require('../models/SalesInquiry');
+    const Notification = require('../models/Notification');
+    const User = require('../models/User');
+    const { sendSalesInquiryEmail } = require('../services/emailService');
+
+    const effectiveInquiryId = inquiryId || `INQ-${Math.floor(100000 + Math.random() * 900000)}`;
+
+    // 1. Permanently save into dedicated SalesInquiry collection
+    const savedInquiry = await SalesInquiry.create({
+      inquiryId: effectiveInquiryId,
+      user: req.user?._id || req.user?.id,
+      fullName: String(fullName).trim(),
+      email: String(email).trim().toLowerCase(),
+      phone: String(phone).trim(),
+      company: String(company).trim(),
+      companySize: companySize || '11-50',
+      messageVolume: messageVolume || '50,000 - 250,000 / mo',
+      agentsNeeded: agentsNeeded || '11-25 Agents',
+      selectedFeatures: Array.isArray(selectedFeatures) ? selectedFeatures : [],
+      message: (message || '').trim(),
+      status: 'new'
+    });
+
+    console.log(`💼 Saved new Enterprise Sales Inquiry [${effectiveInquiryId}] for ${company} (${email})`);
+
+    // 2. Create notification for the submitting user
     try {
       await Notification.create({
         userId: req.user.id,
         type: 'lead',
-        title: `Sales Inquiry: ${company || fullName}`,
-        message: `${fullName} (${email}) requested corporate sales consultation. Company size: ${companySize || 'N/A'}, Expected Volume: ${messageVolume || 'N/A'}.`,
+        title: `Enterprise Inquiry Registered: ${company}`,
+        message: `Your enterprise sales consultation request (Ref: ${effectiveInquiryId}) has been registered. Our enterprise team will contact you shortly.`,
         meta: [
-          { label: 'Inquiry ID', value: String(inquiryId || 'N/A') },
-          { label: 'Company', value: String(company || 'N/A') },
-          { label: 'Phone', value: String(phone || 'N/A') },
-          { label: 'Agents Needed', value: String(agentsNeeded || 'N/A') }
+          { label: 'Inquiry ID', value: String(effectiveInquiryId) },
+          { label: 'Company', value: String(company) },
+          { label: 'Status', value: 'Submitted' }
         ],
         data: {
-          fullName,
-          email,
-          phone,
+          inquiryId: effectiveInquiryId,
           company,
-          companySize,
-          messageVolume,
-          agentsNeeded,
-          selectedFeatures,
-          message,
-          inquiryId
+          fullName
         }
       });
+
+      // 3. ALSO notify all Admin accounts in their notification bell!
+      const adminUsers = await User.find({ role: { $in: ['ADMIN', 'admin'] } }).select('_id');
+      for (const admin of adminUsers) {
+        if (admin._id.toString() !== req.user.id.toString()) {
+          await Notification.create({
+            userId: admin._id,
+            type: 'lead',
+            title: `🚀 New Enterprise Lead: ${company || fullName}`,
+            message: `${fullName} (${email}, ${phone}) requested Corporate & Enterprise plan consultation.`,
+            meta: [
+              { label: 'Inquiry ID', value: String(effectiveInquiryId) },
+              { label: 'Company', value: String(company) },
+              { label: 'Phone', value: String(phone) },
+              { label: 'Volume', value: String(messageVolume || 'N/A') }
+            ],
+            data: savedInquiry
+          });
+        }
+      }
     } catch (notifErr) {
       console.warn('Could not create notification for sales inquiry:', notifErr.message);
     }
 
-    res.status(200).json({
+    // 4. Send email notifications (both to support and confirmation to user)
+    sendSalesInquiryEmail(savedInquiry).catch((e) =>
+      console.warn('Sales inquiry email failed:', e.message)
+    );
+
+    res.status(201).json({
       success: true,
       message: 'Inquiry received successfully. Our sales team will reach out shortly.',
       data: {
-        inquiryId,
-        submittedAt: new Date()
+        inquiryId: effectiveInquiryId,
+        submittedAt: savedInquiry.createdAt
       }
     });
   } catch (error) {
     next(error);
   }
 };
+
+// @desc    Get all Sales Inquiries (Admin only)
+// @route   GET /api/users/contact-sales
+// @access  Private
+exports.getSalesInquiries = async (req, res, next) => {
+  try {
+    const SalesInquiry = require('../models/SalesInquiry');
+    const inquiries = await SalesInquiry.find({}).sort({ createdAt: -1 });
+    res.status(200).json({
+      success: true,
+      count: inquiries.length,
+      data: inquiries
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get client WhatsApp template/message pricing (Super Admin / Admin)
+// @route   GET /api/users/:id/pricing (supports either userId or email)
+// @access  Private (Admin only)
+exports.getUserPricing = async (req, res, next) => {
+  try {
+    const mongoose = require('mongoose');
+    const { getClientPricingSummary } = require('../config/pricingConfig');
+    
+    const isObjectId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const query = isObjectId ? { _id: req.params.id } : { email: String(req.params.id).trim().toLowerCase() };
+
+    const user = await User.findOne(query)
+      .select('name email businessName company subscriptionPlan customPricing')
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const pricingSummary = getClientPricingSummary(user.customPricing);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        userId: user._id,
+        name: user.name,
+        email: user.email,
+        businessName: user.businessName || user.company || '',
+        subscriptionPlan: user.subscriptionPlan,
+        pricing: pricingSummary,
+        lastUpdated: user.customPricing?.updatedAt || null
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Update client WhatsApp template/message custom pricing (Super Admin / Admin)
+// @route   PUT /api/users/:id/pricing (supports either userId or email)
+// @access  Private (Admin only)
+exports.updateUserPricing = async (req, res, next) => {
+  try {
+    const mongoose = require('mongoose');
+    const { getClientPricingSummary } = require('../config/pricingConfig');
+
+    const isObjectId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const query = isObjectId ? { _id: req.params.id } : { email: String(req.params.id).trim().toLowerCase() };
+
+    const user = await User.findOne(query);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const { enabled = true, rates = {} } = req.body;
+
+    // Validate rates if provided
+    const validCategories = ['marketing', 'utility', 'authentication', 'service'];
+    const sanitizedRates = {
+      marketing: user.customPricing?.rates?.marketing ?? null,
+      utility: user.customPricing?.rates?.utility ?? null,
+      authentication: user.customPricing?.rates?.authentication ?? null,
+      service: user.customPricing?.rates?.service ?? null
+    };
+
+    for (const cat of validCategories) {
+      if (rates[cat] !== undefined) {
+        if (rates[cat] === null || rates[cat] === '') {
+          sanitizedRates[cat] = null;
+        } else {
+          const num = Number(rates[cat]);
+          if (isNaN(num) || num < 0) {
+            return res.status(400).json({
+              success: false,
+              message: `Invalid rate for ${cat}: must be a non-negative number`
+            });
+          }
+          sanitizedRates[cat] = parseFloat(num.toFixed(4));
+        }
+      }
+    }
+
+    user.customPricing = {
+      enabled: Boolean(enabled),
+      rates: sanitizedRates,
+      updatedAt: new Date(),
+      updatedBy: req.user?._id || req.user?.id
+    };
+
+    await user.save();
+
+    const pricingSummary = getClientPricingSummary(user.customPricing);
+
+    console.log(`💰 Updated Custom Pricing for ${user.email}:`, pricingSummary.effectiveRates);
+
+    res.status(200).json({
+      success: true,
+      message: 'Custom pricing updated successfully',
+      data: {
+        userId: user._id,
+        email: user.email,
+        pricing: pricingSummary,
+        lastUpdated: user.customPricing.updatedAt
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Reset client pricing to default Meta rates (Super Admin / Admin)
+// @route   DELETE /api/users/:id/pricing (supports either userId or email)
+// @access  Private (Admin only)
+exports.resetUserPricing = async (req, res, next) => {
+  try {
+    const mongoose = require('mongoose');
+    const { getClientPricingSummary } = require('../config/pricingConfig');
+
+    const isObjectId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const query = isObjectId ? { _id: req.params.id } : { email: String(req.params.id).trim().toLowerCase() };
+
+    const user = await User.findOne(query);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    user.customPricing = {
+      enabled: false,
+      rates: {
+        marketing: null,
+        utility: null,
+        authentication: null,
+        service: null
+      },
+      updatedAt: new Date(),
+      updatedBy: req.user?._id || req.user?.id
+    };
+
+    await user.save();
+
+    const pricingSummary = getClientPricingSummary(user.customPricing);
+
+    console.log(`🔄 Reset Pricing to Default Meta Rates for ${user.email}`);
+
+    res.status(200).json({
+      success: true,
+      message: 'Client pricing reset to default Meta rates',
+      data: {
+        userId: user._id,
+        email: user.email,
+        pricing: pricingSummary
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+

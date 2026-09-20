@@ -2,6 +2,7 @@ const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Campaign = require('../models/Campaign');
 const Chat = require('../models/Chat');
+const User = require('../models/User');
 const { getTenantWhatsAppService } = require('../controllers/whatsappController');
 const { normalizePhoneNumber } = require('../utils/phoneHelper');
 const { getIO } = require('../config/socket');
@@ -120,6 +121,18 @@ exports.sendMessageToContact = async (userId, contactId, messageData) => {
     const messageType = messageData?.messageType || 'text';
     const msgTime = formatMessageTime();
 
+    // 💳 Pre-flight WCC Wallet Check
+    const walletService = require('./walletService');
+    const { getMessageCost } = require('../config/pricingConfig');
+    const userPricingDoc = await User.findById(userId).select('customPricing').lean();
+    const msgCost = getMessageCost('SERVICE', normalizedPhone, userPricingDoc?.customPricing);
+    const hasCredits = await walletService.hasSufficientCredits(userId, msgCost);
+    if (!hasCredits) {
+      const err = new Error(`Insufficient WCC Credits. Message cost ₹${msgCost}. Please recharge.`);
+      err.code = 'INSUFFICIENT_WCC_CREDITS';
+      throw err;
+    }
+
     let status = 'sent';
     let whatsappMessageId;
     let error;
@@ -151,6 +164,20 @@ exports.sendMessageToContact = async (userId, contactId, messageData) => {
       lastMsgTime: msgTime,
       lastActivity: new Date()
     });
+
+    // 💸 Deduct credits only on successful send
+    if (whatsappMessageId) {
+      try {
+        await walletService.deductMessageCredits({
+          tenantId: userId,
+          category: 'SERVICE',
+          recipientPhone: normalizedPhone,
+          messageId: message._id
+        });
+      } catch (deductErr) {
+        console.warn('⚠️ Wallet deduction warning:', deductErr.message);
+      }
+    }
 
     return message;
   } catch (error) {
@@ -201,6 +228,27 @@ exports.sendBulkMessages = async (userId, campaignId, contacts, messageTemplate)
         metaTemplateName = dbTpl.whatsappTemplateName;
       }
     } catch (_) {}
+
+    // 💳 Pre-flight WCC Wallet Check for bulk campaign
+    // Estimate cost based on first contact (all same template/category)
+    const walletServiceBulk = require('./walletService');
+    const pricingBulk = require('../config/pricingConfig');
+    const templateCategoryBulk = (() => {
+      try {
+        // Campaign model may store category directly
+        if (campaign.templateCategory) return String(campaign.templateCategory).toUpperCase();
+        return 'MARKETING'; // Safe default
+      } catch { return 'MARKETING'; }
+    })();
+    const userPricingBulkDoc = await User.findById(userId).select('customPricing').lean();
+    const perMsgCost = pricingBulk.getMessageCost(templateCategoryBulk, contacts[0]?.whatsapp || contacts[0]?.phone || '', userPricingBulkDoc?.customPricing);
+    const totalEstimated = perMsgCost * contacts.length;
+    const bulkHasCredits = await walletServiceBulk.hasSufficientCredits(userId, totalEstimated);
+    if (!bulkHasCredits) {
+      const err = new Error(`Insufficient WCC Credits for campaign. Estimated cost: ₹${totalEstimated.toFixed(2)} for ${contacts.length} contacts. Please recharge.`);
+      err.code = 'INSUFFICIENT_WCC_CREDITS';
+      throw err;
+    }
 
     for (const contact of contacts) {
       try {

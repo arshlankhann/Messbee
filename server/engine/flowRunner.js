@@ -156,11 +156,15 @@ export async function sendWhatsAppMessage(toPhone, payload, channel, forceBypass
       console.log(`[SIMULATOR] Intercepted outbound message to ${toPhone}`);
       const io = getIO();
       if (io) {
-        io.to(channel._id.toString()).emit('simulator_message', { 
+        const msgId = `sim_msg_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        const simMsg = { 
+          msgId,
           direction: 'OUTBOUND', 
           payload,
           timestamp: new Date()
-        });
+        };
+        // Emit once globally to avoid duplicate packet reception
+        io.emit('simulator_message', simMsg);
       }
       return null;
     }
@@ -248,6 +252,23 @@ export async function sendWhatsAppMessage(toPhone, payload, channel, forceBypass
       
       metaMessageId = `sim_${Date.now()}`;
     } else {
+      // 💳 Pre-flight WCC Wallet Balance Check for Automation
+      const walletService = (await import('../services/walletService.js')).default || require('../services/walletService.js');
+      const pricingConfig = (await import('../config/pricingConfig.js')).default || require('../config/pricingConfig.js');
+      const { getMessageCost } = pricingConfig;
+      
+      // Determine category (Templates may specify or default to UTILITY for automated notifications)
+      const autoCategory = payload.type === 'template' ? 'UTILITY' : 'SERVICE';
+      const User = (await import('../models/User.js')).default || require('../models/User.js');
+      const userPricingDoc = await User.findById(channel.tenantId).select('customPricing').lean();
+      const autoCost = getMessageCost(autoCategory, toPhone, userPricingDoc?.customPricing);
+
+      const hasBalance = await walletService.hasSufficientCredits(channel.tenantId, autoCost);
+      if (!hasBalance) {
+        console.warn(`[Automation] Skipped outbound message to ${toPhone}. Insufficient WCC Credits for tenant ${channel.tenantId}`);
+        return null;
+      }
+
       const response = await axios.post(url, payload, {
         headers: {
           'Authorization': `Bearer ${channel.metaAccessToken}`,
@@ -257,6 +278,13 @@ export async function sendWhatsAppMessage(toPhone, payload, channel, forceBypass
 
       // Log the outbound message inside Inbox/Contact
       metaMessageId = response.data?.messages?.[0]?.id || null;
+
+      // Deduct WCC credits for successful automated message
+      await walletService.deductMessageCredits({
+        tenantId: channel.tenantId,
+        category: autoCategory,
+        recipientPhone: toPhone
+      });
     }
 
     const logContact = await Contact.findOne({ phone: toPhone, channelId: channel._id });
@@ -298,14 +326,6 @@ function buildMessagePayload(phone, nodeType, nodeData, contextData = {}) {
   const parsedText = parseDynamicVariables(rawText, contextData);
   const btns = buttons || interactiveButtons || [];
 
-  if (messageType === 'text' || nodeType === 'messageNode') {
-    return {
-      ...basePayload,
-      type: 'text',
-      text: { body: parsedText || ' ' }
-    };
-  }
-
   if (messageType === 'interactive' || nodeType === 'interactiveNode') {
     if (btns.length === 0) {
       return { ...basePayload, type: 'text', text: { body: parsedText || 'Please configure buttons.' } };
@@ -318,7 +338,7 @@ function buildMessagePayload(phone, nodeType, nodeData, contextData = {}) {
           type: 'reply',
           reply: { 
             id: parseDynamicVariables(btn.id, contextData) || btn.id || 'btn', 
-            title: parseDynamicVariables(btn.title, contextData) || 'Button'
+            title: parseDynamicVariables(btn.title || btn.text, contextData) || 'Button'
           }
         }))
       }
@@ -340,6 +360,14 @@ function buildMessagePayload(phone, nodeType, nodeData, contextData = {}) {
       ...basePayload,
       type: 'interactive',
       interactive
+    };
+  }
+
+  if (messageType === 'text' || nodeType === 'messageNode') {
+    return {
+      ...basePayload,
+      type: 'text',
+      text: { body: parsedText || ' ' }
     };
   }
 
@@ -749,39 +777,64 @@ export async function processSpecificNode(customerPhone, channelId, startNodeId)
       if (['messageNode', 'interactiveNode', 'menuNode', 'inputNode', 'mediaNode', 'templateNode', 'utilityNode', 'reactionNode', 'catalogNode', 'pollNode', 'commerceNode', 'carouselNode'].includes(currentNode.type)) {
         const payload = buildMessagePayload(customerPhone, currentNode.type, currentNode.data, contextData);
         
-        // Inject full template text for Simulator UI if it's a template node
+        // Inject full template text and buttons for Simulator UI if it's a template node
         if (customerPhone.startsWith('SIMULATOR_') && currentNode.type === 'templateNode') {
           try {
+            // First check if currentNode.data has buttons directly configured
+            if (currentNode.data?.buttons && Array.isArray(currentNode.data.buttons) && currentNode.data.buttons.length > 0) {
+              payload._sim_template_buttons = currentNode.data.buttons;
+            }
+
             const { default: Template } = await import('../models/Template.js');
-            const tmpl = await Template.findOne({ name: currentNode.data.templateName });
+            const tmplName = currentNode.data?.templateName;
+            let tmpl = null;
+            if (tmplName) {
+              tmpl = await Template.findOne({
+                $or: [
+                  { name: tmplName },
+                  { name: new RegExp(`^${tmplName}$`, 'i') },
+                  { whatsappTemplateName: tmplName }
+                ]
+              });
+            }
+
             if (tmpl) {
-              const bodyComponent = tmpl.components.find(c => c.type === 'BODY');
+              const bodyComponent = tmpl.components?.find(c => c.type === 'BODY' || c.type === 'body');
               if (bodyComponent && bodyComponent.text) {
                 payload._sim_template_text = bodyComponent.text;
               }
               
-              const headerComponent = tmpl.components.find(c => c.type === 'HEADER');
-              if (headerComponent && headerComponent.format === 'IMAGE') {
+              const headerComponent = tmpl.components?.find(c => c.type === 'HEADER' || c.type === 'header');
+              if (headerComponent && (headerComponent.format === 'IMAGE' || headerComponent.type === 'IMAGE')) {
                 let imgUrl = headerComponent.example?.header_url?.[0] || headerComponent.example?.header_handle?.[0];
-                // If it's a Meta handle (not starting with http), provide a nice placeholder image for the simulator
                 if (imgUrl && !imgUrl.startsWith('http')) {
-                  imgUrl = 'https://images.unsplash.com/photo-1541339907198-e08756dedf3f?w=600&h=400&fit=crop'; // University / Generic aesthetic image
+                  imgUrl = 'https://images.unsplash.com/photo-1541339907198-e08756dedf3f?w=600&h=400&fit=crop';
                 }
                 if (imgUrl) {
                   payload._sim_template_image = imgUrl;
                 }
               }
 
-              const buttonsComponent = tmpl.components.find(c => c.type === 'BUTTONS');
-              if (buttonsComponent && buttonsComponent.buttons) {
+              const buttonsComponent = tmpl.components?.find(c => c.type === 'BUTTONS' || c.type === 'buttons');
+              if (buttonsComponent && buttonsComponent.buttons && buttonsComponent.buttons.length > 0) {
                 payload._sim_template_buttons = buttonsComponent.buttons;
               }
             }
+
+            // If template text still not found from DB, fallback to node text or placeholder
+            if (!payload._sim_template_text) {
+              payload._sim_template_text = currentNode.data?.text || currentNode.data?.headline || `Template: ${tmplName}`;
+            }
+
+            // Always ensure buttons from node are present if DB didn't provide any
             if (!payload._sim_template_buttons && currentNode.data?.buttons) {
               payload._sim_template_buttons = currentNode.data.buttons;
             }
           } catch (e) {
             console.error('Failed to inject simulator template data:', e);
+            if (currentNode.data?.buttons) {
+              payload._sim_template_buttons = currentNode.data.buttons;
+            }
           }
         }
         
@@ -969,7 +1022,7 @@ export async function processSpecificNode(customerPhone, channelId, startNodeId)
 /**
  * Evaluates the incoming message against the current active flow or initiates a new one.
  */
-export async function executeWorkflowStep(customerPhone, incomingPayload, channelId, referral = null, incomingMessageId = null, simulatorTargetFlowId = null, isNewContact = false) {
+export async function executeWorkflowStep(customerPhone, incomingPayload, channelId, referral = null, incomingMessageId = null, simulatorTargetFlowId = null, isNewContact = false, messageContext = {}) {
   try {
     // IMPORTANT: metaAccessToken has `select: false` in schema — must explicitly select it
     let channel = await Channel.findById(channelId).select('+metaAccessToken');
@@ -1121,11 +1174,22 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
       const settings = await TenantSettings.findOne({ tenantId: channel.tenantId });
       
       // 0. WELCOME MESSAGE PRIORITY
-      if (isNewContact && settings && settings.welcomeMessage && settings.welcomeMessage.enabled && settings.welcomeMessage.automationId) {
-        const welcomeFlow = await Automation.findById(settings.welcomeMessage.automationId);
-        if (welcomeFlow && welcomeFlow.isActive) {
-          matchedFlow = welcomeFlow;
-          matchedTriggerNode = welcomeFlow.nodes.find(n => n.type === 'triggerNode') || welcomeFlow.nodes[0];
+      // Triggers if contact is new OR if customer explicitly greets ('hi', 'hello', 'hey', 'start')
+      const isGreetingWord = ['hi', 'hello', 'hey', 'start', 'namaste'].includes(payloadText);
+      if ((isNewContact || isGreetingWord) && settings && settings.welcomeMessage && settings.welcomeMessage.enabled) {
+        if (settings.welcomeMessage.automationId) {
+          const welcomeFlow = await Automation.findById(settings.welcomeMessage.automationId);
+          if (welcomeFlow && welcomeFlow.isActive) {
+            matchedFlow = welcomeFlow;
+            matchedTriggerNode = welcomeFlow.nodes.find(n => n.type === 'triggerNode') || welcomeFlow.nodes[0];
+          }
+        }
+        // Fallback to default welcome text message if no flow is attached or flow is inactive
+        if (!matchedFlow) {
+          const welcomeText = settings.welcomeMessage.textMessage || 'Welcome! How can we help you today?';
+          const payload = { messaging_product: 'whatsapp', recipient_type: 'individual', to: customerPhone, type: 'text', text: { body: welcomeText } };
+          await sendWhatsAppMessage(customerPhone, payload, channel);
+          return;
         }
       }
 
@@ -1146,7 +1210,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
           const dayName = parts[0].toLowerCase(); // e.g. "monday"
           const timeStr = parts[1]; // e.g. "14:30"
 
-          const dayConfig = settings.awayMessage.workingHours?.get(dayName);
+          const dayConfig = settings.awayMessage.workingHours?.get(dayName) || (settings.awayMessage.workingHours && settings.awayMessage.workingHours[dayName]);
           if (dayConfig) {
             if (!dayConfig.isOpen) {
               isOutOfOffice = true;
@@ -1167,18 +1231,131 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
             matchedTriggerNode = awayFlow.nodes.find(n => n.type === 'triggerNode') || awayFlow.nodes[0];
           }
         }
+        // If out of office and no flow or flow not active, send away text message!
+        if (!matchedFlow) {
+          const awayText = settings.awayMessage.textMessage || 'We are currently away and will get back to you as soon as possible!';
+          const payload = { messaging_product: 'whatsapp', recipient_type: 'individual', to: customerPhone, type: 'text', text: { body: awayText } };
+          await sendWhatsAppMessage(customerPhone, payload, channel);
+          return;
+        }
       }
 
-      // 2. NORMAL TRIGGERS
+      // 2. NORMAL TRIGGERS & TEMPLATE QUICK REPLY TRIGGERS
+      let targetFromButtonEdge = null;
+
       if (!matchedFlow) {
+        // A. Standard Trigger Nodes (Keywords, exact match, regex, etc.)
         for (const flow of allActiveFlows) {
           const tNode = flow.nodes.find(n => n.type === 'triggerNode' || n.type === 'eventTriggerNode');
           if (tNode && isFlowTriggerMatch(tNode, payloadText)) {
             matchedFlow = flow;
             matchedTriggerNode = tNode;
             break;
-          } else if (!tNode && simulatorTargetFlowId && flow._id.toString() === simulatorTargetFlowId.toString()) {
-            // In simulator testing for a flow that starts directly with a templateNode (no triggerNode)
+          }
+        }
+      }
+
+      // B. TEMPLATE QUICK REPLY & INTERACTIVE BUTTON TRIGGERS
+      // When a user taps a quick reply button on a template (sent via campaign, live chat, or automation),
+      // match the button to any active flow's templateNode or interactiveNode.
+      if (!matchedFlow) {
+        const candidatePayloads = [
+          payloadText,
+          messageContext?.buttonText?.trim().toLowerCase(),
+          messageContext?.buttonTitle?.trim().toLowerCase(),
+          messageContext?.buttonPayload?.trim().toLowerCase(),
+          messageContext?.buttonId?.trim().toLowerCase(),
+          messageContext?.listTitle?.trim().toLowerCase(),
+          messageContext?.listId?.trim().toLowerCase()
+        ].filter(Boolean);
+
+        if (candidatePayloads.length > 0) {
+          for (const flow of allActiveFlows) {
+            const interactiveOrTemplateNodes = flow.nodes.filter(n => 
+              n.type === 'templateNode' || 
+              n.type === 'interactiveNode' || 
+              (n.type === 'messageNode' && n.data?.messageType === 'interactive')
+            );
+            
+            for (const node of interactiveOrTemplateNodes) {
+              let buttons = node.data?.buttons || [];
+              if ((!buttons || buttons.length === 0) && node.type === 'templateNode' && node.data?.templateName) {
+                try {
+                  const { default: Template } = await import('../models/Template.js');
+                  const tmpl = await Template.findOne({
+                    $or: [
+                      { name: node.data.templateName },
+                      { whatsappTemplateName: node.data.templateName }
+                    ]
+                  });
+                  const btnComp = tmpl?.components?.find(c => String(c.type).toUpperCase() === 'BUTTONS');
+                  if (btnComp && Array.isArray(btnComp.buttons)) {
+                    buttons = btnComp.buttons;
+                  }
+                } catch (_) {}
+              }
+
+              const outgoingEdges = flow.edges.filter(e => e.source === node.id);
+              if (outgoingEdges.length === 0) continue;
+
+              let matchedBtn = null;
+              let matchedIdx = -1;
+
+              for (let i = 0; i < buttons.length; i++) {
+                const b = buttons[i];
+                const bCandidates = [
+                  b.text?.trim().toLowerCase(),
+                  b.title?.trim().toLowerCase(),
+                  b.payload?.trim().toLowerCase(),
+                  b.id?.toString().trim().toLowerCase(),
+                  String(i)
+                ].filter(Boolean);
+
+                const isMatch = candidatePayloads.some(cp => 
+                  bCandidates.includes(cp) || bCandidates.some(bc => bc.includes(cp) || cp.includes(bc))
+                );
+
+                if (isMatch) {
+                  matchedBtn = b;
+                  matchedIdx = i;
+                  break;
+                }
+              }
+
+              if (matchedBtn) {
+                const btnId = matchedBtn.id || matchedIdx;
+                let matchedEdge = outgoingEdges.find(e => 
+                  candidatePayloads.includes(e.sourceHandle?.toLowerCase()) ||
+                  e.sourceHandle === `btn-${btnId}` ||
+                  e.sourceHandle === `btn-${matchedIdx}` ||
+                  e.sourceHandle === `btn-btn_${matchedIdx}` ||
+                  e.sourceHandle === btnId ||
+                  e.sourceHandle === `${matchedIdx}`
+                );
+
+                if (!matchedEdge && outgoingEdges.length === 1 && (!outgoingEdges[0].sourceHandle || outgoingEdges[0].sourceHandle === 'main-handle' || outgoingEdges[0].sourceHandle === 'default')) {
+                  matchedEdge = outgoingEdges[0];
+                }
+
+                if (matchedEdge) {
+                  console.log(`[FlowRunner] 🎯 Matched button '${payloadText}' on node ${node.id} in flow '${flow.name}'. Next target: ${matchedEdge.target}`);
+                  matchedFlow = flow;
+                  matchedTriggerNode = node;
+                  targetFromButtonEdge = matchedEdge.target;
+                  break;
+                }
+              }
+            }
+            if (matchedFlow) break;
+          }
+        }
+      }
+
+      // C. Flows that start directly with a root templateNode (e.g. simulator testing)
+      if (!matchedFlow) {
+        for (const flow of allActiveFlows) {
+          const tNode = flow.nodes.find(n => n.type === 'triggerNode' || n.type === 'eventTriggerNode');
+          if (!tNode && simulatorTargetFlowId && flow._id.toString() === simulatorTargetFlowId.toString()) {
             const rootNode = flow.nodes.find(n => !flow.edges.some(e => e.target === n.id)) || flow.nodes[0];
             matchedFlow = flow;
             matchedTriggerNode = rootNode;
@@ -1192,12 +1369,20 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
 
       if (!activeFlow) {
         // Fallback: check dynamic settings first
-        if (settings && settings.fallbackMessage && settings.fallbackMessage.enabled && settings.fallbackMessage.automationId) {
-          activeFlow = await Automation.findById(settings.fallbackMessage.automationId);
-          if (activeFlow && activeFlow.isActive) {
-            triggerNode = activeFlow.nodes.find(n => n.type === 'triggerNode') || activeFlow.nodes[0];
-          } else {
-            activeFlow = null;
+        if (settings && settings.fallbackMessage && settings.fallbackMessage.enabled) {
+          if (settings.fallbackMessage.automationId) {
+            activeFlow = await Automation.findById(settings.fallbackMessage.automationId);
+            if (activeFlow && activeFlow.isActive) {
+              triggerNode = activeFlow.nodes.find(n => n.type === 'triggerNode') || activeFlow.nodes[0];
+            } else {
+              activeFlow = null;
+            }
+          }
+          if (!activeFlow) {
+            const fallbackText = settings.fallbackMessage.textMessage || 'Sorry, we did not understand that. Please reply with a keyword or wait for an agent.';
+            const payload = { messaging_product: 'whatsapp', recipient_type: 'individual', to: customerPhone, type: 'text', text: { body: fallbackText } };
+            await sendWhatsAppMessage(customerPhone, payload, channel);
+            return;
           }
         }
       }
@@ -1218,14 +1403,19 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
         return;
       }
 
+      // If triggered by a button click on a template/interactive node, advance straight along that edge!
       // If triggerNode is an actual trigger (triggerNode/eventTriggerNode), follow outgoing edge.
       // If it is a direct root node (like templateNode), start directly on that node!
-      const isTriggerType = ['triggerNode', 'eventTriggerNode'].includes(triggerNode.type);
-      if (isTriggerType) {
-        const outgoingEdges = activeFlow.edges.filter(e => e.source === triggerNode.id);
-        nextNodeId = outgoingEdges.length > 0 ? outgoingEdges[0].target : null;
+      if (targetFromButtonEdge) {
+        nextNodeId = targetFromButtonEdge;
       } else {
-        nextNodeId = triggerNode.id;
+        const isTriggerType = ['triggerNode', 'eventTriggerNode'].includes(triggerNode.type);
+        if (isTriggerType) {
+          const outgoingEdges = activeFlow.edges.filter(e => e.source === triggerNode.id);
+          nextNodeId = outgoingEdges.length > 0 ? outgoingEdges[0].target : null;
+        } else {
+          nextNodeId = triggerNode.id;
+        }
       }
 
       if (!nextNodeId) return;
@@ -1234,7 +1424,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
         phone: customerPhone,
         channelId,
         activeFlowId: activeFlow._id,
-        currentNodeId: triggerNode.id,
+        currentNodeId: targetFromButtonEdge ? triggerNode.id : triggerNode.id,
         referral: referral,
         lastIncomingMessageId: incomingMessageId
       });
@@ -1337,15 +1527,17 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
 
         // Process input answer safely
         const rawVarName = session.saveVariableAs || 'custom_field';
-        if (!session.sessionVariables || typeof session.sessionVariables.set !== 'function') {
-          session.sessionVariables = new Map(Object.entries(session.sessionVariables || {}));
+        if (!session.sessionVariables || typeof session.sessionVariables !== 'object') {
+          session.sessionVariables = {};
+        } else if (session.sessionVariables instanceof Map) {
+          session.sessionVariables = Object.fromEntries(session.sessionVariables);
         }
         
         // Save both with and without prefix so {{neet_score}} and {{contact.neet_score}} both work!
-        session.sessionVariables.set(rawVarName, incomingPayload);
+        session.sessionVariables[rawVarName] = incomingPayload;
         if (rawVarName.startsWith('contact.')) {
           const shortName = rawVarName.replace('contact.', '');
-          session.sessionVariables.set(shortName, incomingPayload);
+          session.sessionVariables[shortName] = incomingPayload;
           
           // Also persist directly to Contact in database
           try {
@@ -1378,7 +1570,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
             console.error('Failed to sync contact field from inputNode:', e);
           }
         } else {
-          session.sessionVariables.set(`contact.${rawVarName}`, incomingPayload);
+          session.sessionVariables[`contact.${rawVarName}`] = incomingPayload;
           
           // Also persist non-prefixed variable name into Contact customFields
           try {
@@ -1411,6 +1603,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
             console.error('Failed to sync non-prefixed contact field from inputNode:', e);
           }
         }
+        session.markModified('sessionVariables');
 
         session.status = 'ACTIVE';
         session.expectedValidation = null;
@@ -1455,6 +1648,8 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
           console.log(`[DEBUG Engine] Trying to match incomingPayload '${incomingPayload}' on node ${currentNode?.type}`);
           console.log(`[DEBUG Engine] Available edges for ${session.currentNodeId}:`, JSON.stringify(outgoingEdges));
           
+          let isExplicitChoiceRecognized = false;
+
           let matchedEdge = outgoingEdges.find(e => 
              e.sourceHandle === incomingPayload || 
              e.sourceHandle === `btn-${incomingPayload}` || 
@@ -1464,21 +1659,55 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
           // Match by title/label case-insensitively (for both Simulator and WhatsApp)
           if (!matchedEdge) {
              const lowerIncoming = (incomingPayload || '').trim().toLowerCase();
-             if ((currentNode.type === 'interactiveNode' || currentNode.type === 'messageNode' || currentNode.type === 'templateNode') && currentNode.data?.buttons) {
-                 const btnIdx = currentNode.data.buttons.findIndex((b, idx) => 
-                   (b.text && b.text.toLowerCase() === lowerIncoming) ||
-                   (b.title && b.title.toLowerCase() === lowerIncoming) || 
-                   (b.id && b.id.toString().toLowerCase() === lowerIncoming) ||
-                   (b.payload && b.payload.toString().toLowerCase() === lowerIncoming) ||
-                   idx.toString() === lowerIncoming
-                 );
+             const candidateInputs = [
+               lowerIncoming,
+               messageContext?.buttonText?.trim().toLowerCase(),
+               messageContext?.buttonTitle?.trim().toLowerCase(),
+               messageContext?.buttonPayload?.trim().toLowerCase(),
+               messageContext?.buttonId?.trim().toLowerCase()
+             ].filter(Boolean);
+
+             if (currentNode.type === 'interactiveNode' || currentNode.type === 'messageNode' || currentNode.type === 'templateNode') {
+                 let buttons = currentNode.data?.buttons || [];
+                 if ((!buttons || buttons.length === 0) && currentNode.type === 'templateNode' && currentNode.data?.templateName) {
+                   try {
+                     const { default: Template } = await import('../models/Template.js');
+                     const tmpl = await Template.findOne({
+                       $or: [
+                         { name: currentNode.data.templateName },
+                         { whatsappTemplateName: currentNode.data.templateName }
+                       ]
+                     });
+                     const btnComp = tmpl?.components?.find(c => String(c.type).toUpperCase() === 'BUTTONS');
+                     if (btnComp && Array.isArray(btnComp.buttons)) {
+                       buttons = btnComp.buttons;
+                     }
+                   } catch (_) {}
+                 }
+
+                 const btnIdx = (buttons || []).findIndex((b, idx) => {
+                   const bCandidates = [
+                     b.text?.trim().toLowerCase(),
+                     b.title?.trim().toLowerCase(),
+                     b.payload?.trim().toLowerCase(),
+                     b.id?.toString().trim().toLowerCase(),
+                     String(idx)
+                   ].filter(Boolean);
+                   return candidateInputs.some(ci => 
+                     bCandidates.includes(ci) || bCandidates.some(bc => bc.includes(ci) || ci.includes(bc))
+                   );
+                 });
+
                  if (btnIdx !== -1) {
-                    const btn = currentNode.data.buttons[btnIdx];
+                    isExplicitChoiceRecognized = true;
+                    const btn = buttons[btnIdx];
                     const btnId = btn.id || btnIdx;
                     matchedEdge = outgoingEdges.find(e => 
+                      candidateInputs.includes(e.sourceHandle?.toLowerCase()) ||
                       e.sourceHandle === `btn-${btnId}` || 
                       e.sourceHandle === `btn-${btnIdx}` ||
-                      e.sourceHandle === btnId ||
+                      e.sourceHandle === `btn-btn_${btnIdx}` ||
+                      e.sourceHandle === btnId || 
                       e.sourceHandle === `${btnIdx}`
                     );
                  }
@@ -1490,6 +1719,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
                      (r.postbackId && r.postbackId.toString().toLowerCase() === lowerIncoming)
                    );
                    if (rowIdx !== -1) {
+                      isExplicitChoiceRecognized = true;
                       const row = sec.rows[rowIdx];
                       const rowId = row.postbackId || row.id || rowIdx;
                       matchedEdge = outgoingEdges.find(e => 
@@ -1508,6 +1738,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
                   idx.toString() === lowerIncoming
                 );
                 if (optIdx !== -1) {
+                  isExplicitChoiceRecognized = true;
                   matchedEdge = outgoingEdges.find(e => 
                     e.sourceHandle === `opt-${optIdx}` || 
                     e.sourceHandle === `${optIdx}`
@@ -1518,10 +1749,32 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
                 matchedEdge = outgoingEdges.find(e => e.sourceHandle === 'main-handle') || outgoingEdges[0];
              }
           }
-          
+
           if (!matchedEdge) {
             // Check if flow designer connected to the 'main-handle' (Next step fallback)
             matchedEdge = outgoingEdges.find(e => e.sourceHandle === 'main-handle');
+          }
+
+          // ⚠️ CRITICAL: If customer explicitly selected a valid choice (e.g. 'left' button)
+          // but that choice has NO connected outgoing edge on the canvas:
+          // It is a terminal choice! Do NOT route to another button's branch.
+          if (isExplicitChoiceRecognized && !matchedEdge) {
+            console.log(`[FlowRunner] User selected choice '${incomingPayload}' on node ${currentNode?.id}, but it has no connected branch. Completing session.`);
+            await markSessionCompleted(session, customerPhone, channelId);
+            return;
+          }
+
+          // Only fallback to a single edge IF that edge is generic (not bound to a specific button like btn-, row-, opt-)
+          if (!matchedEdge && outgoingEdges.length === 1) {
+            const onlyEdge = outgoingEdges[0];
+            const isSpecificHandle = onlyEdge.sourceHandle && (
+              onlyEdge.sourceHandle.startsWith('btn-') || 
+              onlyEdge.sourceHandle.startsWith('row-') || 
+              onlyEdge.sourceHandle.startsWith('opt-')
+            );
+            if (!isSpecificHandle) {
+              matchedEdge = onlyEdge;
+            }
           }
           
           if (matchedEdge) {
@@ -1587,7 +1840,12 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
  */
 export async function startFlowManually(customerPhone, channelId, flowId, eventData = {}) {
   try {
-    const activeFlow = await Automation.findOne({ _id: flowId, channelId, isActive: true });
+    const isSim = typeof customerPhone === 'string' && customerPhone.startsWith('SIMULATOR_');
+    const query = { _id: flowId, channelId };
+    if (!isSim) {
+      query.isActive = true;
+    }
+    const activeFlow = await Automation.findOne(query);
     if (!activeFlow) {
       console.warn(`Flow ${flowId} not found or inactive. Cannot start manually.`);
       return;

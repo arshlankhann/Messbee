@@ -24,6 +24,30 @@ const getAspectRatioLabel = (width, height) => {
 };
 
 /**
+ * Computes preview countdown timer string based on expiration configuration
+ */
+const getExpirationPreviewText = (expirationDate = '24h', customHours = 24) => {
+  switch (expirationDate) {
+    case '6h': return '05:59:59';
+    case '12h': return '11:59:59';
+    case '24h': return '23:59:59';
+    case '48h': return '47:59:59';
+    case '72h': return '2d 23h';
+    case '7d': return '6d 23h';
+    case 'custom': {
+      const h = Number(customHours) || 24;
+      if (h > 24) {
+        const d = Math.floor(h / 24);
+        const remH = h % 24;
+        return `${d}d ${remH > 0 ? remH + 'h' : '00h'}`;
+      }
+      return `${String(Math.max(0, h - 1)).padStart(2, '0')}:59:59`;
+    }
+    default: return '23:59:59';
+  }
+};
+
+/**
  * Checks media file size and dimensions.
  * For images: if dimensions are too large (>1920px) or file size > 5MB,
  * automatically proportionally scales down (shortens/optimizes) without any cropping.
@@ -202,6 +226,9 @@ const CreateTemplate = () => {
   const [authExpirationMinutes, setAuthExpirationMinutes] = useState(10);
   const [authSecurityRecommendation, setAuthSecurityRecommendation] = useState(true);
   const [buttons, setButtons] = useState([]);
+  const [showButtonMenu, setShowButtonMenu] = useState(false);
+  const [menuPlacement, setMenuPlacement] = useState('up');
+  const buttonMenuRef = useRef(null);
   const editorRef = useRef(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [charCount, setCharCount] = useState(0);
@@ -430,11 +457,18 @@ const CreateTemplate = () => {
     name: location.state?.templateData?.name || '',
     language: location.state?.templateData?.language || 'English (US)',
     offerTitle: '20% OFF',
+    limitedTimeOfferText: location.state?.templateData?.limitedTimeOfferText || 'Expiring offer!',
+    hasExpiration: true,
+    offerCode: location.state?.templateData?.offerCode || 'SALE20',
+    ltoHasUrlButton: false,
+    ltoUrlText: 'Shop Now',
+    ltoUrl: '',
     headerType: location.state?.templateData?.headerType || 'None',
     headerText: location.state?.templateData?.headerText || '',
-    bodyText: location.state?.templateData?.bodyText || 'Hello {{1}}, our Summer Sale is now live! Use code BUYONEGETONE for 50% off. Shop now!',
-    footerText: location.state?.templateData?.footerText || 'Reply STOP to opt out',
-    expirationDate: '24h',
+    bodyText: location.state?.templateData?.bodyText || '',
+    footerText: location.state?.templateData?.footerText || '',
+    expirationDate: location.state?.templateData?.expirationDate || '24h',
+    customExpirationHours: location.state?.templateData?.customExpirationHours || 24,
     catalogButtonText: location.state?.templateData?.buttons?.[0]?.text || 'View Catalog',
     mpmButtonText: location.state?.templateData?.buttons?.[0]?.text || 'View Items',
   });
@@ -449,15 +483,16 @@ const CreateTemplate = () => {
   const handleCategoryChange = (cat) => {
     if (formData.category === cat) return; // Skip if no change
     
-    let newBody = '';
-    if (cat === 'Marketing') {
-      newBody = 'Hello {{1}}, our Summer Sale is now live! Use code BUYONEGETONE for 50% off. Shop now!';
-    } else if (cat === 'Utility') {
-      newBody = 'Good news! Your order {{1}} has shipped! Here\'s your tracking information, please check link below.';
-    } else if (cat === 'Authentication') {
-      newBody = '{{1}} is your verification code. For your security, do not share this code.';
+    // Don't auto-fill body — let the user write their own content
+    setFormData({ ...formData, category: cat, bodyText: '' });
+
+    // Reset body editor too
+    if (editorRef.current) {
+      editorRef.current.innerHTML = '';
+      setCharCount(0);
+      setBodyVariables([]);
+      setBodySamples({});
     }
-    setFormData({ ...formData, category: cat, bodyText: newBody });
 
     if (cat === 'Authentication') {
       setTemplateType('OTP');
@@ -473,10 +508,117 @@ const CreateTemplate = () => {
     else toast.error(message);
   };
 
-  const addButton = () => {
-    if (buttons.length < 3) {
-      setButtons([...buttons, { id: Date.now(), type: 'Visit Website', text: 'New Button', value: '', countryCode: '+91' }]);
+  // Close button menu on click outside
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (buttonMenuRef.current && !buttonMenuRef.current.contains(event.target)) {
+        setShowButtonMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Button counts by type
+  const websiteButtonCount = buttons.filter(b => b.type === 'Visit website' || b.type === 'Visit Website').length;
+  const phoneButtonCount = buttons.filter(b => b.type === 'Call phone number').length;
+  const copyCodeButtonCount = buttons.filter(b => b.type === 'Copy offer code').length;
+  const quickReplyButtonCount = buttons.filter(b => b.type === 'Custom' || b.type === 'Marketing opt-out').length;
+
+  const addSpecificButton = (actionType) => {
+    setShowButtonMenu(false);
+
+    if (buttons.length >= 10) {
+      toast.error('Maximum 10 buttons allowed per template.');
+      return;
     }
+
+    if (actionType === 'Marketing opt-out') {
+      if (quickReplyButtonCount >= 3) {
+        toast.error('Maximum 3 quick reply buttons allowed.');
+        return;
+      }
+      setButtons([...buttons, { 
+        id: Date.now(), 
+        type: 'Marketing opt-out', 
+        text: 'Stop promotions', 
+        value: '' 
+      }]);
+      return;
+    }
+
+    if (actionType === 'Custom') {
+      if (quickReplyButtonCount >= 3) {
+        toast.error('Maximum 3 quick reply buttons allowed.');
+        return;
+      }
+      setButtons([...buttons, { 
+        id: Date.now(), 
+        type: 'Custom', 
+        text: 'Quick Reply', 
+        value: '' 
+      }]);
+      return;
+    }
+
+    if (actionType === 'Visit website') {
+      if (websiteButtonCount >= 2) {
+        toast.error('Maximum 2 website buttons allowed.');
+        return;
+      }
+      setButtons([...buttons, { 
+        id: Date.now(), 
+        type: 'Visit website', 
+        text: 'Visit website', 
+        value: '',
+        urlType: 'static'
+      }]);
+      return;
+    }
+
+    if (actionType === 'Call phone number') {
+      if (phoneButtonCount >= 1) {
+        toast.error('Maximum 1 phone number button allowed.');
+        return;
+      }
+      setButtons([...buttons, { 
+        id: Date.now(), 
+        type: 'Call phone number', 
+        text: 'Call us', 
+        countryCode: '+91', 
+        value: '' 
+      }]);
+      return;
+    }
+
+    if (actionType === 'Copy offer code') {
+      if (copyCodeButtonCount >= 1) {
+        toast.error('Maximum 1 copy offer code button allowed.');
+        return;
+      }
+      setButtons([...buttons, { 
+        id: Date.now(), 
+        type: 'Copy offer code', 
+        text: 'Copy offer code', 
+        value: '' 
+      }]);
+      return;
+    }
+  };
+
+  const addButton = () => {
+    if (!showButtonMenu && buttonMenuRef.current) {
+      const rect = buttonMenuRef.current.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      // Popup height is ~280px. If space below is less than 300px and space above is larger, open UP, otherwise open DOWN
+      if (spaceBelow < 300 && spaceAbove > spaceBelow) {
+        setMenuPlacement('up');
+      } else {
+        setMenuPlacement('down');
+      }
+    }
+    setShowButtonMenu(!showButtonMenu);
   };
 
   const removeButton = (id) => {
@@ -962,6 +1104,37 @@ const CreateTemplate = () => {
       return;
     }
 
+    if (templateType === 'LIMITED_TIME_OFFER') {
+      if (formData.headerType === 'Text' || formData.headerType === 'Document') {
+        failSubmit("Limited-Time Offer templates only support Image or Video headers (or None). Please select None, Image, or Video.", true);
+        return;
+      }
+      if (!formData.limitedTimeOfferText || !formData.limitedTimeOfferText.trim()) {
+        failSubmit("Please enter the Offer heading text (max 16 characters).");
+        return;
+      }
+      if (formData.limitedTimeOfferText.trim().length > 16) {
+        failSubmit("Offer heading text cannot exceed 16 characters.");
+        return;
+      }
+      if (!formData.offerCode || !formData.offerCode.trim()) {
+        failSubmit("Please enter an Offer / Coupon Code for the Copy Code button (max 15 characters, e.g. SALE20).");
+        return;
+      }
+      if (formData.offerCode.trim().length > 15) {
+        failSubmit("Offer / Coupon Code cannot exceed 15 characters.");
+        return;
+      }
+      if (!formData.ltoUrl || !formData.ltoUrl.trim()) {
+        failSubmit("WhatsApp mandates a Website URL button for Limited-Time Offers. Please enter your website or offer link below.");
+        return;
+      }
+      if (!/^https?:\/\//i.test(formData.ltoUrl.trim())) {
+        failSubmit("Website URL must start with https:// or http:// (e.g. https://example.com/offers).");
+        return;
+      }
+    }
+
     setIsSubmitting(true);
 
     // Prevent submission if media is still uploading
@@ -1025,6 +1198,16 @@ const CreateTemplate = () => {
       }
 
 
+      if (templateType === 'LIMITED_TIME_OFFER') {
+        components.push({
+          type: 'LIMITED_TIME_OFFER',
+          limited_time_offer: {
+            text: (formData.limitedTimeOfferText || 'Expiring offer!').trim().substring(0, 16),
+            has_expiration: formData.hasExpiration !== false
+          }
+        });
+      }
+
       const bodyComponent = { type: 'BODY', text: strippedBody };
       if (templateVariables.length > 0) {
         bodyComponent.example = {
@@ -1033,7 +1216,7 @@ const CreateTemplate = () => {
       }
       components.push(bodyComponent);
 
-      if (formData.footerText && formData.footerText.trim()) {
+      if (templateType !== 'LIMITED_TIME_OFFER' && formData.footerText && formData.footerText.trim()) {
         components.push({ type: 'FOOTER', text: formData.footerText.substring(0, 60) }); // Max 60 chars
       }
 
@@ -1053,21 +1236,78 @@ const CreateTemplate = () => {
           buttons: [
             {
               type: 'MPM',
-              text: (formData.mpmButtonText || 'View Items').trim().substring(0, 20)
+              // Meta mandates this text MUST always be exactly "View items" — cannot be modified
+              text: 'View items'
             }
           ]
         });
+      } else if (templateType === 'LIMITED_TIME_OFFER') {
+        const ltoButtons = [
+          {
+            type: 'COPY_CODE',
+            example: (formData.offerCode || 'SALE20').trim().substring(0, 15)
+          },
+          {
+            type: 'URL',
+            text: (formData.ltoUrlText || 'Shop Now').trim().substring(0, 25),
+            url: (formData.ltoUrl || 'https://example.com').trim()
+          }
+        ];
+        components.push({
+          type: 'BUTTONS',
+          buttons: ltoButtons
+        });
       } else if (buttons && buttons.length > 0) {
-        const waButtons = buttons.map(b => {
-          if (b.type === 'Visit Website' || b.type === 'Visit website') {
-            return { type: 'URL', text: b.text, url: b.value };
+        // ── Validate buttons before building payload ──
+        for (const b of buttons) {
+          if ((b.type === 'Visit Website' || b.type === 'Visit website')) {
+            if (!b.value || !b.value.trim()) {
+              failSubmit(`Button "${b.text || 'Visit website'}" is missing a URL. Please enter a valid URL (e.g. https://example.com).`);
+              setIsSubmitting(false);
+              return;
+            }
+            if (!/^https?:\/\//i.test(b.value.trim())) {
+              failSubmit(`Button "${b.text}" URL must start with https:// or http://`);
+              setIsSubmitting(false);
+              return;
+            }
           }
           if (b.type === 'Call phone number') {
-            const fullPhone = `${b.countryCode || '+91'}${b.value}`;
-            return { type: 'PHONE_NUMBER', text: b.text, phone_number: fullPhone };
+            if (!b.value || !b.value.trim()) {
+              failSubmit(`Button "${b.text || 'Call us'}" is missing a phone number.`);
+              setIsSubmitting(false);
+              return;
+            }
           }
-          return { type: 'QUICK_REPLY', text: b.text };
-        }).filter(b => b.text && (b.url || b.phone_number || b.type === 'QUICK_REPLY'));
+          if (b.type === 'Copy offer code') {
+            if (!b.value || !b.value.trim()) {
+              failSubmit(`"Copy offer code" button is missing the offer code value.`);
+              setIsSubmitting(false);
+              return;
+            }
+          }
+        }
+
+        const waButtons = buttons.map(b => {
+          if (b.type === 'Visit Website' || b.type === 'Visit website') {
+            return { type: 'URL', text: (b.text || 'Visit website').trim().substring(0, 25), url: (b.value || '').trim() };
+          }
+          if (b.type === 'Call phone number') {
+            const fullPhone = `${b.countryCode || '+91'}${b.value}`.replace(/[^\d+]/g, '');
+            return { type: 'PHONE_NUMBER', text: (b.text || 'Call us').trim().substring(0, 25), phone_number: fullPhone };
+          }
+          if (b.type === 'Copy offer code') {
+            return { type: 'COPY_CODE', example: (b.value || 'OFFER').trim().substring(0, 15) };
+          }
+          // Custom or Marketing opt-out
+          return { type: 'QUICK_REPLY', text: (b.text || 'Quick Reply').trim().substring(0, 25) };
+        }).filter(b => {
+          if (b.type === 'URL') return b.text && b.url;
+          if (b.type === 'PHONE_NUMBER') return b.text && b.phone_number;
+          if (b.type === 'COPY_CODE') return b.example;
+          if (b.type === 'QUICK_REPLY') return b.text;
+          return false;
+        });
         
         if (waButtons.length > 0) {
           components.push({ type: 'BUTTONS', buttons: waButtons });
@@ -1432,7 +1672,7 @@ const CreateTemplate = () => {
 
   // ================= SETUP / CONTENT UI (UNCHANGED) =================
   return (
-    <div className="flex flex-col lg:flex-row min-h-screen w-full bg-white overflow-hidden font-sans animate-in fade-in duration-500 relative">
+    <div className="flex flex-col lg:flex-row h-screen max-h-screen w-full bg-white overflow-hidden font-sans animate-in fade-in duration-500 relative">
       {/* UPGRADE PLAN MODAL */}
       {upgradeModal.isOpen && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 backdrop-blur-sm animate-in fade-in duration-200">
@@ -1481,11 +1721,9 @@ const CreateTemplate = () => {
           </div>
         </div>
       )}
-      {/* REST OF YOUR ORIGINAL FILE BELOW — 100% SAME */}
 
-      
       {/* Scrollable Form Container */}
-      <div className="flex-1 p-4 md:p-6 lg:p-10 overflow-y-auto border-r border-slate-100 bg-[#F8FAFC]">
+      <div className="flex-1 h-full overflow-y-auto p-4 md:p-6 lg:p-10 border-r border-slate-100 bg-[#F8FAFC]">
         <div className="max-w-3xl mx-auto space-y-5 pb-20">
           <div className="flex items-center justify-between mb-4">
             <button
@@ -1545,6 +1783,11 @@ const CreateTemplate = () => {
                                   setTemplateType(type);
                                   if (type === 'MPM' && (!formData.headerType || formData.headerType === 'None')) {
                                     setFormData(prev => ({ ...prev, headerType: 'Text', headerText: prev.headerText || 'Featured Products' }));
+                                  }
+                                  if (type === 'LIMITED_TIME_OFFER') {
+                                    if (formData.headerType === 'Text' || formData.headerType === 'Document') {
+                                      setFormData(prev => ({ ...prev, headerType: 'None' }));
+                                    }
                                   }
                                   setSubmitError(null);
                                   setHeaderError(false);
@@ -1788,11 +2031,16 @@ const CreateTemplate = () => {
                             }}
                         >
                             <option value="None">{templateType === 'MPM' ? 'None (Header is required for MPM)' : 'None'}</option>
-                            <option value="Text">Text</option>
+                            {templateType !== 'LIMITED_TIME_OFFER' && <option value="Text">Text</option>}
                             <option value="Image">Image</option>
                             <option value="Video">Video</option>
-                            <option value="Document">Document</option>
+                            {templateType !== 'LIMITED_TIME_OFFER' && <option value="Document">Document</option>}
                         </select>
+                        {templateType === 'LIMITED_TIME_OFFER' && (
+                          <p className="text-[11px] text-gray-500 mt-2">
+                            WhatsApp allows <strong>Image</strong> or <strong>Video</strong> headers (or <strong>None</strong>) for Limited-Time Offers.
+                          </p>
+                        )}
 
                         {formData.headerType === 'Text' && (
                           <div className="mt-4 space-y-2">
@@ -1968,7 +2216,8 @@ const CreateTemplate = () => {
                             contentEditable
                             suppressContentEditableWarning
                             onInput={syncEditorContent}
-                            className="w-full p-3 md:p-4 outline-none text-sm font-medium text-gray-700 leading-relaxed bg-white min-h-[120px]"
+                            data-placeholder="Enter the text for your message here... Use {{1}}, {{2}} etc. for dynamic variables."
+                            className="w-full p-3 md:p-4 outline-none text-sm font-medium text-gray-700 leading-relaxed bg-white min-h-[120px] empty:before:content-[attr(data-placeholder)] empty:before:text-gray-400 empty:before:pointer-events-none"
                             style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
                         />
                     </div>
@@ -2011,7 +2260,24 @@ const CreateTemplate = () => {
                                 <button type="button" onClick={() => applyFormat('bold')} title="Bold"><Bold size={18}/></button>
                                 <button type="button" onClick={() => applyFormat('italic')} title="Italic"><Italic size={18}/></button>
                                 <button type="button" onClick={() => applyFormat('strikeThrough')} title="Strikethrough"><Strikethrough size={18}/></button>
-                                <button type="button" onClick={() => applyFormat('fontName')} title="Monospace"><Link2 size={18}/></button>
+                                {/* Monospace: wrap selection in <code> tags using insertHTML */}
+                                <button
+                                  type="button"
+                                  title="Monospace (code)"
+                                  onClick={() => {
+                                    const sel = window.getSelection();
+                                    if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+                                      const range = sel.getRangeAt(0);
+                                      const selectedText = range.toString();
+                                      document.execCommand('insertHTML', false, `<code style="font-family:monospace;background:#f1f5f9;padding:1px 4px;border-radius:3px">${selectedText}</code>`);
+                                    } else {
+                                      document.execCommand('insertHTML', false, `<code style="font-family:monospace;background:#f1f5f9;padding:1px 4px;border-radius:3px">code</code>`);
+                                    }
+                                    syncEditorContent();
+                                  }}
+                                >
+                                  <Link2 size={18} className="hover:text-purple-500 transition-colors"/>
+                                </button>
                             </div>
                             <button type="button" onClick={insertVariable} className="text-sm font-bold text-gray-700 flex items-center gap-1.5 hover:text-blue-600 transition-all">
                                 <Plus size={16}/> Add Variable
@@ -2020,25 +2286,41 @@ const CreateTemplate = () => {
                     </div>
 
                     {/* FOOTER SECTION */}
-                    <div className="mt-8 border-t border-gray-50 pt-6">
-                        <div className="flex flex-col gap-1 mb-3">
-                            <h3 className="text-sm md:text-base font-bold text-gray-800">Footer <span className="text-gray-400 font-normal text-sm ml-1">(Optional)</span></h3>
-                            <p className="text-xs text-gray-500">Add a short line of text to the bottom of your message.</p>
-                        </div>
-                        <div className="relative">
-                            <input 
-                                type="text" 
-                                value={formData.footerText} 
-                                onChange={(e) => setFormData({...formData, footerText: e.target.value})} 
-                                placeholder="Enter footer text..."
-                                maxLength={60}
-                                className="w-full p-4 border border-gray-200 rounded-lg text-sm font-medium outline-none bg-white focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all" 
-                            />
-                            <div className="flex justify-end mt-1">
-                                <span className="text-[10px] font-medium text-gray-400">{formData.footerText?.length || 0}/60</span>
+                    {templateType === 'LIMITED_TIME_OFFER' ? (
+                      <div className="mt-8 border-t border-gray-50 pt-6">
+                        <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4">
+                          <div className="flex items-start gap-2.5">
+                            <span className="text-amber-600 text-sm mt-0.5">ℹ️</span>
+                            <div>
+                              <h4 className="text-xs font-semibold text-amber-900">Footer not permitted for Limited-Time Offers</h4>
+                              <p className="text-[11px] text-amber-700 mt-0.5 leading-relaxed">
+                                WhatsApp rules do not allow a footer component on Limited-Time Offer templates because the countdown timer and offer banner occupy the bottom section.
+                              </p>
                             </div>
+                          </div>
                         </div>
-                    </div>
+                      </div>
+                    ) : (
+                      <div className="mt-8 border-t border-gray-50 pt-6">
+                          <div className="flex flex-col gap-1 mb-3">
+                              <h3 className="text-sm md:text-base font-bold text-gray-800">Footer <span className="text-gray-400 font-normal text-sm ml-1">(Optional)</span></h3>
+                              <p className="text-xs text-gray-500">Add a short line of text to the bottom of your message.</p>
+                          </div>
+                          <div className="relative">
+                              <input 
+                                  type="text" 
+                                  value={formData.footerText} 
+                                  onChange={(e) => setFormData({...formData, footerText: e.target.value})} 
+                                  placeholder="Enter footer text..."
+                                  maxLength={60}
+                                  className="w-full p-4 border border-gray-200 rounded-lg text-sm font-medium outline-none bg-white focus:border-[#10B981] focus:ring-1 focus:ring-[#10B981] transition-all" 
+                              />
+                              <div className="flex justify-end mt-1">
+                                  <span className="text-[10px] font-medium text-gray-400">{formData.footerText?.length || 0}/60</span>
+                              </div>
+                          </div>
+                      </div>
+                    )}
 
                     {bodyVariables.length > 0 && (
                       <div className="mt-5 rounded-xl border border-gray-200 bg-white p-5 md:p-6 shadow-sm">
@@ -2124,54 +2406,343 @@ const CreateTemplate = () => {
                                             </div>
                                         </div>
                                         <div>
-                                            <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide">Button Text</label>
-                                            <div className="relative">
+                                            <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide flex items-center gap-1.5">
+                                                Button Text
+                                                <span className="inline-flex items-center gap-1 text-[10px] font-semibold bg-amber-100 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded-full normal-case tracking-normal">
+                                                    <Lock size={9} /> Locked by WhatsApp
+                                                </span>
+                                            </label>
+                                            <div className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-gray-50 text-gray-500 cursor-not-allowed flex items-center justify-between">
+                                                <span>View items</span>
+                                                <Lock size={13} className="text-gray-400" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <p className="text-xs text-gray-500 mt-2">
+                                    WhatsApp mandates the button text is always <strong>&quot;View items&quot;</strong> for Multi-Product Messages — this cannot be changed.
+                                </p>
+                            </div>
+                        ) : templateType === 'LIMITED_TIME_OFFER' ? (
+                            <div className="space-y-6">
+                                <div>
+                                    <h3 className="text-sm md:text-base font-bold text-gray-800 mb-1 flex items-center gap-2">
+                                        Limited-Time Offer Details
+                                        <span className="text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200 px-2 py-0.5 rounded-full uppercase">
+                                          Countdown & Offer Banner
+                                        </span>
+                                    </h3>
+                                    <p className="text-xs text-gray-500 mb-4">
+                                        Configure the promotional banner and countdown timer that WhatsApp renders natively.
+                                    </p>
+
+                                    <div className="p-4 md:p-5 bg-white border border-[#10B981] rounded-xl space-y-5 shadow-sm">
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
+                                            <div>
+                                                <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide flex items-center justify-between">
+                                                    <span>Offer Heading Text</span>
+                                                    <span className="text-[10px] font-medium text-gray-400">
+                                                        {(formData.limitedTimeOfferText || '').length}/16
+                                                    </span>
+                                                </label>
                                                 <input 
                                                     type="text" 
-                                                    value={formData.mpmButtonText || ''} 
-                                                    onChange={(e) => setFormData({...formData, mpmButtonText: e.target.value})}
-                                                    maxLength={20}
+                                                    value={formData.limitedTimeOfferText || ''} 
+                                                    onChange={(e) => setFormData({...formData, limitedTimeOfferText: e.target.value})}
+                                                    maxLength={16}
                                                     className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-white outline-none focus:border-[#10B981] transition-all" 
-                                                    placeholder="View Items"
+                                                    placeholder="Expiring offer!"
                                                 />
-                                                <div className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-medium text-gray-400">
-                                                    {(formData.mpmButtonText || '').length}/20
+                                                <p className="text-[11px] text-gray-400 mt-1">E.g., &quot;Expiring offer!&quot; or &quot;20% OFF&quot; (Max 16 chars)</p>
+                                            </div>
+
+                                            <div>
+                                                <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide">
+                                                    Countdown Timer
+                                                </label>
+                                                <div className="flex items-center justify-between p-2.5 bg-gray-50 border border-gray-200 rounded-lg">
+                                                    <div className="flex items-center gap-2">
+                                                        <Clock size={16} className="text-[#10B981]" />
+                                                        <span className="text-xs font-semibold text-gray-700">Display Live Countdown</span>
+                                                    </div>
+                                                    <label className="relative inline-flex items-center cursor-pointer">
+                                                        <input 
+                                                            type="checkbox" 
+                                                            className="sr-only peer" 
+                                                            checked={formData.hasExpiration !== false} 
+                                                            onChange={(e) => setFormData({...formData, hasExpiration: e.target.checked})} 
+                                                        />
+                                                        <div className="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#10B981]"></div>
+                                                    </label>
+                                                </div>
+                                                <p className="text-[11px] text-gray-400 mt-1">Turns red in WhatsApp within the last hour of expiration</p>
+                                            </div>
+                                        </div>
+
+                                        {/* Expiration Timing Options */}
+                                        {formData.hasExpiration !== false && (
+                                            <div className="pt-4 mt-2 border-t border-gray-100 space-y-3">
+                                                <div className="flex items-center justify-between">
+                                                    <label className="text-[11px] font-bold text-gray-700 uppercase tracking-wide flex items-center gap-1.5">
+                                                        <span>Set Timing of Expiration</span>
+                                                        <span className="text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-md normal-case">
+                                                            Countdown Length
+                                                        </span>
+                                                    </label>
+                                                    <span className="text-[10px] font-bold text-[#10B981] bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full flex items-center gap-1">
+                                                        <Clock size={11} />
+                                                        Active Timer: {getExpirationPreviewText(formData.expirationDate || '24h', formData.customExpirationHours || 24)}
+                                                    </span>
+                                                </div>
+
+                                                {/* Preset Pill Buttons */}
+                                                <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                                                    {[
+                                                        { label: '6 Hours', val: '6h' },
+                                                        { label: '12 Hours', val: '12h' },
+                                                        { label: '24 Hours', val: '24h' },
+                                                        { label: '48 Hours', val: '48h' },
+                                                        { label: '3 Days', val: '72h' },
+                                                        { label: 'Custom', val: 'custom' }
+                                                    ].map(opt => (
+                                                        <button
+                                                            key={opt.val}
+                                                            type="button"
+                                                            onClick={() => setFormData({...formData, expirationDate: opt.val})}
+                                                            className={`py-2 px-2 rounded-lg text-xs font-semibold border transition-all text-center ${
+                                                                (formData.expirationDate || '24h') === opt.val
+                                                                    ? 'bg-[#10B981] text-white border-[#10B981] shadow-xs'
+                                                                    : 'bg-gray-50 text-gray-700 border-gray-200 hover:border-gray-300 hover:bg-white'
+                                                            }`}
+                                                        >
+                                                            {opt.label}
+                                                        </button>
+                                                    ))}
+                                                </div>
+
+                                                {/* Custom Hours Input if Custom selected */}
+                                                {formData.expirationDate === 'custom' && (
+                                                    <div className="flex items-center gap-3 p-3 bg-gray-50 border border-gray-200 rounded-lg animate-in fade-in">
+                                                        <span className="text-xs font-semibold text-gray-700">Expire after:</span>
+                                                        <div className="relative w-28">
+                                                            <input 
+                                                                type="number" 
+                                                                min="1" 
+                                                                max="720"
+                                                                value={formData.customExpirationHours || 24}
+                                                                onChange={(e) => setFormData({...formData, customExpirationHours: Math.max(1, parseInt(e.target.value) || 1)})}
+                                                                className="w-full p-2 border border-gray-200 rounded-lg text-sm font-bold text-center bg-white outline-none focus:border-[#10B981]"
+                                                            />
+                                                        </div>
+                                                        <span className="text-xs font-semibold text-gray-700">Hours</span>
+                                                        <span className="text-[11px] text-gray-400">
+                                                            ({Math.round(((formData.customExpirationHours || 24) / 24) * 10) / 10} days)
+                                                        </span>
+                                                    </div>
+                                                )}
+                                                <p className="text-[11px] text-gray-400">
+                                                    Sets how long recipient has to redeem this offer before the countdown ends.
+                                                </p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <h3 className="text-sm md:text-base font-bold text-gray-800 mb-1 flex items-center gap-2">
+                                        Buttons
+                                        <span className="text-[10px] font-bold bg-blue-100 text-blue-700 border border-blue-200 px-2 py-0.5 rounded-full uppercase">
+                                          WhatsApp Mandated
+                                        </span>
+                                    </h3>
+                                    <p className="text-xs text-gray-500 mb-4">
+                                        WhatsApp requires a Copy Code button for Limited-Time Offers so users can tap to copy the coupon code to clipboard.
+                                    </p>
+
+                                    <div className="space-y-4">
+                                        {/* Copy Code Button (Mandatory) */}
+                                        <div className="p-4 md:p-5 bg-white border border-gray-200 rounded-xl shadow-sm">
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
+                                                <div>
+                                                    <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide flex items-center gap-1.5">
+                                                        Button 1: Type
+                                                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold bg-emerald-100 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded-full normal-case">
+                                                            <Lock size={9} /> Copy Code (Native)
+                                                        </span>
+                                                    </label>
+                                                    <div className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-gray-50 text-gray-500 cursor-not-allowed flex items-center gap-2">
+                                                        <Copy size={14} className="text-gray-400" />
+                                                        <span>Copy code</span>
+                                                    </div>
+                                                    <p className="text-[11px] text-gray-400 mt-1">WhatsApp automatically labels this button &quot;Copy code&quot;</p>
+                                                </div>
+
+                                                <div>
+                                                    <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide flex items-center justify-between">
+                                                        <span>Offer / Coupon Code</span>
+                                                        <span className="text-[10px] font-medium text-gray-400">
+                                                            {(formData.offerCode || '').length}/15
+                                                        </span>
+                                                    </label>
+                                                    <input 
+                                                        type="text" 
+                                                        value={formData.offerCode || ''} 
+                                                        onChange={(e) => setFormData({...formData, offerCode: e.target.value.toUpperCase()})}
+                                                        maxLength={15}
+                                                        className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-mono font-bold bg-white outline-none focus:border-[#10B981] transition-all uppercase" 
+                                                        placeholder="SALE20"
+                                                    />
+                                                    <p className="text-[11px] text-gray-400 mt-1">Copied to clipboard when tapped (Max 15 characters)</p>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* Website URL Button (Mandatory by WhatsApp at index 1) */}
+                                        <div className="p-4 md:p-5 bg-white border border-gray-200 rounded-xl shadow-sm">
+                                            <div className="flex items-center gap-2 mb-4">
+                                                <ExternalLink size={16} className="text-blue-600" />
+                                                <span className="text-xs font-bold text-gray-700 uppercase tracking-wide flex items-center gap-1.5">
+                                                    Button 2: Website URL
+                                                    <span className="inline-flex items-center gap-1 text-[10px] font-semibold bg-blue-100 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded-full normal-case">
+                                                        <Lock size={9} /> Required by WhatsApp
+                                                    </span>
+                                                </span>
+                                            </div>
+
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
+                                                <div>
+                                                    <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide flex items-center justify-between">
+                                                        <span>Button Text</span>
+                                                        <span className="text-[10px] font-medium text-gray-400">
+                                                            {(formData.ltoUrlText || '').length}/25
+                                                        </span>
+                                                    </label>
+                                                    <input 
+                                                        type="text" 
+                                                        value={formData.ltoUrlText || ''} 
+                                                        onChange={(e) => setFormData({...formData, ltoUrlText: e.target.value})}
+                                                        maxLength={25}
+                                                        className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-white outline-none focus:border-[#10B981] transition-all" 
+                                                        placeholder="Shop Now"
+                                                    />
+                                                    <p className="text-[11px] text-gray-400 mt-1">Label shown on the link button (e.g. &quot;Shop Now&quot;)</p>
+                                                </div>
+                                                <div>
+                                                    <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide">
+                                                        Website URL
+                                                    </label>
+                                                    <input 
+                                                        type="url" 
+                                                        value={formData.ltoUrl || ''} 
+                                                        onChange={(e) => setFormData({...formData, ltoUrl: e.target.value})}
+                                                        className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-medium bg-white outline-none focus:border-[#10B981] transition-all" 
+                                                        placeholder="https://example.com/offers"
+                                                    />
+                                                    <p className="text-[11px] text-gray-400 mt-1">Web address opened when tapped (Must start with https://)</p>
                                                 </div>
                                             </div>
                                         </div>
                                     </div>
                                 </div>
-                                <p className="text-xs text-gray-500 mt-2">This button opens a curated selection of products inside WhatsApp.</p>
                             </div>
                         ) : (
                         <>
-                        <div className="flex justify-between items-center mb-4">
-                            <h3 className="text-sm md:text-base font-bold text-gray-800">Buttons </h3>
-                            <button onClick={addButton} disabled={buttons.length >= 3} className="text-xs font-bold text-blue-600 flex items-center gap-1.5 bg-blue-50 px-4 py-2 rounded-lg hover:bg-blue-100 transition-all disabled:opacity-30">
-                                <Plus size={14}/> Add New
-                            </button>
+                        <div className="flex justify-between items-center mb-4 relative" ref={buttonMenuRef}>
+                            <h3 className="text-sm md:text-base font-bold text-gray-800">Buttons</h3>
+                            
+                            <div className="relative">
+                              <button 
+                                type="button"
+                                onClick={addButton} 
+                                disabled={buttons.length >= 10} 
+                                className="text-xs font-bold text-blue-600 flex items-center gap-1.5 bg-blue-50 px-4 py-2 rounded-lg hover:bg-blue-100 transition-all disabled:opacity-40 cursor-pointer shadow-xs"
+                              >
+                                  <Plus size={14}/> Add button
+                              </button>
+
+                              {/* WhatsTool exact style Button Picker Popup (Intelligently opens UP or DOWN based on screen space) */}
+                              {showButtonMenu && (
+                                <div className={`absolute right-0 ${menuPlacement === 'up' ? 'bottom-full mb-2' : 'top-full mt-2'} w-72 bg-white rounded-2xl shadow-2xl border border-gray-200/80 py-3 z-50 animate-in fade-in zoom-in-95 duration-150`}>
+                                  
+                                  {/* Quick Reply Section */}
+                                  <div className="px-4 pb-2">
+                                    <h4 className="text-xs font-bold text-gray-900 tracking-tight">Quick reply buttons</h4>
+                                  </div>
+
+                                  <div className="space-y-0.5">
+                                    <button
+                                      type="button"
+                                      disabled={quickReplyButtonCount >= 3}
+                                      onClick={() => addSpecificButton('Marketing opt-out')}
+                                      className="w-full px-4 py-2 text-left hover:bg-gray-50 transition-colors flex flex-col disabled:opacity-35 disabled:cursor-not-allowed group cursor-pointer"
+                                    >
+                                      <span className="text-sm font-medium text-gray-800 group-hover:text-blue-600 transition-colors">Marketing opt-out</span>
+                                      <span className="text-[11px] text-gray-400 font-normal">Recommended</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      disabled={quickReplyButtonCount >= 3}
+                                      onClick={() => addSpecificButton('Custom')}
+                                      className="w-full px-4 py-2 text-left hover:bg-gray-50 transition-colors flex flex-col disabled:opacity-35 disabled:cursor-not-allowed group cursor-pointer"
+                                    >
+                                      <span className="text-sm font-medium text-gray-800 group-hover:text-blue-600 transition-colors">Custom</span>
+                                    </button>
+                                  </div>
+
+                                  <div className="my-2 border-t border-gray-100" />
+
+                                  {/* Call to Action Section */}
+                                  <div className="px-4 pb-2">
+                                    <h4 className="text-xs font-bold text-gray-900 tracking-tight">Call to action buttons</h4>
+                                  </div>
+
+                                  <div className="space-y-0.5">
+                                    <button
+                                      type="button"
+                                      disabled={websiteButtonCount >= 2}
+                                      onClick={() => addSpecificButton('Visit website')}
+                                      className="w-full px-4 py-2 text-left hover:bg-gray-50 transition-colors flex flex-col disabled:opacity-35 disabled:cursor-not-allowed group cursor-pointer"
+                                    >
+                                      <span className="text-sm font-medium text-gray-800 group-hover:text-blue-600 transition-colors">Visit website</span>
+                                      <span className="text-[11px] text-gray-400 font-normal">2 buttons maximum</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      disabled={phoneButtonCount >= 1}
+                                      onClick={() => addSpecificButton('Call phone number')}
+                                      className="w-full px-4 py-2 text-left hover:bg-gray-50 transition-colors flex flex-col disabled:opacity-35 disabled:cursor-not-allowed group cursor-pointer"
+                                    >
+                                      <span className="text-sm font-medium text-gray-800 group-hover:text-blue-600 transition-colors">Call phone number</span>
+                                      <span className="text-[11px] text-gray-400 font-normal">1 buttons maximum</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      disabled={copyCodeButtonCount >= 1}
+                                      onClick={() => addSpecificButton('Copy offer code')}
+                                      className="w-full px-4 py-2 text-left hover:bg-gray-50 transition-colors flex flex-col disabled:opacity-35 disabled:cursor-not-allowed group cursor-pointer"
+                                    >
+                                      <span className="text-sm font-medium text-gray-800 group-hover:text-blue-600 transition-colors">Copy offer code</span>
+                                      <span className="text-[11px] text-gray-400 font-normal">1 buttons maximum</span>
+                                    </button>
+                                  </div>
+
+                                </div>
+                              )}
+                            </div>
                         </div>
+
                         <div className="space-y-4">
                             {buttons.map((btn) => (
                                 <div key={btn.id} className="p-4 md:p-5 bg-white border border-gray-200 rounded-xl flex items-center gap-4 relative group hover:border-gray-300 transition-all shadow-sm">
-                                    <div className={`grid grid-cols-1 ${btn.type === 'Call phone number' ? 'md:grid-cols-4' : btn.type === 'Custom' ? 'md:grid-cols-2' : 'md:grid-cols-3'} gap-4 md:gap-6 flex-1`}>
+                                    <div className={`grid grid-cols-1 ${btn.type === 'Call phone number' ? 'md:grid-cols-4' : btn.type === 'Custom' || btn.type === 'Marketing opt-out' ? 'md:grid-cols-2' : btn.type === 'Copy offer code' ? 'md:grid-cols-2' : 'md:grid-cols-3'} gap-4 md:gap-6 flex-1`}>
                                         <div>
                                             <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide">Type of Action</label>
-                                            <select 
-                                              value={btn.type}
-                                              onChange={(e) => {
-                                                const newType = e.target.value;
-                                                updateButton(btn.id, 'type', newType);
-                                                if (newType === 'Custom' && (!btn.text || btn.text === 'Visit website' || btn.text === 'Call phone number')) {
-                                                  updateButton(btn.id, 'text', 'Quick Reply');
-                                                }
-                                              }}
-                                              className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-white outline-none focus:border-blue-400 transition-all cursor-pointer"
-                                            >
-                                              <option>Visit website</option>
-                                              <option>Call phone number</option>
-                                              <option>Custom</option>
-                                            </select>
+                                            <div className="w-full p-2.5 border border-gray-100 rounded-lg text-sm font-semibold bg-gray-50 text-gray-700">
+                                              {btn.type}
+                                            </div>
                                         </div>
                                         <div>
                                             <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide">Button Text</label>
@@ -2182,7 +2753,13 @@ const CreateTemplate = () => {
                                                 maxLength={25}
                                                 onChange={(e) => updateButton(btn.id, 'text', e.target.value)}
                                                 className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-white outline-none focus:border-blue-400 transition-all" 
-                                                placeholder={btn.type === 'Custom' ? 'e.g. Yes, Interested' : btn.type === 'Call phone number' ? 'Call us' : 'Visit website'}
+                                                placeholder={
+                                                  btn.type === 'Marketing opt-out' ? 'Stop promotions' :
+                                                  btn.type === 'Custom' ? 'e.g. Yes, Interested' : 
+                                                  btn.type === 'Call phone number' ? 'Call us' : 
+                                                  btn.type === 'Copy offer code' ? 'Copy offer code' :
+                                                  'Visit website'
+                                                }
                                               />
                                               <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-gray-400 font-medium">
                                                 {(btn.text || '').length}/25
@@ -2227,24 +2804,37 @@ const CreateTemplate = () => {
                                                 </div>
                                             </div>
                                           </>
-                                        ) : btn.type === 'Custom' ? null : (
-                                          <>
-                                            <div>
-                                                <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide">Website URL</label>
-                                                <div className="relative">
-                                                  <input 
-                                                    type="text" 
-                                                    value={btn.value} 
-                                                    onChange={(e) => updateButton(btn.id, 'value', e.target.value)}
-                                                    className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-white outline-none focus:border-blue-400 transition-all" 
-                                                    placeholder="https://..."
-                                                  />
-                                                </div>
-                                            </div>
-                                          </>
+                                        ) : btn.type === 'Copy offer code' ? (
+                                          <div>
+                                              <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide flex items-center justify-between">
+                                                <span>Coupon / Offer Code</span>
+                                                <span className="text-[10px] text-gray-400">{(btn.value || '').length}/15</span>
+                                              </label>
+                                              <input 
+                                                type="text" 
+                                                value={btn.value} 
+                                                maxLength={15}
+                                                onChange={(e) => updateButton(btn.id, 'value', e.target.value.toUpperCase())}
+                                                className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-mono font-bold uppercase bg-white outline-none focus:border-blue-400 transition-all" 
+                                                placeholder="OFFER20"
+                                              />
+                                          </div>
+                                        ) : (btn.type === 'Custom' || btn.type === 'Marketing opt-out') ? null : (
+                                          <div>
+                                              <label className="text-[11px] font-bold text-gray-600 block mb-2 uppercase tracking-wide">Website URL</label>
+                                              <div className="relative">
+                                                <input 
+                                                  type="text" 
+                                                  value={btn.value} 
+                                                  onChange={(e) => updateButton(btn.id, 'value', e.target.value)}
+                                                  className="w-full p-2.5 border border-gray-200 rounded-lg text-sm font-semibold bg-white outline-none focus:border-blue-400 transition-all" 
+                                                  placeholder="https://example.com"
+                                                />
+                                              </div>
+                                          </div>
                                         )}
                                     </div>
-                                    <button onClick={() => removeButton(btn.id)} className="p-2 text-gray-400 hover:text-gray-800 transition-colors">
+                                    <button type="button" onClick={() => removeButton(btn.id)} className="p-2 text-gray-400 hover:text-gray-800 transition-colors cursor-pointer">
                                         <X size={20}/>
                                     </button>
                                 </div>
@@ -2294,27 +2884,33 @@ const CreateTemplate = () => {
         </div>
       </div>
 
-      {/* Responsive Preview Sidebar */}
-      <div className="w-full lg:w-[450px] xl:w-[480px] bg-white p-6 md:p-10 flex flex-col items-center border-t lg:border-t-0 lg:border-l border-slate-100 relative overflow-y-auto">
-        <div className="lg:sticky lg:top-0 w-full flex flex-col items-center">
-            <div className="flex justify-between w-full mb-8 lg:mb-12">
+      {/* Responsive Preview Sidebar (Permanently Fixed on Screen) */}
+      <div className="w-full lg:w-[420px] xl:w-[450px] bg-white px-4 py-6 md:p-8 flex flex-col items-center border-t lg:border-t-0 lg:border-l border-slate-100 relative h-full overflow-hidden shrink-0">
+        <div className="w-full flex flex-col items-center h-full justify-between pb-4">
+            <div className="flex justify-between w-full mb-3 shrink-0">
                 <p className="text-gray-800 font-semibold text-sm uppercase tracking-wide">Live Preview</p>
-                <div className="flex items-center gap-2 bg-green-50 px-3 md:px-4 py-1.5 md:py-2 rounded-full">
+                <div className="flex items-center gap-2 bg-green-50 px-3 py-1 rounded-full">
                     <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"/>
                     <span className="text-xs font-semibold text-green-600 uppercase tracking-wide">Synced</span>
                 </div>
             </div>
-            {/* Scale adjustment for smaller laptop screens */}
-            <div className="transform scale-75 sm:scale-90 lg:scale-95 origin-top">
+            {/* Centered Fixed Phone Mockup */}
+            <div className="flex-1 flex items-center justify-center w-full">
           <MobilePreview 
             name={formData.name || 'YOUR_TEMPLATE'} 
             body={formData.bodyText} 
-            footer={formData.category === 'Authentication' ? '' : formData.footerText} 
+            footer={(formData.category === 'Authentication' || templateType === 'LIMITED_TIME_OFFER') ? '' : formData.footerText} 
             headerMedia={headerMedia}
             headerType={formData.headerType}
             showImage={formData.category !== 'Authentication' && formData.headerType !== 'None'} 
             offer={formData.offerTitle} 
             isLimited={templateType === 'LIMITED_TIME_OFFER'}
+            limitedTimeOfferText={formData.limitedTimeOfferText}
+            hasExpiration={formData.hasExpiration}
+            expirationPreviewText={getExpirationPreviewText(formData.expirationDate || '24h', formData.customExpirationHours || 24)}
+            offerCode={formData.offerCode}
+            ltoHasUrlButton={formData.ltoHasUrlButton}
+            ltoUrlText={formData.ltoUrlText}
             isCatalog={templateType === 'CATALOG'}
             isMpm={templateType === 'MPM'}
             catalogButtonText={formData.catalogButtonText}
@@ -2399,13 +2995,33 @@ const CreateTemplate = () => {
   );
 };
 
-const MobilePreview = ({ name, body, footer, showImage = false, isLimited = false, isCatalog = false, isMpm = false, catalogButtonText = "", mpmButtonText = "", buttons = [], headerMedia = null, headerType = 'None', isSetupView = false }) => {
+const MobilePreview = ({ 
+  name, 
+  body, 
+  footer, 
+  showImage = false, 
+  isLimited = false, 
+  limitedTimeOfferText = 'Expiring offer!',
+  hasExpiration = true,
+  expirationPreviewText = '23:59:59',
+  offerCode = 'SALE20',
+  ltoHasUrlButton = false,
+  ltoUrlText = 'Shop Now',
+  isCatalog = false, 
+  isMpm = false, 
+  catalogButtonText = "", 
+  mpmButtonText = "", 
+  buttons = [], 
+  headerMedia = null, 
+  headerType = 'None', 
+  isSetupView = false 
+}) => {
   if (isSetupView) {
     return (
-      <div className="relative w-[285px] h-[585px] bg-white rounded-[2.5rem] border-[12px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
+      <div className="relative w-[260px] h-[525px] bg-white rounded-[2rem] border-[6px] border-[#1e293b] shadow-xl overflow-hidden font-sans flex flex-col items-center">
         {/* Notch */}
-        <div className="absolute top-0 w-32 h-[24px] bg-[#1e293b] rounded-b-[18px] z-20 flex justify-center">
-           <div className="w-12 h-1.5 bg-white/20 rounded-full mt-1.5"></div>
+        <div className="absolute top-0 w-28 h-[18px] bg-[#1e293b] rounded-b-[14px] z-20 flex justify-center">
+           <div className="w-10 h-1 bg-white/20 rounded-full mt-1"></div>
         </div>
         
         {/* Screen Background */}
@@ -2429,49 +3045,64 @@ const MobilePreview = ({ name, body, footer, showImage = false, isLimited = fals
                  {/* Laptop */}
                  <div className="w-[86px] h-[30px] bg-[#e5eaf0] rounded-t-[4px] relative z-30"></div>
               </div>
-              
+
+              {/* Message Details */}
               <div className="p-4 flex flex-col">
-                 <div className="text-[13px] text-[#2c3e50] font-normal leading-relaxed mb-2">
-                   Hey there! Check out our fresh groceries now!
-                   <br /><br />
-                   Use code <strong>HEALTH</strong> to get additional 10% off on your entire purchase.
-                 </div>
+                 <p className="text-[11px] text-[#10B981] font-bold mb-2 uppercase tracking-wide">[YOUR_TEMPLATE]</p>
+                 <p className="text-[9px] text-[#333] font-normal leading-relaxed">
+                   Hello John, thank you for choosing our services! We are excited to assist you with your upcoming project.
+                 </p>
                  
-                 <div className="flex justify-end">
+                 <div className="flex justify-end mt-2">
                     <span className="text-[10px] text-gray-400 font-semibold">11:59</span>
                  </div>
               </div>
-              
+
+              {/* Action Button */}
+              <div className="border-t border-gray-100 w-full bg-[#fafafa]">
+                 <div className="w-full py-3 flex items-center justify-center gap-2">
+                    <span className="text-[#25d366] font-bold text-[9px]">Visit Website</span>
+                 </div>
+              </div>
            </div>
         </div>
       </div>
     );
   }
 
-  // Dynamic preview for content phase
   return (
-    <div className="relative w-[285px] h-[585px] bg-white rounded-[2.5rem] border-[12px] border-[#1e293b] shadow-2xl overflow-hidden font-sans flex flex-col items-center">
+    <div className="relative w-[255px] h-[520px] bg-white rounded-[2rem] border-[5px] border-[#1e293b] shadow-xl overflow-hidden font-sans flex flex-col items-center">
       {/* Notch */}
-      <div className="absolute top-0 w-32 h-[24px] bg-[#1e293b] rounded-b-[18px] z-20 flex justify-center">
-         <div className="w-12 h-1.5 bg-white/20 rounded-full mt-1.5"></div>
+      <div className="absolute top-0 w-28 h-[18px] bg-[#1e293b] rounded-b-[14px] z-20 flex justify-center">
+         <div className="w-10 h-1 bg-white/20 rounded-full mt-1"></div>
       </div>
       
       {/* Screen Background */}
       <div className="w-full h-full bg-[#e5ddd5] pt-12 pb-6 px-3.5 overflow-y-auto custom-scrollbar flex flex-col">
          {/* Message Bubble Card */}
          <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden mt-2 flex flex-col w-full shrink-0">
-            {showImage && (
-              <div className="w-full relative overflow-hidden bg-gray-50 shrink-0 min-h-[110px] max-h-[220px] flex items-center justify-center">
-                {headerMedia ? (
+            {/* Header Media */}
+            {headerType !== 'None' && (
+              <div className="w-full relative bg-gray-100 flex items-center justify-center shrink-0 border-b border-gray-50 overflow-hidden">
+                {headerMedia?.preview ? (
                   <>
-                    {headerMedia.type === 'image' && (
-                      <img src={headerMedia.preview} alt="header" className="w-full h-auto max-h-[220px] object-contain bg-slate-900/5"/>
+                    {headerType === 'Image' && (
+                      <img 
+                        src={headerMedia.preview} 
+                        alt="Header preview" 
+                        className="w-full h-auto max-h-[180px] object-cover" 
+                      />
                     )}
-                    {headerMedia.type === 'video' && (
-                      <video src={headerMedia.preview} className="w-full h-auto max-h-[220px] object-contain bg-black" controls={false}/>
+                    {headerType === 'Video' && (
+                      <video 
+                        src={headerMedia.preview} 
+                        className="w-full h-auto max-h-[180px] object-cover" 
+                        controls 
+                      />
                     )}
-                    {headerMedia.type === 'document' && (
-                      <div className="w-full h-32 bg-red-50 flex items-center justify-center flex-col gap-2">
+                    {headerType === 'Document' && (
+                      <div className="w-full h-24 bg-red-50 flex items-center justify-center gap-2">
+                        <span className="text-2xl">📄</span>
                         <div className="text-3xl font-bold text-red-600">{headerMedia.name.split('.').pop().toUpperCase()}</div>
                       </div>
                     )}
@@ -2489,9 +3120,23 @@ const MobilePreview = ({ name, body, footer, showImage = false, isLimited = fals
                <div className="text-[9px] text-[#333] font-normal leading-relaxed whitespace-pre-line text-left" dangerouslySetInnerHTML={{ __html: formatWhatsAppMarkdown(body) }}></div>
                
                {isLimited && (
-                  <div className="mt-3 p-2 bg-red-50 rounded-lg border border-red-100 flex items-center justify-between">
-                      <span className="text-[11px] font-bold text-red-500">Offer expires in:</span>
-                      <span className="text-[11px] font-bold text-red-600 bg-white px-1.5 py-0.5 rounded shadow-sm">23:59:59</span>
+                  <div className="mt-3 p-2.5 bg-gradient-to-r from-red-50 to-orange-50 rounded-lg border border-red-200 flex flex-col gap-1.5 shadow-xs">
+                      <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-bold text-red-600 tracking-tight">
+                            {limitedTimeOfferText || 'Expiring offer!'}
+                          </span>
+                          {hasExpiration && (
+                            <span className="text-[9px] font-bold text-red-600 bg-white px-1.5 py-0.5 rounded shadow-xs border border-red-100 flex items-center gap-1">
+                              ⏱ {expirationPreviewText || '23:59:59'}
+                            </span>
+                          )}
+                      </div>
+                      {offerCode && (
+                        <div className="flex items-center justify-between bg-white/90 px-2 py-1 rounded border border-dashed border-red-300">
+                          <span className="text-[9px] font-medium text-gray-500">Code:</span>
+                          <span className="text-[10px] font-mono font-bold text-gray-800 tracking-wider bg-gray-50 px-1 rounded">{offerCode}</span>
+                        </div>
+                      )}
                   </div>
                )}
 
@@ -2506,7 +3151,22 @@ const MobilePreview = ({ name, body, footer, showImage = false, isLimited = fals
                <div className="flex flex-col border-t border-gray-100 w-full bg-[#fafafa]">
                   <div className="w-full py-3 flex items-center justify-center gap-2">
                      <span className="text-[#25d366] font-bold text-[9px] flex items-center gap-2">
-                       {isCatalog ? (catalogButtonText || 'View Catalog') : (mpmButtonText || 'View Items')}
+                       {isCatalog ? (catalogButtonText || 'View Catalog') : 'View items'}
+                     </span>
+                  </div>
+               </div>
+            ) : isLimited ? (
+               <div className="flex flex-col border-t border-gray-100 w-full bg-[#fafafa]">
+                  <div className="w-full py-2.5 flex items-center justify-center gap-2 border-b border-gray-100">
+                     <span className="text-[#25d366] font-bold text-[9px] flex items-center gap-1.5 hover:opacity-80 transition-opacity">
+                       <Copy size={12} className="text-[#25d366]"/>
+                       Copy code
+                     </span>
+                  </div>
+                  <div className="w-full py-2.5 flex items-center justify-center gap-2">
+                     <span className="text-[#25d366] font-bold text-[9px] flex items-center gap-1.5 hover:opacity-80 transition-opacity">
+                       <ExternalLink size={12} className="text-[#25d366]"/>
+                       {ltoUrlText || 'Shop Now'}
                      </span>
                   </div>
                </div>
@@ -2514,9 +3174,15 @@ const MobilePreview = ({ name, body, footer, showImage = false, isLimited = fals
                <div className="flex flex-col border-t border-gray-100 w-full bg-[#fafafa]">
                   {buttons.map((btn) => (
                      <div key={btn.id} className="w-full py-3 flex items-center justify-center gap-2 border-b border-gray-100 last:border-b-0">
-                        <span className="text-[#25d366] font-bold text-[9px] flex items-center gap-2 hover:opacity-80 transition-opacity">
-                          {btn.type === 'Visit Website' || btn.type === 'Visit website' ? <ExternalLink size={12} className="text-[#25d366]"/> : btn.text.toLowerCase().includes('copy') ? <Copy size={12} className="text-[#25d366]"/> : null} 
-                          {btn.text}
+                        <span className="text-[#25d366] font-bold text-[9px] flex items-center gap-1.5 hover:opacity-80 transition-opacity">
+                          {btn.type === 'Visit Website' || btn.type === 'Visit website' ? (
+                            <ExternalLink size={11} className="text-[#25d366]"/>
+                          ) : btn.type === 'Call phone number' ? (
+                            <span className="text-[10px]">📞</span>
+                          ) : btn.type === 'Copy offer code' || (btn.text && btn.text.toLowerCase().includes('copy')) ? (
+                            <Copy size={11} className="text-[#25d366]"/>
+                          ) : null} 
+                          {btn.text || (btn.type === 'Copy offer code' ? 'Copy offer code' : 'Button')}
                         </span>
                      </div>
                    ))}

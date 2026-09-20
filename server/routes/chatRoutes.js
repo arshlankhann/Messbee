@@ -27,12 +27,12 @@ function parseWhatsAppError(errorObj) {
     131026: 'Message could not be delivered — the number may not have WhatsApp installed or has blocked your number.',
     131000: 'Something went wrong on WhatsApp servers. Please try again.',
     131005: 'Permission denied — your WhatsApp Business Account does not have permission to perform this action.',
-    131008: 'Required parameter is missing from the API request.',
-    131009: 'Parameter value is invalid.',
+    131008: details ? `Required parameter is missing: ${details}` : 'Required parameter is missing from the API request.',
+    131009: details ? `Parameter value is invalid: ${details}` : 'Parameter value is invalid.',
     131051: 'Message type not supported for this recipient.',
     131052: 'Media download error.',
     131053: 'Media upload error.',
-    100:    'Invalid parameter — check your phone number format. It must include country code (e.g. 919XXXXXXXXX).',
+    100:    (inner?.error_user_msg || details || inner?.message || 'Invalid parameter in WhatsApp API request.').replace(/^\(#100\)\s*/, ''),
     190:    'WhatsApp access token has expired. Please update WHATSAPP_ACCESS_TOKEN in your .env file.',
     4:      'API call limit reached. Please try again later.',
     80007:  'Rate limit — too many messages sent too quickly.'
@@ -478,7 +478,21 @@ router.post("/message", async (req, res) => {
         });
       }
 
-
+      // 💳 Pre-flight WCC Wallet Balance Check (text & media both)
+      const walletService = require('../services/walletService');
+      const User = require('../models/User');
+      const { getMessageCost } = require('../config/pricingConfig');
+      const msgCategory = media ? 'SERVICE' : 'SERVICE';
+      const userPricingDoc = await User.findById(targetTenantId).select('customPricing').lean();
+      const msgCost = getMessageCost(msgCategory, whatsappRecipient, userPricingDoc?.customPricing);
+      const hasBal = await walletService.hasSufficientCredits(targetTenantId, msgCost);
+      if (!hasBal) {
+        return res.status(402).json({
+          success: false,
+          error: `Insufficient WCC Credits. Sending this message costs ₹${msgCost}. Please recharge your WCC Wallet.`,
+          errorCode: 'INSUFFICIENT_WCC_CREDITS'
+        });
+      }
 
       // Handle media messages
       if (media && mediaType) {
@@ -626,8 +640,9 @@ router.post("/message", async (req, res) => {
             chatId: chatId.toString(),
             message: newMessage
           });
-          // Also update chat list for all clients
-          io.emit("chat_updated", await Chat.findById(chatId));
+          // Also update chat list strictly for this tenant
+          const tenantRoom = `tenant_${chat.user?.toString() || req.user?.tenantId || req.user?._id}`;
+          io.to(tenantRoom).emit("chat_updated", await Chat.findById(chatId));
         }
       } catch (socketError) {
         console.error("❌ Socket error:", socketError.message);
@@ -645,6 +660,20 @@ router.post("/message", async (req, res) => {
           errorCode: code,
           rawError: whatsappError
         });
+      }
+
+      // 💸 Deduct WCC credits after confirmed successful dispatch
+      if (whatsappResult) {
+        try {
+          await walletService.deductMessageCredits({
+            tenantId: targetTenantId,
+            category: msgCategory,
+            recipientPhone: whatsappRecipient,
+            messageId: newMessage._id
+          });
+        } catch (deductErr) {
+          console.warn('⚠️ Wallet deduction warning (message already sent):', deductErr.message);
+        }
       }
 
       return res.json({
@@ -900,8 +929,9 @@ router.post("/send-template", async (req, res) => {
           { whatsappTemplateName: templateName }
         ]
       });
-      if (dbTpl && dbTpl.whatsappTemplateName) {
-        metaTemplateName = dbTpl.whatsappTemplateName;
+      if (dbTpl) {
+        if (dbTpl.whatsappTemplateName) metaTemplateName = dbTpl.whatsappTemplateName;
+        if (dbTpl.language && (!languageCode || languageCode === 'en')) languageCode = dbTpl.language;
       }
     } catch (_) {}
 
@@ -912,14 +942,14 @@ router.post("/send-template", async (req, res) => {
       components || []
     );
 
+    let whatsappError = null;
+    let whatsappErrorCode = null;
+
     if (!result.success) {
       const { code, userMessage } = parseWhatsAppError(result.error);
-      return res.status(500).json({
-        success: false,
-        error: userMessage || "Failed to send template",
-        errorCode: code,
-        rawError: result.error
-      });
+      whatsappError = userMessage || "Failed to send template";
+      whatsappErrorCode = code;
+      console.error(`❌ Template send failed [${code}]: ${whatsappError}`);
     }
 
     // Save template message to database
@@ -940,7 +970,10 @@ router.post("/send-template", async (req, res) => {
         const pType = String(param.type).toLowerCase();
         
         if (['image', 'video', 'document'].includes(pType)) {
-          mediaUrl = param[pType]?.link || param[pType]?.url || param[pType]?.id;
+          const directUrl = param[pType]?.link || param[pType]?.url;
+          if (directUrl && (directUrl.startsWith('http://') || directUrl.startsWith('https://') || directUrl.startsWith('/'))) {
+            mediaUrl = directUrl;
+          }
           mediaType = pType;
           if (pType === 'document') {
             fileName = param.document?.filename || 'Document';
@@ -949,32 +982,40 @@ router.post("/send-template", async (req, res) => {
       }
     }
 
-    // Fallback: Try to find template in database to get media URL if not in request
+    // Fallback: Try to find template in database to get media URL if not in request or if only ID was passed
     if (!mediaUrl) {
       try {
         const Template = require('../models/Template');
-        const dbTemplate = await Template.findOne({ name: templateName });
+        const dbTemplate = await Template.findOne({
+          $or: [
+            { name: templateName },
+            { whatsappTemplateName: templateName }
+          ]
+        });
         if (dbTemplate && Array.isArray(dbTemplate.components)) {
           const headerComp = dbTemplate.components.find(c => String(c.type).toUpperCase() === 'HEADER');
           if (headerComp && headerComp.format && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(headerComp.format)) {
-            mediaType = headerComp.format.toLowerCase();
-            // Check for our own system stored a preview URL
-            mediaUrl = headerComp.headerMediaUrl || headerComp.headerMediaUrlPreview;
+            if (!mediaType) mediaType = headerComp.format.toLowerCase();
+            mediaUrl = headerComp.headerMediaUrlPreview || headerComp.headerMediaUrl;
           }
+        }
+        if (!mediaUrl && dbTemplate) {
+          mediaUrl = dbTemplate.headerMediaUrlPreview || dbTemplate.headerMediaUrl;
         }
       } catch (err) {
         console.error('Error fetching template for media fallback:', err.message);
       }
     }
 
-    // Save template message to database
+    // Save template message to database (both on success and failure)
     try {
+      const msgStatus = result.success ? 'sent' : 'failed';
       const newMessage = await Message.create({
         chatId: chatId,
         text: result.displayText || `Template: ${templateName}`,
         sender: 'me',
         time: time,
-        whatsappMessageId: result.messageId,
+        whatsappMessageId: result.messageId || null,
         messageType: 'template',
         templateName: result.templateName || templateName,
         templateLanguage: result.templateLanguage || (languageCode || 'en'),
@@ -984,7 +1025,9 @@ router.post("/send-template", async (req, res) => {
         metadata: {
           components: components || []
         },
-        status: 'sent',
+        status: msgStatus,
+        error: whatsappError || undefined,
+        errorCode: whatsappErrorCode || undefined,
         user: req.user.id
       });
 
@@ -1002,14 +1045,30 @@ router.post("/send-template", async (req, res) => {
       }
       const updatedChat = await Chat.findByIdAndUpdate(chatId, chatUpdateFields, { new: true });
 
-      // Emit socket update for the chat list
+      // Emit socket update for the chat room and chat list
       try {
         const io = getIO();
-        if (io && updatedChat) {
-          io.emit("chat_updated", updatedChat);
+        if (io) {
+          io.to(chatId.toString()).emit("message_sent", {
+            chatId: chatId.toString(),
+            message: newMessage
+          });
+          if (updatedChat) {
+            io.emit("chat_updated", updatedChat);
+          }
         }
       } catch (socketError) {
         console.error("Socket error on template send:", socketError.message);
+      }
+
+      if (!result.success) {
+        return res.status(500).json({
+          success: false,
+          data: newMessage,
+          error: whatsappError,
+          errorCode: whatsappErrorCode,
+          rawError: result.error
+        });
       }
 
       return res.json({

@@ -11,9 +11,13 @@ const {
   bulkDeleteUsers,
   getPendingUsers,
   approveUser,
-  contactSales
+  contactSales,
+  getSalesInquiries,
+  getUserPricing,
+  updateUserPricing,
+  resetUserPricing
 } = require('../controllers/userController');
-const { protect } = require('../middleware/auth');
+const { protect, authorize } = require('../middleware/auth');
 const upload = require('../middleware/upload');
 
 const router = express.Router();
@@ -24,13 +28,22 @@ router.route('/')
 
 router.post('/bulk-delete', protect, bulkDeleteUsers);
 
-router.post('/contact-sales', protect, contactSales);
+router.route('/contact-sales')
+  .post(protect, contactSales)
+  .get(protect, getSalesInquiries);
 
 router.get('/account-limits', protect, require('../controllers/userController').getAccountLimits);
 
 // Admin approval routes (must be before /:id to avoid route conflicts)
 router.get('/pending-approval', protect, getPendingUsers);
 router.put('/:id/approve', protect, approveUser);
+
+// Dynamic Client-Specific WhatsApp Pricing (Super Admin / Admin)
+router.route('/:id/pricing')
+  .get(protect, authorize('ADMIN', 'admin'), getUserPricing)
+  .post(protect, authorize('ADMIN', 'admin'), updateUserPricing)
+  .put(protect, authorize('ADMIN', 'admin'), updateUserPricing)
+  .delete(protect, authorize('ADMIN', 'admin'), resetUserPricing);
 
 router.route('/profile')
   .get(protect, getProfile)
