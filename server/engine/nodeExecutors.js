@@ -6,6 +6,7 @@
 const axios = require('axios');
 const {  emitNotification  } = require('../config/socket.js');
 const Contact = require('../models/Contact.js');
+const Channel = require('../models/Channel.js');
 
 /**
  * Deeply extracts a value from a nested JSON object using a dot-notation path string.
@@ -38,9 +39,13 @@ function safeSetSessionVariable(session, key, value) {
 function safeGetSessionVariable(session, key) {
   if (!session || !session.sessionVariables) return undefined;
   if (typeof session.sessionVariables.get === 'function') {
-    return session.sessionVariables.get(key);
+    const val = session.sessionVariables.get(key);
+    if (val !== undefined) return val;
   }
-  return session.sessionVariables[key];
+  if (session.sessionVariables[key] !== undefined) {
+    return session.sessionVariables[key];
+  }
+  return deepGet(session.sessionVariables, key);
 }
 
 /**
@@ -48,15 +53,34 @@ function safeGetSessionVariable(session, key) {
  * Supports fallback syntax: {{contact.name|there}}
  * Supports system variables: {{system.date}}, {{system.time}}
  */
-module.exports.parseDynamicVariables = function parseDynamicVariables(text, contextData = {}) {
+function parseDynamicVariables(text, contextData = {}) {
   if (!text || typeof text !== 'string') return text;
   
   // Inject system variables automatically
   const now = new Date();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const dayAfter = new Date(now);
+  dayAfter.setDate(dayAfter.getDate() + 2);
+
+  const monthsShort = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const fmtShort = (d) => `${d.getDate()} ${monthsShort[d.getMonth()]}`;
+  const fmtFull = (d) => `${d.getDate()} ${monthsShort[d.getMonth()]} ${d.getFullYear()}`;
+  const fmtDmy = (d) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+
   contextData.system = {
-    date: now.toLocaleDateString(),
+    date: fmtDmy(now),
     time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    day: now.toLocaleDateString('en-US', { weekday: 'long' })
+    day: now.toLocaleDateString('en-US', { weekday: 'long' }),
+    today: `Today (${fmtShort(now)})`,
+    tomorrow: `Tomorrow (${fmtShort(tomorrow)})`,
+    day_after: `Day After (${fmtShort(dayAfter)})`,
+    today_date: fmtDmy(now),
+    tomorrow_date: fmtDmy(tomorrow),
+    day_after_date: fmtDmy(dayAfter),
+    today_full: fmtFull(now),
+    tomorrow_full: fmtFull(tomorrow),
+    day_after_full: fmtFull(dayAfter)
   };
 
   return text.replace(/\{\{([\w._]+)(?:\|([^}]+))?\}\}/g, (match, path, fallback) => {
@@ -93,9 +117,18 @@ module.exports.parseDynamicVariables = function parseDynamicVariables(text, cont
 
     // 3. System aliases
     if (value === undefined) {
-      if (['date', 'current_date', 'today', 'system.date'].includes(lowerPath)) value = contextData.system.date;
+      if (['date', 'current_date', 'system.date'].includes(lowerPath)) value = contextData.system.date;
       else if (['time', 'current_time', 'system.time'].includes(lowerPath)) value = contextData.system.time;
       else if (['day', 'system.day'].includes(lowerPath)) value = contextData.system.day;
+      else if (['today', 'system.today'].includes(lowerPath)) value = contextData.system.today;
+      else if (['tomorrow', 'system.tomorrow'].includes(lowerPath)) value = contextData.system.tomorrow;
+      else if (['day_after', 'day_after_tomorrow', 'system.day_after'].includes(lowerPath)) value = contextData.system.day_after;
+      else if (['today_date', 'system.today_date'].includes(lowerPath)) value = contextData.system.today_date;
+      else if (['tomorrow_date', 'system.tomorrow_date'].includes(lowerPath)) value = contextData.system.tomorrow_date;
+      else if (['day_after_date', 'system.day_after_date'].includes(lowerPath)) value = contextData.system.day_after_date;
+      else if (['today_full', 'system.today_full'].includes(lowerPath)) value = contextData.system.today_full;
+      else if (['tomorrow_full', 'system.tomorrow_full'].includes(lowerPath)) value = contextData.system.tomorrow_full;
+      else if (['day_after_full', 'system.day_after_full'].includes(lowerPath)) value = contextData.system.day_after_full;
     }
 
     // 4. Fallback or resolved value
@@ -110,6 +143,7 @@ module.exports.parseDynamicVariables = function parseDynamicVariables(text, cont
     return '';
   });
 }
+module.exports.parseDynamicVariables = parseDynamicVariables;
 
 /**
  * Handles condition branches (e.g., if user variable == X)
@@ -120,11 +154,20 @@ module.exports.parseDynamicVariables = function parseDynamicVariables(text, cont
 module.exports.executeConditionNode = async function executeConditionNode(session, node, contextData) {
   const { variable, operator, value } = node.data;
   
-  // Upgrade: Fallback to session variables if not found in context (which now contains CRM data like contact.tags)
-  let userValue = deepGet(contextData, variable);
-  if (userValue === undefined) {
-    userValue = safeGetSessionVariable(session, variable);
+  const rawVar = String(variable || '').trim();
+  const cleanVar = rawVar.replace(/^contact\./, '');
+  const contactVar = `contact.${cleanVar}`;
+
+  // Multi-tier lookup across contextData, contact CRM fields, and sessionVariables
+  let userValue = deepGet(contextData, rawVar);
+  if (userValue === undefined) userValue = deepGet(contextData, cleanVar);
+  if (userValue === undefined) userValue = deepGet(contextData, contactVar);
+  if (userValue === undefined && contextData?.contact) {
+    if (contextData.contact[cleanVar] !== undefined) userValue = contextData.contact[cleanVar];
   }
+  if (userValue === undefined) userValue = safeGetSessionVariable(session, rawVar);
+  if (userValue === undefined) userValue = safeGetSessionVariable(session, cleanVar);
+  if (userValue === undefined) userValue = safeGetSessionVariable(session, contactVar);
   
   let result = false;
   const strVal = value !== undefined && value !== null ? String(value).trim() : '';
@@ -133,16 +176,25 @@ module.exports.executeConditionNode = async function executeConditionNode(sessio
   // Array / tag check support (e.g. contact.tags contains 'VIP')
   const isArray = Array.isArray(userValue);
 
-  switch (operator) {
+  const cleanOp = String(operator || '').toLowerCase().trim();
+
+  switch (cleanOp) {
     case 'equals':
+    case '==':
+    case 'eq':
+    case 'is':
       result = (userStr.toLowerCase() === strVal.toLowerCase()) || (userValue == value);
       break;
     case 'not_equals':
+    case '!=':
+    case 'neq':
+    case 'is_not':
     case 'does_not_equal':
       result = (userStr.toLowerCase() !== strVal.toLowerCase()) && (userValue != value);
       break;
     case 'contains':
     case 'has_tag':
+    case 'has':
       if (isArray) {
         result = userValue.some(item => String(item).toLowerCase().includes(strVal.toLowerCase()));
       } else {
@@ -150,6 +202,7 @@ module.exports.executeConditionNode = async function executeConditionNode(sessio
       }
       break;
     case 'does_not_contain':
+    case 'not_contains':
       if (isArray) {
         result = !userValue.some(item => String(item).toLowerCase().includes(strVal.toLowerCase()));
       } else {
@@ -163,21 +216,110 @@ module.exports.executeConditionNode = async function executeConditionNode(sessio
       result = userStr.toLowerCase().endsWith(strVal.toLowerCase());
       break;
     case 'greater_than':
+    case '>':
+    case 'gt':
       result = !isNaN(Number(userValue)) && !isNaN(Number(value)) && (Number(userValue) > Number(value));
       break;
+    case 'greater_than_or_equal':
+    case '>=':
+    case 'gte':
+      result = !isNaN(Number(userValue)) && !isNaN(Number(value)) && (Number(userValue) >= Number(value));
+      break;
     case 'less_than':
+    case '<':
+    case 'lt':
       result = !isNaN(Number(userValue)) && !isNaN(Number(value)) && (Number(userValue) < Number(value));
       break;
+    case 'less_than_or_equal':
+    case '<=':
+    case 'lte':
+      result = !isNaN(Number(userValue)) && !isNaN(Number(value)) && (Number(userValue) <= Number(value));
+      break;
+    case 'in':
+    case 'is_in': {
+      const parts = strVal.split(',').map(s => s.trim().toLowerCase());
+      result = parts.includes(userStr.toLowerCase());
+      break;
+    }
+    case 'not_in':
+    case 'is_not_in': {
+      const parts = strVal.split(',').map(s => s.trim().toLowerCase());
+      result = !parts.includes(userStr.toLowerCase());
+      break;
+    }
+    case 'regex':
+    case 'matches':
+    case 'matches_regex': {
+      try {
+        result = new RegExp(strVal, 'i').test(userStr);
+      } catch (_) {
+        result = false;
+      }
+      break;
+    }
+    case 'before':
+    case 'is_before': {
+      const parseDateVal = (v) => {
+        if (!v) return NaN;
+        if (v instanceof Date) return v.getTime();
+        const s = String(v).trim();
+        const dmy = s.match(/^([0-3]?\d)[\/\-\.]([01]?\d)(?:[\/\-\.](\d{4}|\d{2}))?/);
+        if (dmy) {
+          const d = parseInt(dmy[1], 10);
+          const m = parseInt(dmy[2], 10) - 1;
+          let y = dmy[3] ? parseInt(dmy[3], 10) : new Date().getFullYear();
+          if (y < 100) y += 2000;
+          return new Date(y, m, d).getTime();
+        }
+        const p = Date.parse(s);
+        return isNaN(p) ? NaN : p;
+      };
+      const dUserB = parseDateVal(userValue);
+      const dTargetB = parseDateVal(value);
+      if (!isNaN(dUserB) && !isNaN(dTargetB)) {
+        result = dUserB < dTargetB;
+      } else {
+        result = !isNaN(Number(userValue)) && !isNaN(Number(value)) && (Number(userValue) < Number(value));
+      }
+      break;
+    }
+    case 'after':
+    case 'is_after': {
+      const parseDateVal = (v) => {
+        if (!v) return NaN;
+        if (v instanceof Date) return v.getTime();
+        const s = String(v).trim();
+        const dmy = s.match(/^([0-3]?\d)[\/\-\.]([01]?\d)(?:[\/\-\.](\d{4}|\d{2}))?/);
+        if (dmy) {
+          const d = parseInt(dmy[1], 10);
+          const m = parseInt(dmy[2], 10) - 1;
+          let y = dmy[3] ? parseInt(dmy[3], 10) : new Date().getFullYear();
+          if (y < 100) y += 2000;
+          return new Date(y, m, d).getTime();
+        }
+        const p = Date.parse(s);
+        return isNaN(p) ? NaN : p;
+      };
+      const dUserA = parseDateVal(userValue);
+      const dTargetA = parseDateVal(value);
+      if (!isNaN(dUserA) && !isNaN(dTargetA)) {
+        result = dUserA > dTargetA;
+      } else {
+        result = !isNaN(Number(userValue)) && !isNaN(Number(value)) && (Number(userValue) > Number(value));
+      }
+      break;
+    }
     case 'not_empty':
     case 'is_not_empty':
     case 'exists':
       result = userValue !== undefined && userValue !== null && userStr !== '' && (!isArray || userValue.length > 0);
       break;
     case 'is_empty':
+    case 'empty':
       result = userValue === undefined || userValue === null || userStr === '' || (isArray && userValue.length === 0);
       break;
     default:
-      result = userValue == value;
+      result = (userStr.toLowerCase() === strVal.toLowerCase()) || (userValue == value);
   }
 
   return result ? 'true_path' : 'false_path';
@@ -190,8 +332,8 @@ module.exports.executeConditionNode = async function executeConditionNode(sessio
  * @param {object} contextData - Context for parsing variables
  */
 module.exports.executeApiCallNode = async function executeApiCallNode(session, node, contextData) {
-  const { endpoint, url: nodeUrl, method, headers, responseMapping, bodyParams, body } = node.data || {};
-  const rawUrl = endpoint || nodeUrl || '';
+  const { endpoint, url: nodeUrl, apiUrl, method, headers, responseMapping, bodyParams, body } = node.data || {};
+  const rawUrl = endpoint || nodeUrl || apiUrl || '';
   
   const parsedEndpoint = parseDynamicVariables(rawUrl, contextData);
   let parsedHeaders = {};
@@ -206,7 +348,8 @@ module.exports.executeApiCallNode = async function executeApiCallNode(session, n
 
   let requestBody = undefined;
   const rawBody = bodyParams || body;
-  if (rawBody && (method === 'POST' || method === 'PUT')) {
+  const upperMethod = String(method || 'GET').toUpperCase();
+  if (rawBody && ['POST', 'PUT', 'PATCH'].includes(upperMethod)) {
     try {
       const parsedB = typeof rawBody === 'string' ? JSON.parse(rawBody) : rawBody;
       const finalBody = {};
@@ -220,9 +363,10 @@ module.exports.executeApiCallNode = async function executeApiCallNode(session, n
   
   try {
     const axiosConfig = {
-      method: method || 'GET',
+      method: upperMethod,
       url: parsedEndpoint,
-      headers: parsedHeaders
+      headers: parsedHeaders,
+      timeout: 10000
     };
     if (requestBody) {
       // Axios parses strings automatically if header is application/json
@@ -234,14 +378,20 @@ module.exports.executeApiCallNode = async function executeApiCallNode(session, n
     const data = response.data;
 
     // Map response fields back to session variables if configured
-    if (responseMapping && responseMapping.length > 0) {
-      responseMapping.forEach(mapping => {
-        // Advanced Extraction: Supports nested JSON paths like 'user.profile.email'
-        const extractedValue = deepGet(data, mapping.responseField);
+    if (responseMapping) {
+      if (Array.isArray(responseMapping)) {
+        responseMapping.forEach(mapping => {
+          const extractedValue = deepGet(data, mapping.responseField);
+          if (extractedValue !== undefined) {
+            safeSetSessionVariable(session, mapping.sessionVariable, extractedValue);
+          }
+        });
+      } else if (typeof responseMapping === 'string') {
+        const extractedValue = deepGet(data, responseMapping);
         if (extractedValue !== undefined) {
-          safeSetSessionVariable(session, mapping.sessionVariable, extractedValue);
+          safeSetSessionVariable(session, node.data.saveVariable || 'api_response', extractedValue);
         }
-      });
+      }
     }
 
     return 'success';
@@ -391,10 +541,17 @@ module.exports.executeActionNode = async function executeActionNode(session, nod
       safeSetSessionVariable(session, targetKey, parsedValue);
       safeSetSessionVariable(session, `contact.${targetKey.replace(/^contact\./, '')}`, parsedValue);
 
-      if (contextData?.contact?.phone) {
+      if (targetPhone) {
         try {
           const rawKey = targetKey.replace(/^contact\./, '');
-          const dbContact = await Contact.findOne({ phone: contextData.contact.phone });
+          const cleanPhone = String(targetPhone).replace(/\D/g, '');
+          const dbContact = await Contact.findOne({
+            $or: [
+              { phone: targetPhone },
+              { phone: cleanPhone },
+              { phone: `+${cleanPhone}` }
+            ]
+          });
           if (dbContact) {
             if (['name', 'email'].includes(rawKey)) {
               dbContact[rawKey] = parsedValue;
@@ -443,14 +600,100 @@ module.exports.executeActionNode = async function executeActionNode(session, nod
     return 'success';
   }
 
+  if (actionType === 'set_variable') {
+    const varName = node.data.variableName || node.data.fieldKey || node.data.key;
+    const rawVal = node.data.variableValue !== undefined ? node.data.variableValue : (node.data.fieldValue !== undefined ? node.data.fieldValue : node.data.value);
+    if (varName && rawVal !== undefined) {
+      const parsedValue = parseDynamicVariables(rawVal, contextData);
+      safeSetSessionVariable(session, varName, parsedValue);
+      if (session.save) await session.save();
+    }
+    return 'success';
+  }
+
   if (actionType === 'unassign_team') {
     session.status = 'ACTIVE';
     session.assignedTo = null;
     return 'success';
   }
 
+  // 📱 Send WhatsApp Notification / Alert to Staff, Doctor, and Admin CC
+  if (['notify_whatsapp', 'send_whatsapp_notification', 'notify_staff', 'whatsapp_notification'].includes(actionType)) {
+    const rawRecipients = node.data.recipientPhone || node.data.targetPhone || node.data.recipient || '';
+    const rawAdminPhone = node.data.adminPhone || '';
+    const rawMsg = node.data.notificationMessage || node.data.messageBody || node.data.message || '';
+
+    // Collect all recipient numbers (staff/doctor + admin CC)
+    const recipientList = [];
+    if (rawRecipients) {
+      recipientList.push(...String(rawRecipients).split(',').map(p => p.trim()).filter(Boolean));
+    }
+    if (rawAdminPhone) {
+      recipientList.push(...String(rawAdminPhone).split(',').map(p => p.trim()).filter(Boolean));
+    }
+
+    if (recipientList.length > 0 && rawMsg) {
+      const parsedMsg = parseDynamicVariables(rawMsg, contextData);
+
+      let channelToUse = contextData?.channel;
+      if (!channelToUse && session.channelId) {
+        try {
+          channelToUse = await Channel.findById(session.channelId).select('+metaAccessToken');
+        } catch (_) {}
+      }
+
+      if (channelToUse) {
+        try {
+          const { sendWhatsAppMessage } = await import('./flowRunner.js');
+
+          for (const rawP of recipientList) {
+            const evaluatedP = parseDynamicVariables(rawP, contextData);
+            const cleanP = String(evaluatedP || '').replace(/\D/g, '');
+            if (cleanP && cleanP.length >= 8) {
+              const payload = {
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to: cleanP,
+                type: 'text',
+                text: { body: parsedMsg }
+              };
+              await sendWhatsAppMessage(cleanP, payload, channelToUse, true);
+              console.log(`[ActionNode] ✅ WhatsApp Notification sent to: ${cleanP}`);
+            }
+          }
+        } catch (err) {
+          console.error('[ActionNode] Failed to send WhatsApp notification:', err.message);
+        }
+      }
+    }
+
+    // Optional: Auto-assign / handoff in Messbee Live Chat if configured
+    const staffToAssign = node.data.assignToStaff || node.data.assignTo;
+    if (staffToAssign) {
+      const parsedStaff = parseDynamicVariables(staffToAssign, contextData);
+      if (parsedStaff) {
+        session.status = 'HANDOFF';
+        session.assignedTo = parsedStaff;
+        if (targetPhone) {
+          try {
+            await Contact.updateMany(
+              { phone: targetPhone },
+              { $set: { status: 'HANDOFF', isBotPaused: true, assignedTo: parsedStaff } }
+            );
+          } catch (e) {
+            console.error('Failed to update assignedTo on contact:', e);
+          }
+        }
+      }
+    }
+
+    return 'success';
+  }
+
   return 'success';
 }
+
+module.exports.executeApiNode = module.exports.executeApiCallNode;
 
 /**
  * Executes a dedicated Google Sheets integration node
@@ -538,17 +781,21 @@ module.exports.executeAiNode = async function executeAiNode(session, node, conte
  * @returns {string} - The edge handle to follow ('path_a' or 'path_b')
  */
 module.exports.executeRandomizerNode = async function executeRandomizerNode(session, node) {
-  const { splitPercentage } = node.data;
-  const targetSplit = Number(splitPercentage) || 50;
+  const { splitPercentage } = node?.data || {};
+  const targetSplit = (splitPercentage !== undefined && splitPercentage !== null && !isNaN(Number(splitPercentage))) ? Number(splitPercentage) : 50;
   
   // Math.random() is between 0 (inclusive) and 1 (exclusive). Multiply by 100 to get percentage scale.
   const rand = Math.random() * 100;
-  
-  if (rand < targetSplit) {
-    return 'path_a';
-  } else {
-    return 'path_b';
+  const chosenHandle = (rand < targetSplit) ? 'path_a' : 'path_b';
+
+  if (session && session.sessionVariables) {
+    session.sessionVariables['randomizer_path'] = chosenHandle;
+    session.sessionVariables['ab_variant'] = chosenHandle === 'path_a' ? 'A' : 'B';
+    session.markModified('sessionVariables');
+    await session.save();
   }
+  
+  return chosenHandle;
 }
 
 /**
