@@ -56,6 +56,9 @@ function safeGetSessionVariable(session, key) {
 function parseDynamicVariables(text, contextData = {}) {
   if (!text || typeof text !== 'string') return text;
   
+  // Unescape any literal \r\n, \n into real newlines
+  text = text.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '');
+  
   // Inject system variables automatically
   const now = new Date();
   const tomorrow = new Date(now);
@@ -93,14 +96,14 @@ function parseDynamicVariables(text, contextData = {}) {
       value = deepGet(contextData, lowerPath);
     }
 
-    // 2. Contact field aliases (name, phone, email, tags)
+    // 2. Universal lookup across contextData and CRM contact fields
     if (value === undefined && contextData.contact) {
       if (['name', 'first_name', 'customer_name', 'contact_name', 'contact.name'].includes(lowerPath)) {
-        value = contextData.contact.name;
+        value = contextData.name || contextData.contact.name;
       } else if (['phone', 'mobile', 'phone_number', 'contact_phone', 'contact.phone'].includes(lowerPath)) {
-        value = contextData.contact.phone;
+        value = contextData.phone || contextData.contact.phone;
       } else if (['email', 'contact_email', 'contact.email'].includes(lowerPath)) {
-        value = contextData.contact.email;
+        value = contextData.email || contextData.contact.email;
       } else if (['tags', 'tag', 'contact.tags'].includes(lowerPath)) {
         value = Array.isArray(contextData.contact.tags) ? contextData.contact.tags.join(', ') : contextData.contact.tags;
       } else if (contextData.contact.customFields) {
@@ -115,7 +118,17 @@ function parseDynamicVariables(text, contextData = {}) {
       }
     }
 
-    // 3. System aliases
+    // 3. Universal cross-prefix lookup (e.g. {{score}} <-> {{contact.score}}, {{field}} <-> {{contact.field}})
+    if (value === undefined) {
+      if (rawPath.startsWith('contact.')) {
+        const shortKey = rawPath.replace(/^contact\./, '');
+        value = deepGet(contextData, shortKey) ?? deepGet(contextData, shortKey.toLowerCase());
+      } else {
+        value = deepGet(contextData, `contact.${rawPath}`) ?? deepGet(contextData, `contact.${lowerPath}`);
+      }
+    }
+
+    // 4. System aliases
     if (value === undefined) {
       if (['date', 'current_date', 'system.date'].includes(lowerPath)) value = contextData.system.date;
       else if (['time', 'current_time', 'system.time'].includes(lowerPath)) value = contextData.system.time;
@@ -360,22 +373,95 @@ module.exports.executeApiCallNode = async function executeApiCallNode(session, n
       parsedHeaders['Content-Type'] = 'application/json';
     } catch(e) {}
   }
-  
   try {
-    const axiosConfig = {
-      method: upperMethod,
-      url: parsedEndpoint,
-      headers: parsedHeaders,
-      timeout: 10000
-    };
-    if (requestBody) {
-      // Axios parses strings automatically if header is application/json
-      // but it expects the body payload in the `data` property.
-      axiosConfig.data = requestBody;
+    let finalUrl = parsedEndpoint;
+    if (finalUrl && finalUrl.startsWith('/')) {
+      finalUrl = `http://127.0.0.1:${process.env.PORT || 5002}${finalUrl}`;
     }
 
-    const response = await axios(axiosConfig);
-    const data = response.data;
+    let data;
+    const isSlotCheckPreset = node.data?.apiPreset === 'slot_availability' ||
+      (parsedEndpoint && parsedEndpoint.includes('/check-availability')) ||
+      (node.data?.entityId && node.data?.checkAvailability);
+
+    // Internal fast-path for slot availability checks to guarantee zero latency & network resilience
+    if (isSlotCheckPreset) {
+      try {
+        let entityId = node.data?.entityId;
+        if (entityId && typeof entityId === 'string' && entityId.includes('{{')) {
+          entityId = parseDynamicVariables(entityId, contextData);
+        }
+        if (!entityId || entityId === 'dynamic') {
+          entityId = contextData?.selected_doctor_id ||
+            contextData?.doctor_id ||
+            contextData?.booking_entity_id ||
+            contextData?.doctor_name ||
+            contextData?.selected_menu_option ||
+            contextData?.selected_row_id ||
+            contextData?.entity_id;
+        }
+
+        if (!entityId && finalUrl) {
+          try {
+            const urlObj = new URL(finalUrl);
+            const pathSegments = urlObj.pathname.split('/');
+            const entIdx = pathSegments.indexOf('entities');
+            if (entIdx !== -1 && pathSegments[entIdx + 1] && pathSegments[entIdx + 1] !== 'dynamic') {
+              entityId = pathSegments[entIdx + 1];
+            }
+          } catch (_) {}
+        }
+
+        if (entityId) {
+          const slotEngine = require('../services/slotBookingEngine.js');
+          let parsedBodyObj = null;
+          try {
+            if (requestBody) parsedBodyObj = JSON.parse(requestBody);
+          } catch (_) {}
+
+          const datetimeVal = parsedBodyObj?.datetime ||
+            (node.data?.datetimeVariable ? parseDynamicVariables(node.data.datetimeVariable, contextData) : '') ||
+            contextData?.preferred_datetime ||
+            contextData?.datetime ||
+            contextData?.selected_slot ||
+            contextData?.appointment_slot ||
+            contextData?.slot || '';
+
+          data = await slotEngine.checkSlotAvailability(entityId, datetimeVal);
+          data = { success: true, ...data };
+
+          // Automatically populate standard downstream session variables for effortless canvas wiring
+          safeSetSessionVariable(session, 'is_slot_available', data.is_available);
+          safeSetSessionVariable(session, 'booking_slot_label', data.confirmed_slot_label);
+          safeSetSessionVariable(session, 'booking_date_label', data.confirmed_date_label);
+          safeSetSessionVariable(session, 'alt_slot_label', data.alt_slot_label);
+          safeSetSessionVariable(session, 'alt_date_label', data.alt_date_label);
+          safeSetSessionVariable(session, 'booking_entity_name', data.entity_name);
+          safeSetSessionVariable(session, 'booking_entity_id', data.entity_id || entityId);
+          safeSetSessionVariable(session, '__booking_entity_id', data.entity_id || entityId);
+          if (data.matched_start_ms) safeSetSessionVariable(session, 'matched_start_ms', data.matched_start_ms);
+          if (data.matched_end_ms) safeSetSessionVariable(session, 'matched_end_ms', data.matched_end_ms);
+          if (data.alt_start_ms) safeSetSessionVariable(session, 'alt_start_ms', data.alt_start_ms);
+          if (data.alt_end_ms) safeSetSessionVariable(session, 'alt_end_ms', data.alt_end_ms);
+        }
+      } catch (err) {
+        console.error('[executeApiCallNode] Slot availability check error:', err.message);
+      }
+    }
+
+    if (!data) {
+      const axiosConfig = {
+        method: upperMethod,
+        url: finalUrl,
+        headers: parsedHeaders,
+        timeout: 10000
+      };
+      if (requestBody) {
+        axiosConfig.data = requestBody;
+      }
+      const response = await axios(axiosConfig);
+      data = response.data;
+    }
 
     // Map response fields back to session variables if configured
     if (responseMapping) {
@@ -389,9 +475,12 @@ module.exports.executeApiCallNode = async function executeApiCallNode(session, n
       } else if (typeof responseMapping === 'string') {
         const extractedValue = deepGet(data, responseMapping);
         if (extractedValue !== undefined) {
-          safeSetSessionVariable(session, node.data.saveVariable || 'api_response', extractedValue);
+          safeSetSessionVariable(session, node.data.saveVariable || node.data.saveVariableAs || 'api_response', extractedValue);
         }
       }
+    } else if (node.data?.saveVariable || node.data?.saveVariableAs) {
+      const targetVar = node.data.saveVariable || node.data.saveVariableAs;
+      safeSetSessionVariable(session, targetVar, data);
     }
 
     return 'success';
@@ -667,18 +756,17 @@ module.exports.executeActionNode = async function executeActionNode(session, nod
       }
     }
 
-    // Optional: Auto-assign / handoff in Messbee Live Chat if configured
+    // Optional: Assign staff/doctor to contact in CRM without breaking active bot flow
     const staffToAssign = node.data.assignToStaff || node.data.assignTo;
     if (staffToAssign) {
       const parsedStaff = parseDynamicVariables(staffToAssign, contextData);
       if (parsedStaff) {
-        session.status = 'HANDOFF';
         session.assignedTo = parsedStaff;
         if (targetPhone) {
           try {
             await Contact.updateMany(
               { phone: targetPhone },
-              { $set: { status: 'HANDOFF', isBotPaused: true, assignedTo: parsedStaff } }
+              { $set: { assignedTo: parsedStaff } }
             );
           } catch (e) {
             console.error('Failed to update assignedTo on contact:', e);

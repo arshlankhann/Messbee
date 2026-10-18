@@ -21,6 +21,7 @@ import { getIO } from '../config/socket.js';
 import { createRequire } from 'module';
 const _require = createRequire(import.meta.url);
 const logger = _require('../utils/logger.js');
+const _slotEngine = _require('../services/slotBookingEngine.js');
 
 
 async function markSessionCompleted(session, customerPhone, channelId) {
@@ -549,7 +550,7 @@ export async function sendWhatsAppMessage(toPhone, payload, channel, forceBypass
 
   } catch (error) {
     logger.error('Error sending WhatsApp message:', error.response?.data || error.message);
-    throw new Error('Failed to send WhatsApp message');
+    return null;
   }
 }
 
@@ -618,7 +619,53 @@ export function buildMessagePayload(phone, nodeType, nodeData, contextData = {})
     };
   }
 
-  if (messageType === 'text' || nodeType === 'messageNode') {
+  if (nodeType === 'bookingNode') {
+    // Real-Time Slot Booking Node
+    // Dynamically generates a WhatsApp interactive list menu with live available slots
+    let rawEntityId = nodeData.entityId || contextData.selected_doctor_id || contextData.doctor_id || contextData.entityId || '';
+    if (typeof rawEntityId === 'string' && rawEntityId.includes('{{')) {
+      rawEntityId = parseDynamicVariables(rawEntityId, contextData);
+    }
+    const entityId = (rawEntityId && !rawEntityId.includes('{{')) ? rawEntityId : (contextData.__booking_entity_fallback || '');
+    const bodyText = parseDynamicVariables(nodeData.text || nodeData.question || 'Please select an appointment slot:', contextData);
+    const headerText = parseDynamicVariables(nodeData.headerText || nodeData.header || '', contextData);
+    const footerText = parseDynamicVariables(nodeData.footer || '', contextData);
+    const menuButtonText = parseDynamicVariables(nodeData.buttonText || nodeData.menuButtonText || 'View Slots', contextData);
+
+    const sections = (entityId && contextData[`__booking_sections_${entityId}`]) || contextData[`__booking_sections_resolved`] || [];
+
+    if (!entityId && sections.length === 0) {
+      return { ...basePayload, type: 'text', text: { body: '⚠️ Booking node is not configured. Please select a resource/doctor.' } };
+    }
+
+    if (sections.length === 0) {
+      return {
+        ...basePayload,
+        type: 'text',
+        text: { body: `📅 *No available slots found at the moment.*\n\nPlease try again later or contact us directly.` }
+      };
+    }
+
+    const interactive = {
+      type: 'list',
+      body: { text: bodyText.substring(0, 1024) },
+      action: {
+        button: (menuButtonText || 'View Slots').substring(0, 20),
+        sections: sections.slice(0, 10)
+      }
+    };
+
+    if (headerText) {
+      interactive.header = { type: 'text', text: headerText.substring(0, 60) };
+    }
+    if (footerText) {
+      interactive.footer = { text: footerText.substring(0, 60) };
+    }
+
+    return { ...basePayload, type: 'interactive', interactive };
+  }
+
+  if (nodeType === 'messageNode' || (messageType === 'text' && !['bookingNode', 'pollNode', 'menuNode', 'catalogNode', 'commerceNode', 'carouselNode', 'interactiveNode'].includes(nodeType))) {
     return {
       ...basePayload,
       type: 'text',
@@ -1034,31 +1081,57 @@ export function buildMessagePayload(phone, nodeType, nodeData, contextData = {})
 
   if (nodeType === 'commerceNode') {
     if (nodeData.commerceType === 'payment') {
+      const parsedItemName = parseDynamicVariables(nodeData.itemName, contextData) || "Doctor Consultation Fee";
+      const resolvedCurrency = nodeData.currency || "INR";
+      const rawAmount = nodeData.amount || "499";
+      const resolvedAmount = parseDynamicVariables(rawAmount, contextData) || "499";
+      const referenceId = parseDynamicVariables(nodeData.referenceId, contextData) || `order_${Date.now()}`;
+      const upiId = nodeData.upiId ? parseDynamicVariables(nodeData.upiId, contextData) : '';
+      let paymentUrl = nodeData.paymentUrl ? parseDynamicVariables(nodeData.paymentUrl, contextData) : '';
+      if (!paymentUrl && upiId) {
+        paymentUrl = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(parsedItemName)}&am=${resolvedAmount}&cu=INR`;
+      }
+
+      let bodyText = parseDynamicVariables(nodeData.text, contextData);
+      if (!bodyText || bodyText.trim().length === 0) {
+        bodyText = `💳 *PAYMENT REQUEST*\n\n*Item:* ${parsedItemName}\n*Amount:* ${resolvedCurrency} ${resolvedAmount}`;
+        if (upiId) {
+          bodyText += `\n📱 *UPI ID:* ${upiId}`;
+        }
+        if (paymentUrl) {
+          bodyText += `\n\n🔗 *Payment Link:* ${paymentUrl}\n\nPlease tap the link above to complete payment.`;
+        }
+      } else if (paymentUrl && !bodyText.includes('http')) {
+        bodyText = `${bodyText}\n\n🔗 *Payment Link:* ${paymentUrl}`;
+      }
+
       return {
         ...basePayload,
         type: 'interactive',
         interactive: {
           type: 'order_details',
-          body: { text: parseDynamicVariables(nodeData.text, contextData) || 'Please pay for your order.' },
+          body: { text: bodyText },
           action: {
             name: "review_and_pay",
             parameters: {
-              reference_id: parseDynamicVariables(nodeData.referenceId, contextData) || `order_${Date.now()}`,
+              reference_id: referenceId,
+              payment_url: paymentUrl,
               type: nodeData.goodsType || "digital-goods",
               payment_settings: [{
                 type: "payment_gateway",
                 payment_gateway: { 
                   desc: parseDynamicVariables(nodeData.paymentDescription, contextData) || "Payment", 
-                  type: nodeData.paymentGateway || "razorpay" 
+                  type: nodeData.paymentGateway || "razorpay",
+                  payment_url: paymentUrl
                 }
               }],
-              currency: nodeData.currency || "INR",
-              total_amount: { value: (Number(nodeData.amount) * 100) || 100, offset: 100 },
+              currency: resolvedCurrency,
+              total_amount: { value: (Number(resolvedAmount) * 100) || 100, offset: 100 },
               order: {
                 status: "pending",
                 items: [{
-                  name: parseDynamicVariables(nodeData.itemName, contextData) || "Order Item",
-                  amount: { value: (Number(nodeData.amount) * 100) || 100, offset: 100 },
+                  name: parsedItemName,
+                  amount: { value: (Number(resolvedAmount) * 100) || 100, offset: 100 },
                   quantity: 1
                 }]
               }
@@ -1107,6 +1180,9 @@ export function buildMessagePayload(phone, nodeType, nodeData, contextData = {})
       }
     };
   }
+
+
+
 
   return { ...basePayload, type: 'text', text: { body: 'Unsupported message type' } };
 }
@@ -1304,7 +1380,38 @@ export async function processSpecificNode(customerPhone, channelId, startNodeId)
       let nextNodeId = defaultNextEdge ? defaultNextEdge.target : null;
 
       // Handle specific node types
-      if (['messageNode', 'interactiveNode', 'menuNode', 'inputNode', 'mediaNode', 'templateNode', 'utilityNode', 'reactionNode', 'catalogNode', 'pollNode', 'commerceNode', 'carouselNode'].includes(currentNode.type)) {
+      if (['messageNode', 'interactiveNode', 'menuNode', 'inputNode', 'mediaNode', 'templateNode', 'utilityNode', 'reactionNode', 'catalogNode', 'pollNode', 'commerceNode', 'carouselNode', 'bookingNode'].includes(currentNode.type)) {
+
+        // ── PRE-LOAD: bookingNode async slot injection ──────────────────────
+        // buildMessagePayload is sync, so we pre-load live slots here async
+        // and inject into contextData so bookingNode case can read them.
+        if (currentNode.type === 'bookingNode') {
+          try {
+            let entityId = currentNode.data?.entityId || contextData?.selected_doctor_id || contextData?.doctor_id || contextData?.entityId || session?.sessionVariables?.selected_doctor_id || session?.sessionVariables?.doctor_id || '';
+            if (typeof entityId === 'string' && entityId.includes('{{')) {
+              entityId = parseDynamicVariables(entityId, contextData);
+            }
+            if (!entityId || entityId.includes('{{')) {
+              const EntityModel = (await import('../models/Entity.js')).default || _require('../models/Entity.js');
+              const defaultEntity = await EntityModel.findOne({ tenantId: channel.tenantId || activeFlow?.tenantId, isActive: true });
+              if (defaultEntity) {
+                entityId = defaultEntity._id.toString();
+                contextData.__booking_entity_fallback = entityId;
+                if (!contextData['doctor_name']) contextData['doctor_name'] = defaultEntity.name;
+              }
+            }
+            if (entityId && !entityId.includes('{{')) {
+              const daysAhead = Number(currentNode.data?.daysAhead) || 3;
+              const sections = await _slotEngine.buildSlotMenuSections(entityId, currentNode.data, contextData);
+              contextData[`__booking_sections_${entityId}`] = sections;
+              contextData[`__booking_sections_resolved`] = sections;
+            }
+          } catch (slotErr) {
+            logger.error(`[bookingNode] Failed to load slots:`, slotErr.message);
+          }
+        }
+        // ───────────────────────────────────────────────────────────────────
+
         const payload = buildMessagePayload(customerPhone, currentNode.type, currentNode.data, contextData);
         
         // Inject full template text and buttons for Simulator UI if it's a template node
@@ -1420,6 +1527,28 @@ export async function processSpecificNode(customerPhone, channelId, startNodeId)
           await session.save();
           isBlockingNode = true;
           keepRunning = false;
+        } else if (currentNode.type === 'bookingNode') {
+          // bookingNode: interactive list of real-time available slots
+          // Blocks and waits for user to select a slot
+          session.status = 'WAITING_FOR_INPUT';
+          session.expectedValidation = 'booking_slot';
+          session.saveVariableAs = currentNode.data.saveVariableAs || 'booking_slot_id';
+          session.validationRetries = 0;
+          // Store entity context on session so the input handler can complete the HOLD → COMMIT
+          if (!session.sessionVariables) session.sessionVariables = {};
+          session.sessionVariables['__booking_node_id'] = currentNode.id;
+          let resolvedEntityId = currentNode.data?.entityId || contextData?.selected_doctor_id || contextData?.doctor_id || contextData?.entityId || session?.sessionVariables?.selected_doctor_id || contextData?.__booking_entity_fallback || '';
+          if (typeof resolvedEntityId === 'string' && resolvedEntityId.includes('{{')) {
+            resolvedEntityId = parseDynamicVariables(resolvedEntityId, contextData);
+          }
+          if (!resolvedEntityId || resolvedEntityId.includes('{{')) {
+            resolvedEntityId = contextData?.__booking_entity_fallback || '';
+          }
+          session.sessionVariables['__booking_entity_id'] = resolvedEntityId || '';
+          session.markModified('sessionVariables');
+          await session.save();
+          isBlockingNode = true;
+          keepRunning = false;
         } else if (
           currentNode.type === 'interactiveNode' ||
           currentNode.type === 'menuNode' ||
@@ -1435,23 +1564,23 @@ export async function processSpecificNode(customerPhone, channelId, startNodeId)
           const hasInteractiveOptions = (currentNode.data?.buttons && currentNode.data.buttons.length > 0) ||
                                         (currentNode.data?.interactiveButtons && currentNode.data.interactiveButtons.length > 0) ||
                                         (currentNode.data?.sections && currentNode.data.sections.length > 0) ||
-                                        ['pollNode', 'catalogNode', 'carouselNode'].includes(currentNode.type) ||
+                                        ['pollNode', 'catalogNode', 'carouselNode', 'commerceNode'].includes(currentNode.type) ||
                                         (currentNode.type === 'templateNode' && ((currentNode.data?.buttons && currentNode.data.buttons.length > 0) || outgoingEdges.some(e => e.sourceHandle && e.sourceHandle.startsWith('btn-'))));
 
-          if (outgoingEdges.length === 0) {
-            // Leaf interactive node! Nothing follows; complete the session so user is not trapped.
-            logger.log(`[FlowRunner] Leaf interactive node reached (${currentNode.id}). Completing session.`);
-            await markSessionCompleted(session, customerPhone, channelId);
-            keepRunning = false;
-            break;
-          } else if (hasInteractiveOptions) {
-            // Interactive nodes with outgoing edges block execution and wait for user reply
+          if (hasInteractiveOptions) {
+            // Interactive nodes (buttons, lists, payment links) wait for user interaction
             session.status = 'WAITING_FOR_INPUT';
             session.expectedValidation = 'interactive';
             session.validationRetries = 0;
             await session.save();
             isBlockingNode = true;
             keepRunning = false;
+          } else if (outgoingEdges.length === 0) {
+            // Leaf node with no interactive options configured; complete the session so user is not trapped.
+            logger.log(`[FlowRunner] Leaf interactive node reached (${currentNode.id}) with no options. Completing session.`);
+            await markSessionCompleted(session, customerPhone, channelId);
+            keepRunning = false;
+            break;
           } else {
             // Degraded to text message (no buttons configured) — do not trap user, advance to next step!
             await sleep(500);
@@ -1668,6 +1797,18 @@ export async function processSpecificNode(customerPhone, channelId, startNodeId)
         // If jump fails, just move to next node in current flow
         const edge = outgoingEdges[0];
         nextNodeId = edge ? edge.target : null;
+      }
+
+      // ─────────────────────────────────────────────
+      // BOOKING NODE: Real-time slot menu generation
+      // Executed BEFORE the standard message send path
+      // via buildMessagePayload, so we intercept here
+      // ─────────────────────────────────────────────
+      if (currentNode.type === 'bookingNode' && !currentNode._bookingPayloadInjected) {
+        // This branch is never reached because bookingNode is handled inside the
+        // message dispatch block above. The node type is included in the list so
+        // buildMessagePayload generates the slot interactive list.
+        // The actual slot menu is generated in buildMessagePayload below.
       }
 
       if (keepRunning) {
@@ -2369,71 +2510,19 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
       // Check if user tapped a button that matches a template or interactive node in ANY active flow
       let buttonMatchesAnyFlow = false;
       if (isButtonTap) {
-        const currentActiveFlow = allActiveFlows.find(f => f._id.toString() === session.activeFlowId?.toString());
-        const currentNode = currentActiveFlow?.nodes?.find(n => n.id === session.currentNodeId);
-        const currentOutgoing = currentActiveFlow?.edges?.filter(e => e.source === session.currentNodeId) || [];
-
-        let currentCanHandle = false;
-        if (currentNode) {
-          // If the node is currently waiting for free-form user input (Ask Question / inputNode), it handles it!
-          if (currentNode.type === 'inputNode' || session.status === 'WAITING_FOR_INPUT') {
-            currentCanHandle = true;
-          } else if (['catalogNode', 'commerceNode', 'carouselNode'].includes(currentNode.type)) {
-            // These nodes only have a next step (main-handle) to continue the flow
-            currentCanHandle = currentOutgoing.length > 0;
-          } else {
-            const btnHandles = currentOutgoing.map(e => e.sourceHandle?.toLowerCase()).filter(Boolean);
-            const hasMainOrSingleEdge = btnHandles.includes('main-handle') || currentOutgoing.length === 1;
-
-            // Also check pollNode options if currentNode is pollNode
-            let pollMatches = false;
-            if (currentNode.type === 'pollNode' && Array.isArray(currentNode.data?.options)) {
-              pollMatches = currentNode.data.options.some((opt, idx) => {
-                const optCand = [
-                  opt.text?.trim().toLowerCase(),
-                  opt.id?.toString().trim().toLowerCase(),
-                  String(idx),
-                  `opt-${idx}`,
-                  `opt-${opt.text?.trim().toLowerCase()}`
-                ].filter(Boolean);
-                return candidatePayloads.some(cp => {
-                  const clean = cp.toLowerCase().trim();
-                  return optCand.includes(clean) || optCand.some(oc => oc.replace(/^opt-/, '') === clean.replace(/^opt-/, ''));
-                });
-              });
-            }
-
-            currentCanHandle = pollMatches || candidatePayloads.some(cp => {
-              const cleanCp = cp.toLowerCase().trim();
-              const strippedCp = cleanCp.replace(/^(btn-|row-|row_|opt-)/, '');
-              return btnHandles.includes(cleanCp) ||
-                btnHandles.includes(`btn-${cleanCp}`) ||
-                btnHandles.includes(`row-${cleanCp}`) ||
-                btnHandles.includes(`opt-${cleanCp}`) ||
-                btnHandles.some(sh => {
-                  if (!sh) return false;
-                  const strippedSh = sh.replace(/^(btn-|row-|row_|opt-)/, '');
-                  return (
-                    strippedSh === cleanCp || 
-                    strippedSh === strippedCp ||
-                    cleanCp.replace(/^(btn-|row-|row_|opt-)/, '') === sh ||
-                    sh.includes(strippedCp) ||
-                    strippedCp.includes(strippedSh)
-                  );
-                });
-            });
-
-            if (!currentCanHandle && hasMainOrSingleEdge) {
-              currentCanHandle = true;
-            }
-          }
-        }
-
-        // If current session's node CANNOT handle this button tap, check if ANY active flow has a template/button that matches
-        if (!currentCanHandle) {
-          const externalMatch = await findButtonEdgeMatch(candidatePayloads);
-          if (externalMatch) {
+        const externalMatch = await findButtonEdgeMatch(candidatePayloads);
+        if (externalMatch) {
+          const currentFlowIdStr = session.activeFlowId?.toString();
+          if (externalMatch.flow?._id?.toString() !== currentFlowIdStr) {
+            // Button clicked belongs to another flow/template (e.g. Free Demo) -> Pre-empt current session!
             buttonMatchesAnyFlow = true;
+          } else {
+            const currentActiveFlow = allActiveFlows.find(f => f._id.toString() === currentFlowIdStr);
+            const currentNode = currentActiveFlow?.nodes?.find(n => n.id === session.currentNodeId);
+            if (currentNode?.type === 'inputNode') {
+              // Current node is waiting for free-form text/number/date, not this button click -> Pre-empt!
+              buttonMatchesAnyFlow = true;
+            }
           }
         }
       }
@@ -2499,7 +2588,8 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
       if (!matchedFlow) {
         for (const flow of allActiveFlows) {
           const tNode = flow.nodes.find(n => n.type === 'triggerNode' || n.type === 'eventTriggerNode');
-          if (tNode && isFlowTriggerMatch(tNode, payloadText, messageContext, isNewContact)) {
+          const isSimulatorExplicitFlow = Boolean(simulatorTargetFlowId && flow._id && flow._id.toString() === simulatorTargetFlowId.toString());
+          if (tNode && (isFlowTriggerMatch(tNode, payloadText, messageContext, isNewContact) || isSimulatorExplicitFlow)) {
             logger.log(`[FlowRunner] 🎯 [PATH-A] Matched keyword '${payloadText}' on trigger ${tNode.id} in flow '${flow.name}'`);
             matchedFlow = flow;
             matchedTriggerNode = tNode;
@@ -2561,11 +2651,18 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
             isOutOfOffice = true;
           } else {
             const tz = settings.awayMessage.timezone || 'UTC';
-            const nowStr = new Date().toLocaleString('en-US', { timeZone: tz, weekday: 'long', hour: '2-digit', minute: '2-digit', hour12: false });
-            const parts = nowStr.split(', ');
-            const dayName = parts[0].toLowerCase();
-            const timeStr = parts[1];
-            const dayConfig = settings.awayMessage.workingHours?.get(dayName) || (settings.awayMessage.workingHours && settings.awayMessage.workingHours[dayName]);
+            const now = new Date();
+            let dayName = '';
+            let timeStr = '';
+            try {
+              dayName = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(now).toLowerCase();
+              timeStr = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(now);
+            } catch (_) {
+              const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+              dayName = days[now.getDay()];
+              timeStr = now.toTimeString().substring(0, 5);
+            }
+            const dayConfig = settings.awayMessage.workingHours?.get?.(dayName) || (settings.awayMessage.workingHours && settings.awayMessage.workingHours[dayName]);
             if (dayConfig) {
               if (!dayConfig.isOpen) {
                 isOutOfOffice = true;
@@ -2581,7 +2678,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
         if (isOutOfOffice) {
           if (configuredAwayAutomationId) {
             const awayFlow = await Automation.findById(configuredAwayAutomationId);
-            if (awayFlow && awayFlow.isActive) {
+            if (awayFlow && (awayFlow.isActive || ['active', 'published'].includes(awayFlow.status))) {
               matchedFlow = awayFlow;
               matchedTriggerNode = awayFlow.nodes.find(n => n.type === 'triggerNode') || awayFlow.nodes[0];
             }
@@ -2600,7 +2697,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
           if (isNewContact || isGreetingWord) {
             if (settings.welcomeMessage.automationId) {
               const welcomeFlow = await Automation.findById(settings.welcomeMessage.automationId);
-              if (welcomeFlow && welcomeFlow.isActive) {
+              if (welcomeFlow && (welcomeFlow.isActive || ['active', 'published'].includes(welcomeFlow.status))) {
                 matchedFlow = welcomeFlow;
                 matchedTriggerNode = welcomeFlow.nodes.find(n => n.type === 'triggerNode') || welcomeFlow.nodes[0];
               }
@@ -2641,7 +2738,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
         if (settings && settings.fallbackMessage && settings.fallbackMessage.enabled) {
           if (settings.fallbackMessage.automationId) {
             activeFlow = await Automation.findById(settings.fallbackMessage.automationId);
-            if (activeFlow && activeFlow.isActive) {
+            if (activeFlow && (activeFlow.isActive || ['active', 'published'].includes(activeFlow.status))) {
               triggerNode = activeFlow.nodes.find(n => n.type === 'triggerNode') || activeFlow.nodes[0];
             } else {
               activeFlow = null;
@@ -2739,13 +2836,14 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
         }
       }
 
-      if (session.status === 'WAITING_FOR_INPUT' || session.status === 'ACTIVE') {
-        const currentNode = activeFlow.nodes.find(n => n.id === session.currentNodeId);
-        if (!currentNode) {
-          logger.warn('[FlowRunner] Current node not found. Completing session.');
-          await markSessionCompleted(session, customerPhone, channelId);
-          return;
-        }
+      const currentNode = activeFlow.nodes.find(n => n.id === session.currentNodeId);
+      if (!currentNode) {
+        logger.warn('[FlowRunner] Current node not found. Completing session.');
+        await markSessionCompleted(session, customerPhone, channelId);
+        return;
+      }
+
+      if (currentNode.type === 'inputNode') {
         const nodeQuestion = String(currentNode?.data?.text || currentNode?.data?.question || '').toLowerCase();
         const validationType = String(session.expectedValidation || currentNode?.data?.validationType || 'text').toLowerCase().trim();
 
@@ -2824,8 +2922,9 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
           }
         } else if (validationType === 'number') {
           const stripped = (incomingPayload || '').replace(/[,₹$€£\s]|rs\.?|rupees|inr/gi, '');
-          isValid = !isNaN(Number(stripped)) && stripped.trim() !== '';
-          if (isValid) incomingPayload = stripped.trim();
+          const numMatch = stripped.match(/-?\d+(\.\d+)?/);
+          isValid = numMatch !== null;
+          if (isValid) incomingPayload = numMatch[0];
         } else if (validationType === 'date') {
           const dt = extractDateAndTime(incomingPayload);
           if (dt && dt.hasDate) {
@@ -2865,6 +2964,113 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
         } else if (validationType === 'address') {
           const cleanAddr = (incomingPayload || '').trim();
           isValid = cleanAddr.length >= 3;
+        } else if (validationType === 'booking_slot') {
+          // bookingNode slot selection validation
+          // incomingPayload can be row ID ("SLOT_<entityId>_<startMs>_<endMs>") OR slot title ("12:30 PM - 1:00 PM")
+          const candidateSlotIds = [
+            incomingPayload,
+            messageContext?.listId,
+            messageContext?.rowId,
+            messageContext?.id,
+            messageContext?.optId,
+            messageContext?.buttonId,
+            messageContext?.buttonPayload
+          ].filter(Boolean);
+
+          let parsed = null;
+          for (const cid of candidateSlotIds) {
+            if (typeof cid === 'string' && (cid.toUpperCase().startsWith('SLOT_') || cid.includes('_'))) {
+              parsed = _slotEngine.parseSlotId(cid);
+              if (parsed) break;
+            }
+          }
+
+          let entityId = session.sessionVariables?.['__booking_entity_id'] || session.sessionVariables?.['selected_doctor_id'] || parsed?.entityId || currentNode?.data?.entityId;
+          if (typeof entityId === 'string' && entityId.includes('{{')) {
+            entityId = parseDynamicVariables(entityId, session.sessionVariables || {});
+          }
+
+          // If not parsed by ID directly, search available slots by time label
+          if (!parsed && entityId) {
+            try {
+              const daysAhead = Number(currentNode?.data?.daysAhead) || 4;
+              const range = await _slotEngine.getAvailableSlotsRange(entityId, daysAhead);
+              const searchTexts = [
+                incomingPayload,
+                messageContext?.listTitle,
+                messageContext?.buttonTitle,
+                messageContext?.buttonText
+              ].filter(Boolean).map(t => String(t).toLowerCase().trim());
+
+              for (const dayGroup of range) {
+                for (const s of dayGroup.slots) {
+                  const sLabel = (s.slotLabel || '').toLowerCase();
+                  const sTime = (s.timeLabel || '').toLowerCase();
+                  const matches = searchTexts.some(st => sLabel.includes(st) || st.includes(sTime) || sTime === st || sLabel === st);
+                  if (matches) {
+                    parsed = {
+                      entityId,
+                      startEpochMs: s.startMs,
+                      endEpochMs: s.endMs,
+                      slotLabel: s.slotLabel,
+                      dateLabel: dayGroup.dateLabel
+                    };
+                    break;
+                  }
+                }
+                if (parsed) break;
+              }
+            } catch (err) {
+              logger.error('[bookingNode] Error searching slot by time label:', err.message);
+            }
+          }
+
+          if (!parsed) {
+            isValid = false;
+          } else {
+            // Atomically claim a HOLD on the selected slot
+            const tenantId = channel.tenantId;
+            const targetEntityId = entityId || parsed.entityId;
+            const holdResult = await _slotEngine.claimEntityQuantum({
+              tenantId,
+              channelId: channel?._id || channel?.id || channelId,
+              entityId: targetEntityId,
+              startEpochMs: parsed.startEpochMs,
+              endEpochMs: parsed.endEpochMs,
+              customerPhone,
+              sessionId: session._id,
+              slotLabel: parsed.slotLabel || `${_slotEngine.formatTimeLabel(parsed.startEpochMs)} - ${_slotEngine.formatTimeLabel(parsed.endEpochMs)}`,
+              dateLabel: parsed.dateLabel || _slotEngine.formatDateLabel(new Date(parsed.startEpochMs)),
+              sessionVariables: session.sessionVariables || {}
+            });
+
+            if (!holdResult.success) {
+              isValid = false;
+              logger.warn(`[bookingNode] Slot ${incomingPayload} CAPACITY_EXHAUSTED for ${customerPhone}. Reason: ${holdResult.reason}`);
+            } else {
+              // Immediately commit the HOLD → COMMITTED
+              await _slotEngine.commitAllocation(holdResult.allocationId, session.sessionVariables || {});
+
+              // Save booking metadata to session variables
+              const slotLabel = parsed.slotLabel || `${_slotEngine.formatTimeLabel(parsed.startEpochMs)} - ${_slotEngine.formatTimeLabel(parsed.endEpochMs)}`;
+              const dateLabel = parsed.dateLabel || _slotEngine.formatDateLabel(new Date(parsed.startEpochMs));
+              session.sessionVariables['booking_slot_label'] = slotLabel;
+              session.sessionVariables['booking_date_label'] = dateLabel;
+              session.sessionVariables['booking_allocation_id'] = holdResult.allocationId ? holdResult.allocationId.toString() : `APT-${Date.now().toString().slice(-6)}`;
+              session.sessionVariables['booking_entity_id'] = targetEntityId;
+              session.sessionVariables['selected_slot'] = `${dateLabel} at ${slotLabel}`;
+              session.sessionVariables['datetime'] = `${dateLabel} at ${slotLabel}`;
+              session.sessionVariables['appointment_date'] = dateLabel;
+              session.sessionVariables['appointment_time'] = slotLabel;
+              session.sessionVariables['contact.booking_slot_label'] = slotLabel;
+              session.sessionVariables['contact.booking_date_label'] = dateLabel;
+              session.markModified('sessionVariables');
+
+              incomingPayload = `${dateLabel} ${slotLabel}`;
+              isValid = true;
+              logger.log(`[bookingNode] ✅ Slot COMMITTED for ${customerPhone}: ${dateLabel} ${slotLabel} (Allocation: ${holdResult.allocationId})`);
+            }
+          }
         } else if (['text', 'string', 'any'].includes(validationType)) {
           isValid = incomingPayload && incomingPayload.trim().length > 0;
         }
@@ -2930,6 +3136,8 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
             defaultErrMsg = '⚠️ Video not received. Please attach a video file (🎥), or type *restart* to start over.';
           } else if (validationType === 'address') {
             defaultErrMsg = '⚠️ Address too short. Please provide your complete delivery or office address, or type *restart* to start over.';
+          } else if (validationType === 'booking_slot') {
+            defaultErrMsg = '⚠️ That slot is no longer available — someone else just booked it! Please tap *View Slots* again to see updated availability, or type *restart* to start over.';
           }
 
           let errorMsg = currentNode?.data?.validationErrorMessage || defaultErrMsg;
@@ -2969,7 +3177,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
           valToSave = typeof messageContext.location === 'object' ? JSON.stringify(messageContext.location) : String(messageContext.location);
         }
 
-        const rawVarName = session.saveVariableAs || (isCombinedNamePhone ? 'contact.name' : 'custom_field');
+        const rawVarName = session.saveVariableAs || currentNode?.data?.variableName || (isCombinedNamePhone ? 'contact.name' : 'custom_field');
         if (!session.sessionVariables || typeof session.sessionVariables !== 'object') {
           session.sessionVariables = {};
         } else if (session.sessionVariables instanceof Map) {
@@ -3035,6 +3243,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
             session.sessionVariables['slot'] = extractedDateTime.slot;
             session.sessionVariables['datetime'] = extractedDateTime.slot;
           }
+        }
         if (validationType === 'location' && messageContext?.location) {
           const loc = messageContext.location;
           session.sessionVariables['latitude'] = loc.latitude;
@@ -3120,6 +3329,11 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
             logger.error('Failed to sync non-prefixed contact field from inputNode:', e);
           }
         }
+
+        // Universal variable saving: persist both short key and contact-prefixed key
+        const cleanVarName = rawVarName.replace(/^contact\./, '');
+        session.sessionVariables[cleanVarName] = valToSave;
+        session.sessionVariables[`contact.${cleanVarName}`] = valToSave;
         session.markModified('sessionVariables');
 
         session.status = 'ACTIVE';
@@ -3151,7 +3365,180 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
         const outgoingEdges = activeFlow.edges.filter(e => e.source === session.currentNodeId);
         nextNodeId = null;
 
-        const isInteractiveNode = ['menuNode', 'catalogNode', 'pollNode', 'commerceNode', 'carouselNode', 'interactiveNode'].includes(currentNode?.type) || 
+        // ── 1. REAL-TIME BOOKING NODE SLOT SELECTION ───────────────────────────
+        if (currentNode?.type === 'bookingNode') {
+          let parsedSlot = null;
+          let entityId = session.sessionVariables?.['__booking_entity_id'] || session.sessionVariables?.['selected_doctor_id'] || session.sessionVariables?.['doctor_id'] || currentNode.data?.entityId;
+          if (typeof entityId === 'string' && entityId.includes('{{')) {
+            entityId = parseDynamicVariables(entityId, session.sessionVariables || {});
+          }
+          if (!entityId || entityId.includes('{{')) {
+            entityId = session.sessionVariables?.['__booking_entity_id'] || '';
+          }
+
+          const candidateSlotIds = [
+            incomingPayload,
+            messageContext?.listId,
+            messageContext?.rowId,
+            messageContext?.id,
+            messageContext?.optId,
+            messageContext?.buttonId,
+            messageContext?.buttonPayload
+          ].filter(Boolean);
+
+          for (const ci of candidateSlotIds) {
+            if (typeof ci === 'string' && (ci.toLowerCase().startsWith('slot_') || ci.includes('_'))) {
+              const p = _slotEngine.parseSlotId(ci);
+              if (p) {
+                parsedSlot = p;
+                break;
+              }
+            }
+          }
+
+          if (!parsedSlot && entityId) {
+            try {
+              const daysAhead = Number(currentNode.data?.daysAhead) || 7;
+              const availableRange = await _slotEngine.getAvailableSlotsRange(entityId, daysAhead);
+              const searchTexts = [
+                incomingPayload,
+                messageContext?.listTitle,
+                messageContext?.buttonTitle,
+                messageContext?.buttonText
+              ].filter(Boolean).map(t => String(t).toLowerCase().trim());
+
+              for (const dayGroup of availableRange) {
+                for (const s of dayGroup.slots) {
+                  const sLabel = (s.slotLabel || '').toLowerCase();
+                  const sTime = (s.timeLabel || '').toLowerCase();
+                  const matches = searchTexts.some(st => sLabel.includes(st) || st.includes(sTime) || sTime === st || sLabel === st);
+                  if (matches) {
+                    parsedSlot = {
+                      entityId,
+                      startEpochMs: s.startMs,
+                      endEpochMs: s.endMs,
+                      slotLabel: s.slotLabel,
+                      dateLabel: dayGroup.dateLabel
+                    };
+                    break;
+                  }
+                }
+                if (parsedSlot) break;
+              }
+            } catch (e) {
+              logger.error('[bookingNode] Error searching slot match:', e.message);
+            }
+          }
+
+          if (parsedSlot) {
+            const claim = await _slotEngine.claimEntityQuantum({
+              tenantId: channel.tenantId,
+              channelId: channel?._id || channel?.id || channelId,
+              entityId: parsedSlot.entityId,
+              startEpochMs: parsedSlot.startEpochMs,
+              endEpochMs: parsedSlot.endEpochMs,
+              customerPhone,
+              sessionId: session._id,
+              slotLabel: parsedSlot.slotLabel || `${_slotEngine.formatTimeLabel(parsedSlot.startEpochMs)} - ${_slotEngine.formatTimeLabel(parsedSlot.endEpochMs)}`,
+              dateLabel: parsedSlot.dateLabel || _slotEngine.formatDateLabel(new Date(parsedSlot.startEpochMs)),
+              sessionVariables: session.sessionVariables || {}
+            });
+
+            if (claim && claim.success && claim.allocationId) {
+              await _slotEngine.commitAllocation(claim.allocationId, session.sessionVariables || {});
+            }
+
+            const timeStr = parsedSlot.slotLabel || `${_slotEngine.formatTimeLabel(parsedSlot.startEpochMs)} - ${_slotEngine.formatTimeLabel(parsedSlot.endEpochMs)}`;
+            const dateStr = parsedSlot.dateLabel || _slotEngine.formatDateLabel(new Date(parsedSlot.startEpochMs));
+            const allocId = claim.allocationId ? claim.allocationId.toString() : `APT-${Date.now().toString().slice(-6)}`;
+
+            session.sessionVariables['booking_slot_label'] = timeStr;
+            session.sessionVariables['booking_date_label'] = dateStr;
+            session.sessionVariables['selected_slot'] = `${dateStr} at ${timeStr}`;
+            session.sessionVariables['datetime'] = `${dateStr} at ${timeStr}`;
+            session.sessionVariables['appointment_date'] = dateStr;
+            session.sessionVariables['appointment_time'] = timeStr;
+            session.sessionVariables['booking_allocation_id'] = allocId;
+            session.sessionVariables['booking_entity_id'] = parsedSlot.entityId;
+
+            if (currentNode.data?.saveVariableAs) {
+              session.sessionVariables[currentNode.data.saveVariableAs] = allocId;
+            }
+            session.markModified('sessionVariables');
+            await session.save();
+
+            const outgoingEdges = activeFlow.edges.filter(e => e.source === session.currentNodeId);
+            const matchedEdge = outgoingEdges.find(e => e.sourceHandle === 'main-handle' || !e.sourceHandle) || outgoingEdges[0];
+
+            if (matchedEdge && matchedEdge.target) {
+              logger.log(`[bookingNode] ✅ Slot COMMITTED for ${customerPhone}: ${dateStr} ${timeStr}. Advancing to: ${matchedEdge.target}`);
+              session.status = 'ACTIVE';
+              session.expectedValidation = null;
+              session.validationRetries = 0;
+              await session.save();
+              await processSpecificNode(customerPhone, channelId, matchedEdge.target);
+              return;
+            } else {
+              logger.log(`[bookingNode] ✅ Slot COMMITTED for ${customerPhone}: ${dateStr} ${timeStr}. Terminal node.`);
+              const confMsg = `🎉 *APPOINTMENT CONFIRMED!* 🎉\n\nYour appointment is confirmed for *${dateStr}* at *${timeStr}*.\n\n📋 *Booking Reference:* #${allocId}\n\nThank you! We look forward to seeing you.`;
+              await sendWhatsAppMessage(customerPhone, {
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to: customerPhone,
+                type: 'text',
+                text: { body: confMsg }
+              }, channel);
+              await markSessionCompleted(session, customerPhone, channelId);
+              return;
+            }
+          }
+        }
+
+        // ── 2. COMMERCE / PAYMENT NODE RESPONSE ─────────────────────────────────
+        if (currentNode?.type === 'commerceNode') {
+          const isPayReply = String(incomingPayload).toLowerCase().includes('payment') || 
+                             String(incomingPayload).toLowerCase().includes('paid') || 
+                             String(incomingPayload).toLowerCase().includes('pay') ||
+                             Boolean(messageContext?.isButtonTap);
+          if (isPayReply) {
+            session.sessionVariables['payment_status'] = 'COMPLETED';
+            session.sessionVariables['is_paid'] = true;
+            if (currentNode.data?.saveVariableAs) {
+              session.sessionVariables[currentNode.data.saveVariableAs] = 'COMPLETED';
+            }
+            session.markModified('sessionVariables');
+            await session.save();
+
+            const outgoingEdges = activeFlow.edges.filter(e => e.source === session.currentNodeId);
+            const matchedEdge = outgoingEdges.find(e => e.sourceHandle === 'main-handle' || !e.sourceHandle) || outgoingEdges[0];
+
+            if (matchedEdge && matchedEdge.target) {
+              logger.log(`[commerceNode] ✅ Payment completed for ${customerPhone}. Advancing to: ${matchedEdge.target}`);
+              session.status = 'ACTIVE';
+              session.expectedValidation = null;
+              session.validationRetries = 0;
+              await session.save();
+              await processSpecificNode(customerPhone, channelId, matchedEdge.target);
+              return;
+            } else {
+              logger.log(`[commerceNode] ✅ Payment completed for ${customerPhone}. Terminal node.`);
+              const currency = currentNode.data?.currency || 'INR';
+              const amt = currentNode.data?.amount || '499';
+              const receiptMsg = `✅ *PAYMENT RECEIVED!*\n\nThank you! Your payment of *${currency} ${amt}* has been successfully processed.\n\nTransaction ID: *TXN_${Date.now().toString().slice(-8)}*`;
+              await sendWhatsAppMessage(customerPhone, {
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to: customerPhone,
+                type: 'text',
+                text: { body: receiptMsg }
+              }, channel);
+              await markSessionCompleted(session, customerPhone, channelId);
+              return;
+            }
+          }
+        }
+
+        const isInteractiveNode = ['menuNode', 'catalogNode', 'pollNode', 'commerceNode', 'carouselNode', 'interactiveNode', 'bookingNode'].includes(currentNode?.type) || 
                                   (currentNode?.type === 'messageNode' && (currentNode?.data?.messageType === 'interactive' || (currentNode?.data?.buttons && currentNode.data.buttons.length > 0) || (currentNode?.data?.sections && currentNode.data.sections.length > 0))) || 
                                   (currentNode?.type === 'templateNode' && ((currentNode?.data?.buttons && currentNode.data.buttons.length > 0) || outgoingEdges.some(e => e.sourceHandle && e.sourceHandle.startsWith('btn-'))));
 
@@ -3174,6 +3561,172 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
              e.sourceHandle === `btn-${incomingPayload}` || 
              e.sourceHandle === `row-${incomingPayload}`
           );
+
+          if (matchedEdge) {
+            isExplicitChoiceRecognized = true;
+            let chosenBtn = messageContext?.buttonTitle || messageContext?.buttonText || messageContext?.listTitle || incomingPayload;
+
+            // 📋 If menuNode, resolve row title & row id from sections
+            if (currentNode.type === 'menuNode' && currentNode.data?.sections) {
+              let matchedRow = null;
+              for (let sIdx = 0; sIdx < currentNode.data.sections.length; sIdx++) {
+                const sec = currentNode.data.sections[sIdx];
+                for (let rIdx = 0; rIdx < (sec.rows || []).length; rIdx++) {
+                  const r = sec.rows[rIdx];
+                  const rCandidates = [
+                    r.id?.toString().trim().toLowerCase(),
+                    r.postbackId?.toString().trim().toLowerCase(),
+                    r.title?.trim().toLowerCase(),
+                    `${sIdx}_${rIdx}`,
+                    String(rIdx)
+                  ].filter(Boolean);
+                  const inputsToTest = [
+                    (incomingPayload || '').trim().toLowerCase(),
+                    messageContext?.listId?.trim().toLowerCase(),
+                    messageContext?.rowId?.trim().toLowerCase(),
+                    messageContext?.listTitle?.trim().toLowerCase()
+                  ].filter(Boolean);
+                  if (inputsToTest.some(inp => rCandidates.includes(inp) || (inp.length >= 3 && rCandidates.some(rc => rc.includes(inp) || inp.includes(rc))))) {
+                    matchedRow = r;
+                    break;
+                  }
+                }
+                if (matchedRow) break;
+              }
+
+              const rowTitle = matchedRow ? matchedRow.title : (messageContext?.listTitle || chosenBtn);
+              const rowId = matchedRow ? String(matchedRow.postbackId || matchedRow.id || '') : (messageContext?.listId || incomingPayload);
+
+              session.sessionVariables['selected_menu_option'] = rowTitle;
+              session.sessionVariables['selected_option'] = rowTitle;
+              session.sessionVariables['selected_row_id'] = rowId;
+              session.sessionVariables['contact.last_menu_choice'] = rowTitle;
+
+              if (rowTitle.toLowerCase().includes('dr.') || rowTitle.toLowerCase().includes('doctor') || currentNode.data?.label?.toLowerCase().includes('doctor')) {
+                session.sessionVariables['doctor_name'] = rowTitle;
+                session.sessionVariables['selected_doctor'] = rowTitle;
+                session.sessionVariables['selected_doctor_id'] = rowId;
+              }
+
+              if (currentNode.data?.saveVariableAs) {
+                const valToSave = (currentNode.data.saveVariableAs.toLowerCase().includes('id') && rowId) ? rowId : (rowTitle || rowId);
+                session.sessionVariables[currentNode.data.saveVariableAs] = valToSave;
+                session.sessionVariables[currentNode.data.saveVariableAs.replace(/^contact\./, '')] = valToSave;
+                session.sessionVariables['contact.' + currentNode.data.saveVariableAs.replace(/^contact\./, '')] = valToSave;
+              }
+              chosenBtn = rowTitle;
+            }
+
+            session.sessionVariables['selected_button'] = chosenBtn;
+            session.sessionVariables['selected_option'] = chosenBtn;
+            session.sessionVariables['contact.last_button_choice'] = chosenBtn;
+
+            const dtDirect = extractDateAndTime(chosenBtn);
+            if (dtDirect?.date) {
+              session.sessionVariables['selected_date'] = dtDirect.date;
+              session.sessionVariables['appointment_date'] = dtDirect.date;
+              session.sessionVariables['date'] = dtDirect.date;
+            }
+            if (dtDirect?.time) {
+              session.sessionVariables['selected_time'] = dtDirect.time;
+              session.sessionVariables['appointment_time'] = dtDirect.time;
+              session.sessionVariables['time'] = dtDirect.time;
+            }
+            if (dtDirect?.slot) {
+              session.sessionVariables['selected_slot'] = chosenBtn;
+              session.sessionVariables['appointment_slot'] = chosenBtn;
+              session.sessionVariables['slot'] = chosenBtn;
+              session.sessionVariables['datetime'] = dtDirect.slot;
+            }
+
+            if (currentNode.data?.saveVariableAs && currentNode.type !== 'menuNode') {
+              const saveKey = currentNode.data.saveVariableAs;
+              session.sessionVariables[saveKey] = chosenBtn;
+              session.sessionVariables[saveKey.replace(/^contact\./, '')] = chosenBtn;
+              session.sessionVariables['contact.' + saveKey.replace(/^contact\./, '')] = chosenBtn;
+            }
+
+            // 🏥 AUTO-CLAIM & COMMIT ALLOCATION ON DIRECT CONFIRMATION TAP (Yes, Confirm or Yes, Book Alt Slot)
+            const lowerDirectPayload = String(incomingPayload || '').toLowerCase();
+            const lowerBtnId = String(messageContext?.buttonId || '').toLowerCase();
+            const lowerBtnPayload = String(messageContext?.buttonPayload || '').toLowerCase();
+            const lowerChosenBtn = String(chosenBtn || '').toLowerCase();
+
+            const isSlotConfirmTapDirect = ['yes', 'yes_alt', 'confirm', 'book'].includes(lowerDirectPayload) ||
+              ['yes', 'yes_alt', 'confirm', 'book'].includes(lowerBtnId) ||
+              ['yes', 'yes_alt', 'confirm', 'book'].includes(lowerBtnPayload) ||
+              lowerChosenBtn.includes('confirm') ||
+              lowerChosenBtn.includes('book alt') ||
+              lowerChosenBtn.includes('book slot') ||
+              lowerChosenBtn.includes('book') ||
+              lowerChosenBtn.includes('yes') ||
+              lowerChosenBtn.includes('accept');
+
+            const effectiveEntityIdDirect = session.sessionVariables?.booking_entity_id ||
+              session.sessionVariables?.__booking_entity_id ||
+              session.sessionVariables?.selected_doctor_id ||
+              session.sessionVariables?.doctor_id;
+
+            if (isSlotConfirmTapDirect && effectiveEntityIdDirect && !session.sessionVariables?.booking_allocation_id) {
+              try {
+                const isAltChoice = lowerDirectPayload === 'yes_alt' ||
+                  lowerBtnId === 'yes_alt' ||
+                  lowerBtnPayload === 'yes_alt' ||
+                  lowerChosenBtn.includes('alt');
+
+                const targetSlotLabel = isAltChoice ? (session.sessionVariables['alt_slot_label'] || session.sessionVariables['booking_slot_label']) : session.sessionVariables['booking_slot_label'];
+                const targetDateLabel = isAltChoice ? (session.sessionVariables['alt_date_label'] || session.sessionVariables['booking_date_label']) : session.sessionVariables['booking_date_label'];
+                let targetStartMs = isAltChoice ? (session.sessionVariables['alt_start_ms'] || session.sessionVariables['matched_start_ms']) : session.sessionVariables['matched_start_ms'];
+                let targetEndMs = isAltChoice ? (session.sessionVariables['alt_end_ms'] || session.sessionVariables['matched_end_ms']) : session.sessionVariables['matched_end_ms'];
+
+                if (!targetStartMs && targetSlotLabel) {
+                  try {
+                    const range = await _slotEngine.getAvailableSlotsRange(session.sessionVariables.booking_entity_id, 4);
+                    for (const dg of range) {
+                      for (const s of dg.slots) {
+                        if (s.slotLabel === targetSlotLabel || targetSlotLabel.includes(s.timeLabel)) {
+                          targetStartMs = s.startMs;
+                          targetEndMs = s.endMs;
+                          break;
+                        }
+                      }
+                      if (targetStartMs) break;
+                    }
+                  } catch (_) {}
+                }
+
+                if (targetStartMs && targetEndMs) {
+                  const hold = await _slotEngine.claimEntityQuantum({
+                    tenantId: channel.tenantId,
+                    entityId: session.sessionVariables.booking_entity_id,
+                    startEpochMs: targetStartMs,
+                    endEpochMs: targetEndMs,
+                    customerPhone,
+                    sessionId: session._id,
+                    slotLabel: targetSlotLabel,
+                    dateLabel: targetDateLabel,
+                    sessionVariables: session.sessionVariables || {}
+                  });
+                  if (hold.success && hold.allocationId) {
+                    await _slotEngine.commitAllocation(hold.allocationId, session.sessionVariables || {});
+                    session.sessionVariables['booking_allocation_id'] = hold.allocationId.toString();
+                    session.sessionVariables['booking_slot_label'] = targetSlotLabel;
+                    session.sessionVariables['booking_date_label'] = targetDateLabel;
+                    session.sessionVariables['selected_slot'] = `${targetDateLabel} at ${targetSlotLabel}`;
+                    session.sessionVariables['datetime'] = `${targetDateLabel} at ${targetSlotLabel}`;
+                    session.sessionVariables['appointment_date'] = targetDateLabel;
+                    session.sessionVariables['appointment_time'] = targetSlotLabel;
+                    session.sessionVariables['contact.booking_allocation_id'] = hold.allocationId.toString();
+                    logger.log(`[FlowRunner] ✅ Created live booking Allocation on direct button tap (${hold.allocationId}) for ${customerPhone}`);
+                  }
+                }
+              } catch (allocErr) {
+                logger.error('[FlowRunner] Error creating allocation on direct button tap:', allocErr.message);
+              }
+            }
+
+            session.markModified('sessionVariables');
+          }
           
           // Match by title/label case-insensitively (for both Simulator and WhatsApp)
           if (!matchedEdge) {
@@ -3194,7 +3747,7 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
              ].filter(Boolean);
 
              if (currentNode.type === 'interactiveNode' || currentNode.type === 'messageNode' || currentNode.type === 'templateNode' || currentNode.type === 'carouselNode') {
-                 let buttons = currentNode.data?.buttons || [];
+                 let buttons = currentNode.data?.buttons || currentNode.data?.interactiveButtons || [];
                  if (currentNode.type === 'carouselNode' && Array.isArray(currentNode.data?.cards)) {
                    buttons = currentNode.data.cards.flatMap((c, cIdx) => {
                      if (Array.isArray(c.buttons) && c.buttons.length > 0) return c.buttons;
@@ -3291,8 +3844,65 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
                       }
 
                       if (currentNode.data?.saveVariableAs) {
-                        session.sessionVariables[currentNode.data.saveVariableAs] = btn.payload || btn.id || chosenBtnTitle;
+                        session.sessionVariables[currentNode.data.saveVariableAs] = btn.title || btn.text || btn.payload || chosenBtnTitle || btn.id;
                       }
+
+                      // 🏥 AUTO-CLAIM & COMMIT ALLOCATION ON CONFIRMATION TAP (Yes, Confirm or Yes, Book Alt Slot)
+                      const lowerBtnIdFallback = String(btnId || '').toLowerCase();
+                      const lowerBtnPayloadFallback = String(btn.payload || '').toLowerCase();
+                      const lowerChosenBtnTitleFallback = chosenBtnTitle.toLowerCase();
+
+                      const isSlotConfirmTap = ['yes', 'yes_alt', 'confirm', 'book'].includes(lowerBtnIdFallback) ||
+                        ['yes', 'yes_alt', 'confirm', 'book'].includes(lowerBtnPayloadFallback) ||
+                        lowerChosenBtnTitleFallback.includes('confirm') ||
+                        lowerChosenBtnTitleFallback.includes('book alt') ||
+                        lowerChosenBtnTitleFallback.includes('book slot') ||
+                        lowerChosenBtnTitleFallback.includes('book') ||
+                        lowerChosenBtnTitleFallback.includes('yes') ||
+                        lowerChosenBtnTitleFallback.includes('accept');
+
+                      const effectiveEntityIdFallback = session.sessionVariables?.booking_entity_id ||
+                        session.sessionVariables?.__booking_entity_id ||
+                        session.sessionVariables?.selected_doctor_id ||
+                        session.sessionVariables?.doctor_id;
+
+                      if (isSlotConfirmTap && effectiveEntityIdFallback && !session.sessionVariables?.booking_allocation_id) {
+                        try {
+                          const isAltChoice = lowerBtnIdFallback === 'yes_alt' || lowerBtnPayloadFallback === 'yes_alt' || lowerChosenBtnTitleFallback.includes('alt');
+                          const targetSlotLabel = isAltChoice ? (session.sessionVariables['alt_slot_label'] || session.sessionVariables['booking_slot_label']) : session.sessionVariables['booking_slot_label'];
+                          const targetDateLabel = isAltChoice ? (session.sessionVariables['alt_date_label'] || session.sessionVariables['booking_date_label']) : session.sessionVariables['booking_date_label'];
+                          const targetStartMs = isAltChoice ? (session.sessionVariables['alt_start_ms'] || session.sessionVariables['matched_start_ms']) : session.sessionVariables['matched_start_ms'];
+                          const targetEndMs = isAltChoice ? (session.sessionVariables['alt_end_ms'] || session.sessionVariables['matched_end_ms']) : session.sessionVariables['matched_end_ms'];
+
+                          if (targetStartMs && targetEndMs) {
+                            const hold = await _slotEngine.claimEntityQuantum({
+                              tenantId: channel.tenantId,
+                              entityId: session.sessionVariables.booking_entity_id,
+                              startEpochMs: targetStartMs,
+                              endEpochMs: targetEndMs,
+                              customerPhone,
+                              sessionId: session._id,
+                              slotLabel: targetSlotLabel,
+                              dateLabel: targetDateLabel,
+                              sessionVariables: session.sessionVariables || {}
+                            });
+                            if (hold.success && hold.allocationId) {
+                              await _slotEngine.commitAllocation(hold.allocationId, session.sessionVariables || {});
+                              session.sessionVariables['booking_allocation_id'] = hold.allocationId.toString();
+                              session.sessionVariables['booking_slot_label'] = targetSlotLabel;
+                              session.sessionVariables['booking_date_label'] = targetDateLabel;
+                              session.sessionVariables['selected_slot'] = `${targetDateLabel} at ${targetSlotLabel}`;
+                              session.sessionVariables['datetime'] = `${targetDateLabel} at ${targetSlotLabel}`;
+                              session.sessionVariables['appointment_date'] = targetDateLabel;
+                              session.sessionVariables['appointment_time'] = targetSlotLabel;
+                              logger.log(`[FlowRunner] ✅ Created live booking Allocation on button tap (${hold.allocationId}) for ${customerPhone}`);
+                            }
+                          }
+                        } catch (allocErr) {
+                          logger.error('[FlowRunner] Error creating allocation on button tap:', allocErr.message);
+                        }
+                      }
+
                       session.markModified('sessionVariables');
                     }
 
@@ -3400,6 +4010,12 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
                   session.sessionVariables['selected_option'] = rowTitle;
                   session.sessionVariables['selected_row_id'] = rowId;
                   session.sessionVariables['contact.last_menu_choice'] = rowTitle;
+
+                  if (rowTitle.toLowerCase().includes('dr.') || rowTitle.toLowerCase().includes('doctor') || currentNode.data?.label?.toLowerCase().includes('doctor')) {
+                    session.sessionVariables['doctor_name'] = rowTitle;
+                    session.sessionVariables['selected_doctor'] = rowTitle;
+                    session.sessionVariables['selected_doctor_id'] = rowId;
+                  }
 
                   // 📅 SMART DATE & TIME SLOT EXTRACTION FROM MENU SELECTION
                   const secTitle = currentNode.data.sections[matchedSecIdx]?.title || '';
@@ -3539,8 +4155,8 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
                       (opt.id && (sh === `opt-${opt.id}` || sh === String(opt.id) || strippedSh === String(opt.id).toLowerCase()))
                     );
                   });
-                  if (!matchedEdge && outgoingEdges[optIdx]) {
-                    matchedEdge = outgoingEdges[optIdx];
+                  if (!matchedEdge) {
+                    matchedEdge = outgoingEdges.find(e => e.sourceHandle === 'main-handle' || !e.sourceHandle) || outgoingEdges[optIdx] || outgoingEdges[0];
                   }
                 }
               } else if (['catalogNode', 'commerceNode', 'carouselNode'].includes(currentNode?.type)) {
@@ -3551,7 +4167,97 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
                   session.markModified('sessionVariables');
                 }
                 matchedEdge = outgoingEdges.find(e => e.sourceHandle === 'main-handle' || !e.sourceHandle) || outgoingEdges[0];
-             }
+              } else if (currentNode?.type === 'bookingNode') {
+                // Real-Time Slot Selection from live WhatsApp / Simulator List
+                let parsedSlot = null;
+                let entityId = session.sessionVariables?.['selected_doctor_id'] || session.sessionVariables?.['doctor_id'] || currentNode.data?.entityId;
+                if (typeof entityId === 'string' && entityId.includes('{{')) {
+                  entityId = parseDynamicVariables(entityId, session.sessionVariables || {});
+                }
+
+                // 1. Try parsing from candidateInputs for slot_ format
+                for (const ci of candidateInputs) {
+                  if (ci && (ci.toLowerCase().startsWith('slot_') || ci.includes('_'))) {
+                    const p = _slotEngine.parseSlotId(ci);
+                    if (p) {
+                      parsedSlot = p;
+                      break;
+                    }
+                  }
+                }
+
+                // 2. If user tapped a row with text (e.g. simulator sent title '10:00 AM - 10:30 AM' or 'Today at...')
+                if (!parsedSlot && entityId) {
+                  try {
+                    const daysAhead = Number(currentNode.data?.daysAhead) || 4;
+                    const availableRange = await _slotEngine.getAvailableSlotsRange(entityId, daysAhead);
+                    for (const dayGroup of availableRange) {
+                      for (const s of dayGroup.slots) {
+                        const sLabel = (s.slotLabel || '').toLowerCase();
+                        const sTime = (s.timeLabel || '').toLowerCase();
+                        const matchesCandidate = candidateInputs.some(ci => {
+                          if (!ci) return false;
+                          const cleanCi = ci.toLowerCase().trim();
+                          return sLabel.includes(cleanCi) || cleanCi.includes(sTime) || sTime === cleanCi;
+                        });
+                        if (matchesCandidate) {
+                          parsedSlot = {
+                            entityId,
+                            startEpochMs: s.startMs,
+                            endEpochMs: s.endMs,
+                            slotLabel: s.slotLabel,
+                            dateLabel: dayGroup.dateLabel
+                          };
+                          break;
+                        }
+                      }
+                      if (parsedSlot) break;
+                    }
+                  } catch (e) {
+                    logger.error('[bookingNode] Error searching slot match:', e.message);
+                  }
+                }
+
+                if (parsedSlot) {
+                  isExplicitChoiceRecognized = true;
+
+                  // Atomic Quantum Lock
+                  const claim = await _slotEngine.claimEntityQuantum({
+                    tenantId: channel.tenantId,
+                    entityId: parsedSlot.entityId,
+                    startEpochMs: parsedSlot.startEpochMs,
+                    endEpochMs: parsedSlot.endEpochMs,
+                    customerPhone,
+                    sessionId: session._id,
+                    slotLabel: parsedSlot.slotLabel || `${_slotEngine.formatTimeLabel(parsedSlot.startEpochMs)} - ${_slotEngine.formatTimeLabel(parsedSlot.endEpochMs)}`,
+                    dateLabel: parsedSlot.dateLabel || _slotEngine.formatDateLabel(new Date(parsedSlot.startEpochMs)),
+                    sessionVariables: session.sessionVariables || {}
+                  });
+
+                  // Commit the HOLD allocation permanently
+                  if (claim && claim.success && claim.allocationId) {
+                    await _slotEngine.commitAllocation(claim.allocationId, session.sessionVariables || {});
+                  }
+
+                  const timeStr = parsedSlot.slotLabel || `${_slotEngine.formatTimeLabel(parsedSlot.startEpochMs)} - ${_slotEngine.formatTimeLabel(parsedSlot.endEpochMs)}`;
+                  const dateStr = parsedSlot.dateLabel || _slotEngine.formatDateLabel(new Date(parsedSlot.startEpochMs));
+
+                  session.sessionVariables['booking_slot_label'] = timeStr;
+                  session.sessionVariables['booking_date_label'] = dateStr;
+                  session.sessionVariables['selected_slot'] = `${dateStr} at ${timeStr}`;
+                  session.sessionVariables['datetime'] = `${dateStr} at ${timeStr}`;
+                  session.sessionVariables['appointment_date'] = dateStr;
+                  session.sessionVariables['appointment_time'] = timeStr;
+                  session.sessionVariables['booking_allocation_id'] = claim.allocationId ? claim.allocationId.toString() : `APT-${Date.now().toString().slice(-6)}`;
+                  
+                  if (currentNode.data?.saveVariableAs) {
+                    session.sessionVariables[currentNode.data.saveVariableAs] = claim.allocationId ? claim.allocationId.toString() : timeStr;
+                  }
+                  session.markModified('sessionVariables');
+
+                  matchedEdge = outgoingEdges.find(e => e.sourceHandle === 'main-handle' || !e.sourceHandle) || outgoingEdges[0];
+                }
+              }
           }
 
           // Fallback edges ONLY allowed if customer actually tapped a button or selected a recognized option
@@ -3683,7 +4389,6 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
       await session.save();
       await processSpecificNode(customerPhone, effectiveChannelId, nextNodeId);
     }
-    }
 
   } catch (error) {
     logger.error('Workflow Entry Error:', error);
@@ -3708,12 +4413,13 @@ export async function executeWorkflowStep(customerPhone, incomingPayload, channe
 export async function startFlowManually(customerPhone, channelId, flowId, eventData = {}) {
   try {
     const isSim = typeof customerPhone === 'string' && customerPhone.startsWith('SIMULATOR_');
+    const isTest = Boolean(eventData?.isTest);
     const activeFlow = await Automation.findById(flowId);
     if (!activeFlow) {
       logger.warn(`Flow ${flowId} not found. Cannot start manually.`);
       return;
     }
-    if (!isSim && !activeFlow.isActive && !['active', 'published', 'enabled'].includes(activeFlow.status)) {
+    if (!isSim && !isTest && !activeFlow.isActive && !['active', 'published', 'enabled'].includes(activeFlow.status)) {
       logger.warn(`Flow ${flowId} is inactive. Cannot start manually.`);
       return;
     }
@@ -3790,20 +4496,22 @@ export async function triggerAutomationFromEvent(contact, triggerType, triggerVa
       if (settings && settings.welcomeMessage && settings.welcomeMessage.enabled && settings.welcomeMessage.automationId) {
         activeFlow = await Automation.findOne({
           _id: settings.welcomeMessage.automationId,
-          channelId: contact.channelId,
-          isActive: true
+          $or: [{ isActive: true }, { status: 'active' }, { status: 'published' }]
         });
       }
     }
 
     // Fallback to static trigger matching if no dynamic global rule was matched
     if (!activeFlow) {
-      activeFlow = await Automation.findOne({
+      const triggerQuery = {
         channelId: contact.channelId,
-        isActive: true,
-        'triggers.type': triggerType,
-        'triggers.value': triggerValue
-      });
+        $or: [{ isActive: true }, { status: 'active' }, { status: 'published' }],
+        'triggers.type': triggerType
+      };
+      if (triggerValue !== null && triggerValue !== undefined && triggerValue !== '') {
+        triggerQuery['triggers.value'] = triggerValue;
+      }
+      activeFlow = await Automation.findOne(triggerQuery);
     }
 
     if (!activeFlow) return;

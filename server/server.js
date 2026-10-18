@@ -264,6 +264,9 @@ app.use('/api/sales', require('./routes/salesRoutes'));
 app.use('/api/inventory', require('./routes/inventoryRoutes'));
 app.use('/api/reports', require('./routes/reportsRoutes'));
 
+// ================== UNIVERSAL SLOT BOOKING ENGINE ==================
+app.use('/api/entities', require('./routes/entityRoutes'));
+
 // ================== TEMP DEV FIX (REMOVE AFTER USE) ==================
 // Fixes isEmailVerified + password for a user — local dev only
 if (process.env.NODE_ENV !== 'production') {
@@ -360,8 +363,7 @@ if (!isServerless && httpServer) {
   process.on('SIGINT', () => shutdown('SIGINT'));
 
   process.on('unhandledRejection', (err) => {
-    console.error('❌ Unhandled Rejection:', err.message);
-    httpServer.close(() => process.exit(1));
+    console.error('⚠️ Unhandled Rejection (non-fatal):', err?.stack || err?.message || err);
   });
 
   startServer();
